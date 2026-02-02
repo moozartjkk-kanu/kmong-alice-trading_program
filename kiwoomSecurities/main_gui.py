@@ -885,11 +885,9 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # ✅ 계좌 비밀번호 가져오기 (config에서)
-            password = self.config.get("kiwoom", "account_password") or ""
-            self.log(f"[잔고조회] 계좌번호: {account} (길이: {len(account)}) 비밀번호: {'설정됨' if password else '미설정'}")
+            self.log(f"[잔고조회] 계좌번호: {account} (길이: {len(account)})")
 
-            balance = self.kiwoom.get_balance(account, password)
+            balance = self.kiwoom.get_balance(account)
 
             deposit = balance.get("deposit", 0) or 0
             holdings = balance.get("holdings", [])
@@ -900,7 +898,7 @@ class MainWindow(QMainWindow):
             if deposit == 0:
                 try:
                     self.log(f"[잔고조회] opw00018 예수금=0, opw00001로 재조회...")
-                    deposit_info = self.kiwoom.get_deposit(account, password)
+                    deposit_info = self.kiwoom.get_deposit(account)
                     self.log(f"[잔고조회] opw00001 결과: {deposit_info}")
                     # 주문가능금액 > D+2예수금 > 예수금 순으로 사용
                     deposit = deposit_info.get("order_available", 0) or 0

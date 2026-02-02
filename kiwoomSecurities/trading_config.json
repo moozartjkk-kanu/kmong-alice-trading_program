@@ -59,9 +59,9 @@
   "positions": {},
   "pending_orders": {},
   "session": {
-    "last_trading_date": "20260130",
+    "last_trading_date": "20260203",
     "auto_trading_enabled": false,
-    "orders_restored": true,
+    "orders_restored": false,
     "state_synced": true
   },
   "error_handling": {

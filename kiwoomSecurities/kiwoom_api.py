@@ -285,6 +285,14 @@ class KiwoomAPI:
             self.tr_data["opt10081_candles"] = candles
             self._debug(f"[TR] opt10081 extracted {len(candles)} candles")
 
+        # opw00018: 계좌잔고
+        elif trcode == "opw00018":
+            self._extract_opw00018_data(rqname)
+
+        # opw00001: 예수금 상세
+        elif trcode == "opw00001":
+            self._extract_opw00001_data(rqname)
+
         self._debug(f"[TR] received rqname={rqname} trcode={trcode} record_name={record_name} next={next}")
 
         if self.tr_event_loop and self.tr_event_loop.isRunning():
@@ -366,6 +374,119 @@ class KiwoomAPI:
         self._debug(f"[opt10001] result: price={info['price']} name='{info['name']}'")
         return info
 
+    # ==================== TR 응답 내 데이터 추출 (버퍼 유실 방지) ====================
+    def _extract_opw00018_data(self, rqname):
+        """opw00018 데이터를 TR 응답 핸들러 내에서 즉시 추출"""
+        def safe_int(val):
+            if val is None or val.strip() == "":
+                return 0
+            try:
+                return int(val.replace(",", "").replace("-", ""))
+            except ValueError:
+                return 0
+
+        # 싱글 데이터 - 예수금 관련 필드들
+        single_record_names = ["", "opw00018", rqname, "계좌평가결과"]
+        deposit_fields = [
+            "D+2추정예수금", "추정예탁자산", "예수금", "D+2예수금",
+            "출금가능금액", "주문가능금액", "예탁자산평가액",
+        ]
+
+        deposit = 0
+        single_record = ""
+
+        for rec_name in single_record_names:
+            for field in deposit_fields:
+                val = self.get_comm_data("opw00018", rec_name, 0, field)
+                deposit = safe_int(val)
+                if deposit > 0:
+                    single_record = rec_name
+                    self._debug(f"[opw00018] found deposit: rec='{rec_name}' field='{field}' val={deposit}")
+                    break
+            if deposit > 0:
+                break
+
+        # 싱글 데이터 저장
+        self.tr_data["opw00018_single"] = {
+            "record_name": single_record,
+            "deposit": deposit,
+            "total_purchase": safe_int(self.get_comm_data("opw00018", single_record, 0, "총매입금액")),
+            "total_eval": safe_int(self.get_comm_data("opw00018", single_record, 0, "총평가금액")),
+            "total_profit": safe_int(self.get_comm_data("opw00018", single_record, 0, "총평가손익금액")),
+            "profit_rate_str": self.get_comm_data("opw00018", single_record, 0, "총수익률(%)"),
+        }
+
+        # 멀티 데이터 - 보유종목
+        record_names = ["", "opw00018", rqname, "계좌평가잔고개별합산"]
+        repeat_cnt = 0
+        used_record_name = ""
+
+        for rec_name in record_names:
+            repeat_cnt = self.get_repeat_cnt("opw00018", rec_name)
+            if repeat_cnt > 0:
+                used_record_name = rec_name
+                self._debug(f"[opw00018] found holdings: rec='{rec_name}' count={repeat_cnt}")
+                break
+
+        holdings = []
+        for i in range(repeat_cnt):
+            code_raw = self.get_comm_data("opw00018", used_record_name, i, "종목번호").strip()
+            if not code_raw:
+                code_raw = self.get_comm_data("opw00018", used_record_name, i, "종목코드").strip()
+            if not code_raw:
+                continue
+
+            holding = {
+                "code_raw": code_raw,
+                "name": self.get_comm_data("opw00018", used_record_name, i, "종목명").strip(),
+                "quantity_str": self.get_comm_data("opw00018", used_record_name, i, "보유수량"),
+                "quantity_str2": self.get_comm_data("opw00018", used_record_name, i, "현재보유량"),
+                "avg_price_str": self.get_comm_data("opw00018", used_record_name, i, "매입가"),
+                "avg_price_str2": self.get_comm_data("opw00018", used_record_name, i, "평균매입가"),
+                "current_price_str": self.get_comm_data("opw00018", used_record_name, i, "현재가"),
+                "eval_amount_str": self.get_comm_data("opw00018", used_record_name, i, "평가금액"),
+                "profit_str": self.get_comm_data("opw00018", used_record_name, i, "평가손익"),
+                "profit_str2": self.get_comm_data("opw00018", used_record_name, i, "손익금액"),
+                "profit_rate_str": self.get_comm_data("opw00018", used_record_name, i, "수익률(%)"),
+                "profit_rate_str2": self.get_comm_data("opw00018", used_record_name, i, "수익률"),
+            }
+            holdings.append(holding)
+
+        self.tr_data["opw00018_holdings"] = holdings
+        self._debug(f"[opw00018] extracted: deposit={deposit} holdings_count={len(holdings)}")
+
+    def _extract_opw00001_data(self, rqname):
+        """opw00001 데이터를 TR 응답 핸들러 내에서 즉시 추출"""
+        record_names = ["", "opw00001", rqname, "예수금상세현황"]
+
+        deposit_fields = {
+            "예수금": "",
+            "D+1예수금": "",
+            "D+1추정예수금": "",
+            "D+2예수금": "",
+            "D+2추정예수금": "",
+            "출금가능금액": "",
+            "인출가능금액": "",
+            "주문가능금액": "",
+        }
+
+        used_record = ""
+        for rec_name in record_names:
+            val = self.get_comm_data("opw00001", rec_name, 0, "예수금")
+            if val and val.strip():
+                used_record = rec_name
+                self._debug(f"[opw00001] found record: '{rec_name}'")
+                break
+
+        for field in deposit_fields:
+            deposit_fields[field] = self.get_comm_data("opw00001", used_record, 0, field)
+
+        self.tr_data["opw00001_data"] = {
+            "record_name": used_record,
+            "fields": deposit_fields,
+        }
+        self._debug(f"[opw00001] extracted: {deposit_fields}")
+
     # ==================== 일봉 데이터 (이동평균 계산용) ====================
     def get_daily_candles(self, code, count=60):
         """일봉 데이터 조회 (opt10081)"""
@@ -394,71 +515,33 @@ class KiwoomAPI:
         return candles
 
     # ==================== 계좌 잔고 ====================
-    def get_balance(self, account, password=""):
+    def get_balance(self, account):
         """계좌 잔고 조회 (opw00018)"""
-        self._debug(f"[opw00018] account={account} (len={len(account)}) password={'****' if password else '(empty)'}")
+        self._debug(f"[opw00018] account={account} (len={len(account)})")
 
         self.set_input_value("계좌번호", account)
-        self.set_input_value("비밀번호", password)  # 비밀번호 직접 전달
+        self.set_input_value("비밀번호", "")  # 비밀번호 직접 전달
         self.set_input_value("비밀번호입력매체구분", "00")
         # 조회구분: 1=합산, 2=개별
         self.set_input_value("조회구분", "1")
         self.comm_rq_data("계좌잔고", "opw00018", 0, "0103")
 
-        # TR 수신 후 record_name 확인
-        received_record = self.tr_data.get("record_name", "")
-        self._debug(f"[opw00018] received record_name='{received_record}'")
-
-        rqname = "계좌잔고"
-
-        # 예수금 값 파싱 (빈 문자열이나 None 처리)
+        # ✅ TR 핸들러에서 미리 추출된 데이터 사용 (버퍼 유실 방지)
         def safe_int(val):
-            if val is None or val.strip() == "":
+            if val is None or str(val).strip() == "":
                 return 0
             try:
-                return int(val.replace(",", "").replace("-", ""))
+                return int(str(val).replace(",", "").replace("-", ""))
             except ValueError:
                 return 0
 
-        # ✅ 예수금 관련 필드들 조회
-        # opw00018 싱글 데이터: 여러 레코드명 시도 (빈 문자열 포함)
-        deposit = 0
-
-        # 싱글 데이터 레코드명 후보 (빈 문자열 먼저 시도)
-        single_record_names = ["", "opw00018", "계좌잔고", "계좌평가결과"]
-
-        # opw00018에서 사용 가능한 예수금 관련 필드들 순서대로 시도
-        deposit_fields = [
-            "D+2추정예수금",
-            "추정예탁자산",
-            "예수금",
-            "D+2예수금",
-            "출금가능금액",
-            "주문가능금액",
-            "예탁자산평가액",
-        ]
-
-        deposit_raw = {}
-        single_record = ""  # 기본값
-
-        for rec_name in single_record_names:
-            for field in deposit_fields:
-                val = self.get_comm_data("opw00018", rec_name, 0, field)
-                deposit_raw[f"{rec_name}/{field}"] = val
-                deposit = safe_int(val)
-                if deposit > 0:
-                    single_record = rec_name
-                    break
-            if deposit > 0:
-                break
-
-        self._debug(f"[opw00018] single_record='{single_record}' deposit={deposit}")
-
-        # 싱글 데이터 필드 조회 - single_record 직접 사용
-        total_purchase = safe_int(self.get_comm_data("opw00018", single_record, 0, "총매입금액"))
-        total_eval = safe_int(self.get_comm_data("opw00018", single_record, 0, "총평가금액"))
-        total_profit = safe_int(self.get_comm_data("opw00018", single_record, 0, "총평가손익금액"))
-        profit_rate_str = self.get_comm_data("opw00018", single_record, 0, "총수익률(%)")
+        # 싱글 데이터 (예수금, 총평가 등)
+        single_data = self.tr_data.get("opw00018_single", {})
+        deposit = single_data.get("deposit", 0)
+        total_purchase = single_data.get("total_purchase", 0)
+        total_eval = single_data.get("total_eval", 0)
+        total_profit = single_data.get("total_profit", 0)
+        profit_rate_str = single_data.get("profit_rate_str", "")
 
         try:
             profit_rate = float(profit_rate_str) if profit_rate_str else 0.0
@@ -472,82 +555,58 @@ class KiwoomAPI:
             "profit_rate": profit_rate,
             "deposit": deposit,
         }
-        self._debug(f"[opw00018] deposit_fields={deposit_raw} selected={deposit}")
+        self._debug(f"[opw00018] single_data: deposit={deposit} total_eval={total_eval}")
 
-        # 보유 종목
-        # opw00018 멀티데이터 조회 - 레코드명 없이도 시도
+        # 보유 종목 (멀티 데이터)
+        holdings_raw = self.tr_data.get("opw00018_holdings", [])
         holdings = []
 
-        # 여러 레코드명 시도 (환경에 따라 다를 수 있음)
-        # 빈 문자열도 시도 (키움 API에서 레코드명 무시하는 경우 있음)
-        record_names = ["", "opw00018", "계좌평가잔고개별합산", "계좌잔고"]
-        repeat_cnt = 0
-        used_record_name = ""
-
-        for rec_name in record_names:
-            repeat_cnt = self.get_repeat_cnt("opw00018", rec_name)
-            self._debug(f"[opw00018] try record_name='{rec_name}' -> repeat_cnt={repeat_cnt}")
-            if repeat_cnt > 0:
-                used_record_name = rec_name
-                break
-
-        if repeat_cnt == 0:
-            self._debug("[opw00018] No holdings found with any record name")
-
-        for i in range(repeat_cnt):
-            # 종목코드 조회 (종목번호 필드 사용) - used_record_name 직접 사용
-            code_raw = self.get_comm_data("opw00018", used_record_name, i, "종목번호").strip()
-            if not code_raw:
-                code_raw = self.get_comm_data("opw00018", used_record_name, i, "종목코드").strip()
+        for raw in holdings_raw:
+            code_raw = raw.get("code_raw", "")
             if not code_raw:
                 continue
             code = code_raw.replace("A", "").replace(" ", "")
 
-            # 종목명 조회
-            name = self.get_comm_data("opw00018", used_record_name, i, "종목명").strip()
+            name = raw.get("name", "")
 
-            # 보유수량 조회 (여러 필드명 시도)
-            quantity_str = self.get_comm_data("opw00018", used_record_name, i, "보유수량")
+            # 보유수량
+            quantity_str = raw.get("quantity_str", "")
             if not quantity_str or quantity_str.strip() == "":
-                quantity_str = self.get_comm_data("opw00018", used_record_name, i, "현재보유량")
+                quantity_str = raw.get("quantity_str2", "")
             quantity = abs(safe_int(quantity_str))
 
-            # 매입가 조회
-            avg_price_str = self.get_comm_data("opw00018", used_record_name, i, "매입가")
+            # 매입가
+            avg_price_str = raw.get("avg_price_str", "")
             if not avg_price_str or avg_price_str.strip() == "":
-                avg_price_str = self.get_comm_data("opw00018", used_record_name, i, "평균매입가")
+                avg_price_str = raw.get("avg_price_str2", "")
             avg_price = abs(safe_int(avg_price_str))
 
-            # 현재가 조회 (부호 있을 수 있음 -> abs 처리)
-            current_price_str = self.get_comm_data("opw00018", used_record_name, i, "현재가")
-            current_price = abs(safe_int(current_price_str))
+            # 현재가
+            current_price = abs(safe_int(raw.get("current_price_str", "")))
 
-            # 평가금액 조회 (필드가 없으면 현재가 * 보유수량으로 계산)
-            eval_amount_str = self.get_comm_data("opw00018", used_record_name, i, "평가금액")
-            eval_amount = abs(safe_int(eval_amount_str))
+            # 평가금액
+            eval_amount = abs(safe_int(raw.get("eval_amount_str", "")))
             if eval_amount == 0 and current_price > 0 and quantity > 0:
                 eval_amount = current_price * quantity
 
-            # 평가손익 조회 (음수 가능)
-            profit_str = self.get_comm_data("opw00018", used_record_name, i, "평가손익")
+            # 평가손익
+            profit_str = raw.get("profit_str", "")
             if not profit_str or profit_str.strip() == "":
-                profit_str = self.get_comm_data("opw00018", used_record_name, i, "손익금액")
+                profit_str = raw.get("profit_str2", "")
             profit = safe_int(profit_str)
-            # 평가손익이 없으면 계산 (평가금액 - 매입금액)
             if profit == 0 and eval_amount > 0 and avg_price > 0:
                 profit = eval_amount - (avg_price * quantity)
 
-            # 수익률 조회
-            profit_rate_str = self.get_comm_data("opw00018", used_record_name, i, "수익률(%)")
+            # 수익률
+            profit_rate_str = raw.get("profit_rate_str", "")
             if not profit_rate_str or profit_rate_str.strip() == "":
-                profit_rate_str = self.get_comm_data("opw00018", used_record_name, i, "수익률")
+                profit_rate_str = raw.get("profit_rate_str2", "")
             try:
-                profit_rate = float(profit_rate_str) if profit_rate_str else 0.0
+                item_profit_rate = float(profit_rate_str) if profit_rate_str else 0.0
             except ValueError:
-                profit_rate = 0.0
-            # 수익률이 없으면 계산
-            if profit_rate == 0.0 and avg_price > 0:
-                profit_rate = ((current_price - avg_price) / avg_price) * 100
+                item_profit_rate = 0.0
+            if item_profit_rate == 0.0 and avg_price > 0:
+                item_profit_rate = ((current_price - avg_price) / avg_price) * 100
 
             holding = {
                 "code": code,
@@ -557,7 +616,7 @@ class KiwoomAPI:
                 "current_price": current_price,
                 "eval_amount": eval_amount,
                 "profit": profit,
-                "profit_rate": profit_rate,
+                "profit_rate": item_profit_rate,
             }
 
             if holding["quantity"] > 0:
@@ -565,7 +624,7 @@ class KiwoomAPI:
                 self._debug(
                     "[opw00018] holding "
                     f"code={code} name={name} qty={quantity} avg={avg_price} "
-                    f"cur={current_price} eval={eval_amount} profit={profit} rate={profit_rate:.2f}"
+                    f"cur={current_price} eval={eval_amount} profit={profit} rate={item_profit_rate:.2f}"
                 )
 
         balance["holdings"] = holdings
@@ -582,43 +641,41 @@ class KiwoomAPI:
 
         return balance
 
-    def get_deposit(self, account, password=""):
+    def get_deposit(self, account):
         """
         ✅ 예수금 상세 조회 (opw00001)
 
         opw00018에서 예수금이 안 나올 경우 이 함수 사용
         """
         self.set_input_value("계좌번호", account)
-        self.set_input_value("비밀번호", password)  # 비밀번호 직접 전달
+        self.set_input_value("비밀번호", "")  # 비밀번호 직접 전달
         self.set_input_value("비밀번호입력매체구분", "00")
         self.set_input_value("조회구분", "2")  # 2: 일반조회
         self.comm_rq_data("예수금조회", "opw00001", 0, "0106")
-        record_name = self._get_record_name("예수금조회", "opw00001", "예수금조회")
 
+        # ✅ TR 핸들러에서 미리 추출된 데이터 사용 (버퍼 유실 방지)
         def safe_int(val):
-            if val is None or val.strip() == "":
+            if val is None or str(val).strip() == "":
                 return 0
             try:
-                # 음수 값 처리 (마이너스 기호가 앞에 있을 수 있음)
-                val = val.strip().replace(",", "")
+                val = str(val).strip().replace(",", "")
                 if val.startswith("-"):
                     return -int(val[1:])
                 return int(val.replace("-", ""))
             except ValueError:
                 return 0
 
-        def read_field(field):
-            return safe_int(self.get_comm_data("opw00001", record_name, 0, field))
+        # TR 핸들러에서 추출된 데이터
+        extracted = self.tr_data.get("opw00001_data", {})
+        fields = extracted.get("fields", {})
 
-        def first_nonzero(fields):
-            for field in fields:
-                val = read_field(field)
+        def first_nonzero(field_names):
+            for name in field_names:
+                val = safe_int(fields.get(name, ""))
                 if val != 0:
                     return val
             return 0
 
-        # rqname = "예수금조회" (comm_rq_data에서 사용한 이름)
-        # 증권사/환경에 따라 필드명이 달라질 수 있어 복수 필드로 시도
         deposit_info = {
             "deposit": first_nonzero(["예수금", "D+2추정예수금", "D+2예수금", "주문가능금액"]),
             "deposit_d1": first_nonzero(["D+1예수금", "D+1추정예수금"]),
@@ -626,17 +683,8 @@ class KiwoomAPI:
             "available": first_nonzero(["출금가능금액", "인출가능금액"]),
             "order_available": first_nonzero(["주문가능금액", "출금가능금액"]),
         }
-        deposit_raw = {
-            "예수금": self.get_comm_data("opw00001", record_name, 0, "예수금"),
-            "D+1예수금": self.get_comm_data("opw00001", record_name, 0, "D+1예수금"),
-            "D+1추정예수금": self.get_comm_data("opw00001", record_name, 0, "D+1추정예수금"),
-            "D+2예수금": self.get_comm_data("opw00001", record_name, 0, "D+2예수금"),
-            "D+2추정예수금": self.get_comm_data("opw00001", record_name, 0, "D+2추정예수금"),
-            "출금가능금액": self.get_comm_data("opw00001", record_name, 0, "출금가능금액"),
-            "인출가능금액": self.get_comm_data("opw00001", record_name, 0, "인출가능금액"),
-            "주문가능금액": self.get_comm_data("opw00001", record_name, 0, "주문가능금액"),
-        }
-        self._debug(f"[opw00001] raw_fields={deposit_raw} parsed={deposit_info}")
+
+        self._debug(f"[opw00001] extracted_fields={fields} parsed={deposit_info}")
 
         best_deposit = deposit_info.get("order_available", 0) or deposit_info.get("deposit_d2", 0) or deposit_info.get("deposit", 0)
         try:
