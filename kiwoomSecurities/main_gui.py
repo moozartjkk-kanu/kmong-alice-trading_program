@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTabWidget,
-    QMessageBox, QHeaderView, QFrame, QGridLayout, QCheckBox
+    QMessageBox, QHeaderView, QFrame, QGridLayout
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QColor
@@ -469,15 +469,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(sell_group)
 
-        mock_group = QGroupBox("거래 설정")
-        mock_layout = QHBoxLayout(mock_group)
-
-        self.mock_trading_check = QCheckBox("모의투자 사용")
-        self.mock_trading_check.setChecked(self.config.get("kiwoom", "use_mock_trading"))
-        mock_layout.addWidget(self.mock_trading_check)
-
-        mock_layout.addStretch()
-        layout.addWidget(mock_group)
+        # 모의투자 체크박스 삭제됨 - 로그인 시 서버 자동 감지
 
         save_btn = QPushButton("설정 저장")
         save_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
@@ -1368,7 +1360,7 @@ class MainWindow(QMainWindow):
         )
         self.config.set(self.setting_ma20_ratio.value(), "sell", "ma20_sell_ratio")
 
-        self.config.set(self.mock_trading_check.isChecked(), "kiwoom", "use_mock_trading")
+        # 모의투자 설정 삭제됨 - 로그인 시 서버 자동 감지
 
         self.config.save_config()
 

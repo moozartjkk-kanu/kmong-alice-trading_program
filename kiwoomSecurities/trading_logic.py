@@ -1212,6 +1212,10 @@ class AutoTrader:
         if not self.account:
             self.log("계좌가 설정되지 않았습니다.", "ERROR")
             return False
+        # ✅ 장 시간 체크
+        if not self.is_market_open():
+            self.log("장 시간이 아닙니다. 수동 매도 불가", "ERROR")
+            return False
         try:
             stock_name = self.kiwoom.get_master_code_name(code)
             price_str = f"{price:,}원" if price > 0 else "시장가"
@@ -1233,6 +1237,10 @@ class AutoTrader:
             return False
         if not self.account:
             self.log("계좌가 설정되지 않았습니다.", "ERROR")
+            return False
+        # ✅ 장 시간 체크
+        if not self.is_market_open():
+            self.log("장 시간이 아닙니다. 수동 매수 불가", "ERROR")
             return False
         try:
             stock_name = self.kiwoom.get_master_code_name(code)
