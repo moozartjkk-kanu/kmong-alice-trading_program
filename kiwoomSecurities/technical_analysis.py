@@ -206,45 +206,14 @@ class TradingSignal:
                 )
             }
 
-        # 2차/3차 매수 (기존 로직 유지)
-        buy_count = position.get("buy_count", 0)
-
+        # ✅ 2차/3차 매수는 1차 매수 시 미리 주문이 걸려있으므로 여기서는 신호 발생하지 않음
+        # (1차 매수 주문 전송 시 _place_additional_buy_orders에서 2차/3차 주문도 함께 전송됨)
         if position.get("sell_occurred", False):
             return {"signal": False, "reason": "매도 발생으로 추가 매수 차단됨"}
 
-        if buy_count >= max_buy_count:
-            return {"signal": False, "reason": f"최대 매수 횟수({max_buy_count}차) 도달"}
-
-        last_executed_price = (
-            position.get("last_executed_price", 0)
-            or position.get("last_buy_price", 0)
-            or 0
-        )
-        target_price = float(last_executed_price) * (1 - drop_percent / 100.0)
-        target_floor = self._floor_to_tick(target_price)
-        if target_floor is None:
-            return {"signal": False, "reason": "추가매수 호가 계산 실패"}
-
-        tick = self._get_tick_size(int(target_floor))
-        if current_price <= target_floor:
-            next_buy_count = buy_count + 1
-            limit_buy_price = target_floor + tick
-
-            return {
-                "signal": True,
-                "buy_count": next_buy_count,
-                "reason": (
-                    f"{next_buy_count}차 매수: 이전 체결가({int(last_executed_price):,}원) 대비 "
-                    f"-{drop_percent}% 도달 (목표가: {int(target_floor):,} → 지정가: {limit_buy_price:,})"
-                ),
-                "target_price": limit_buy_price,
-                "ma20": int(ma),
-                "order_type": self.ORDER_TYPE_LIMIT
-            }
-
         return {
             "signal": False,
-            "reason": f"추가 매수 조건 미충족 (현재가: {current_price:,}, 목표가: {int(target_floor):,})"
+            "reason": "보유 중인 종목 - 2차/3차 매수 주문은 이미 걸려있음"
         }
 
     # ---------------- Sell Planning / Signals ----------------

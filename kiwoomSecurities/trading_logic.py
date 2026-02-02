@@ -683,7 +683,8 @@ class AutoTrader:
 
         요구사항 반영:
         - 스탑로스 발동 이력 종목은 재매수 차단
-        - 매도가 한번이라도 발생하면 추가 매수 차단
+        - 매도가 한번이라도 발생하면 당일 재매수 완전 차단 (재진입 불가)
+        - 1차 매수 시 2차/3차 매수 주문도 미리 걸기
         - 매수 체결 시 즉시 모든 매도 주문 설정
         """
         try:
@@ -702,22 +703,16 @@ class AutoTrader:
                 self.log(f"[{code}] 스탑로스 발동 이력 종목 - 재매수 차단", "WARNING")
                 return
 
-            # ✅ 매도가 한번이라도 발생하면 추가 매수 차단
+            # ✅ 매도가 한번이라도 발생하면 당일 재매수 완전 차단
             if position and position.get("sell_occurred", False):
-                self.log(f"[{code}] 매도 발생 종목 - 추가 매수 차단", "WARNING")
+                self.log(f"[{code}] 매도 발생 종목 - 당일 재매수 차단", "WARNING")
                 return
 
-            # 재진입 횟수 확인 (1차 매수이고 이전에 전량 매도한 적이 있는 경우)
-            if buy_count == 1:
-                if position and position.get("quantity", 0) == 0:
-                    # 이전에 포지션이 있었다면 재진입
-                    if position.get("avg_price", 0) > 0:
-                        if not self.config.can_reentry(code):
-                            max_reentry = self.config.get("buy", "max_reentry_per_day") or 1
-                            self.log(f"[{code}] 재진입 제한: 당일 최대 재진입 횟수({max_reentry}회) 초과", "WARNING")
-                            return
-                        self.config.increment_reentry_count(code)
-                        self.log(f"[{code}] 재진입 매수 시도 (당일 {self.config.get_reentry_count(code)}회차)", "INFO")
+            # ✅ 이전에 포지션이 있었던 종목은 재매수 차단 (재진입 불가)
+            if buy_count == 1 and position:
+                if position.get("quantity", 0) == 0 and position.get("avg_price", 0) > 0:
+                    self.log(f"[{code}] 이전 매도 이력 존재 - 당일 재매수 차단", "WARNING")
+                    return
 
             buy_amount = self.config.get("buy", "buy_amount_per_stock")
             quantity = buy_amount // buy_price
@@ -777,6 +772,7 @@ class AutoTrader:
                         "buy_count": buy_count,
                         "last_buy_price": buy_price,
                         "target_buy_price": buy_price,
+                        "first_buy_price": buy_price,  # ✅ 1차 매수가 저장 (2차/3차 계산용)
                         "ma20": ma20,
                         "sold_targets": [],
                         "sell_occurred": False,
@@ -788,6 +784,10 @@ class AutoTrader:
                         "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
                     self.config.update_position(code, new_position)
+
+                    # ✅ 1차 매수 시 2차/3차 매수 주문도 미리 걸기
+                    self._place_additional_buy_orders(code, buy_price, ma20)
+
                 else:
                     position["buy_count"] = buy_count
                     position["last_buy_price"] = buy_price
@@ -800,6 +800,111 @@ class AutoTrader:
 
         except Exception as e:
             self.log(f"[{code}] 매수 실행 중 오류: {e}", "ERROR")
+
+    def _place_additional_buy_orders(self, code, first_buy_price, ma20):
+        """
+        ✅ 1차 매수 주문 전송 후 2차/3차 매수 주문도 미리 걸기
+
+        요구사항:
+        - 2차 주문: 1차 주문 가격의 -10%
+        - 3차 주문: 2차 주문 가격의 -10% (= 1차 × 0.81)
+        """
+        try:
+            max_buy_count = self.config.get("buy", "max_buy_count") or 3
+            drop_percent = self.config.get("buy", "additional_buy_drop_percent") or 10
+            buy_amount = self.config.get("buy", "buy_amount_per_stock")
+
+            # 2차 매수가: 1차 × (1 - drop_percent/100)
+            second_buy_price_raw = first_buy_price * (1 - drop_percent / 100.0)
+            second_buy_price = self._floor_to_tick(second_buy_price_raw)
+            if second_buy_price is None or second_buy_price <= 0:
+                self.log(f"[{code}] 2차 매수가 계산 실패", "WARNING")
+                return
+
+            tick = self._get_tick_size(int(second_buy_price))
+            second_buy_price = second_buy_price + tick  # 호가단위 +1호가
+
+            # 3차 매수가: 2차 × (1 - drop_percent/100) = 1차 × 0.81
+            third_buy_price_raw = second_buy_price * (1 - drop_percent / 100.0)
+            third_buy_price = self._floor_to_tick(third_buy_price_raw)
+            if third_buy_price is None or third_buy_price <= 0:
+                third_buy_price = 0
+
+            if third_buy_price > 0:
+                tick3 = self._get_tick_size(int(third_buy_price))
+                third_buy_price = third_buy_price + tick3
+
+            # 2차 매수 주문 걸기
+            if max_buy_count >= 2 and second_buy_price > 0:
+                quantity_2 = buy_amount // second_buy_price
+                if quantity_2 > 0:
+                    result_2 = self.kiwoom.buy_stock(self.account, code, quantity_2, second_buy_price)
+                    if result_2 == 0:
+                        self.log(f"[{code}] 2차 매수 예약 주문 전송: {quantity_2}주 @ {second_buy_price:,}원", "SUCCESS")
+
+                        # 미체결 주문 저장
+                        self.config.save_pending_order(code, {
+                            "order_type": "buy",
+                            "quantity": quantity_2,
+                            "price": second_buy_price,
+                            "buy_count": 2,
+                            "ma20": ma20,
+                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+
+                        if code not in self.pending_buy_orders:
+                            self.pending_buy_orders[code] = []
+                        self.pending_buy_orders[code].append({
+                            "buy_count": 2,
+                            "quantity": quantity_2,
+                            "price": second_buy_price,
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+                    else:
+                        self.log(f"[{code}] 2차 매수 예약 주문 실패: 에러코드 {result_2}", "ERROR")
+
+            # 3차 매수 주문 걸기
+            if max_buy_count >= 3 and third_buy_price > 0:
+                quantity_3 = buy_amount // third_buy_price
+                if quantity_3 > 0:
+                    result_3 = self.kiwoom.buy_stock(self.account, code, quantity_3, third_buy_price)
+                    if result_3 == 0:
+                        self.log(f"[{code}] 3차 매수 예약 주문 전송: {quantity_3}주 @ {third_buy_price:,}원", "SUCCESS")
+
+                        # 미체결 주문 저장
+                        self.config.save_pending_order(code, {
+                            "order_type": "buy",
+                            "quantity": quantity_3,
+                            "price": third_buy_price,
+                            "buy_count": 3,
+                            "ma20": ma20,
+                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+
+                        if code not in self.pending_buy_orders:
+                            self.pending_buy_orders[code] = []
+                        self.pending_buy_orders[code].append({
+                            "buy_count": 3,
+                            "quantity": quantity_3,
+                            "price": third_buy_price,
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+                    else:
+                        self.log(f"[{code}] 3차 매수 예약 주문 실패: 에러코드 {result_3}", "ERROR")
+
+        except Exception as e:
+            self.log(f"[{code}] 추가 매수 주문 설정 중 오류: {e}", "ERROR")
+
+    def _floor_to_tick(self, price):
+        """호가 단위로 내림"""
+        if price is None:
+            return None
+        try:
+            p = float(price)
+            tick = self._get_tick_size(int(p))
+            return (int(p) // tick) * tick
+        except Exception:
+            return None
 
     # ==================== 매도 ====================
     def _execute_sell(self, code, current_price, signal, position):
@@ -954,6 +1059,17 @@ class AutoTrader:
                             else:
                                 position["last_executed_price"] = executed_price
                                 position["last_executed_qty"] = executed_qty
+
+                            # ✅ 체결된 매수 주문의 buy_count 찾아서 포지션 업데이트
+                            pending_orders = self.config.get_pending_orders().get(code, [])
+                            for order in pending_orders:
+                                if order.get("order_type") == "buy" and int(order.get("price", 0)) == int(executed_price):
+                                    order_buy_count = order.get("buy_count", 1)
+                                    current_buy_count = position.get("buy_count", 0)
+                                    if order_buy_count > current_buy_count:
+                                        position["buy_count"] = order_buy_count
+                                        self.log(f"[{code}] {order_buy_count}차 매수 체결 확인", "INFO")
+                                    break
 
                             self.config.update_position(code, position)
 

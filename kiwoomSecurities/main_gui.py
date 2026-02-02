@@ -415,11 +415,7 @@ class MainWindow(QMainWindow):
         self.setting_max_holding.setSuffix(" 종목")
         buy_layout.addWidget(self.setting_max_holding, 3, 1)
 
-        buy_layout.addWidget(QLabel("재진입 허용:"), 3, 2)
-        self.setting_allow_reentry = QCheckBox()
-        self.setting_allow_reentry.setChecked(self.config.get("buy", "allow_reentry") or True)
-        self.setting_allow_reentry.setToolTip("전량 매도 후 같은 종목 재진입 허용 여부")
-        buy_layout.addWidget(self.setting_allow_reentry, 3, 3)
+        # 재진입 허용 체크박스 삭제됨 - 매도 발생 시 당일 재매수 금지
 
         layout.addWidget(buy_group)
 
@@ -1360,7 +1356,7 @@ class MainWindow(QMainWindow):
         self.config.set(self.setting_add_drop.value(), "buy", "additional_buy_drop_percent")
         self.config.set(self.setting_buy_amount.value(), "buy", "buy_amount_per_stock")
         self.config.set(self.setting_max_holding.value(), "buy", "max_holding_stocks")
-        self.config.set(self.setting_allow_reentry.isChecked(), "buy", "allow_reentry")
+        # 재진입 허용 설정 삭제됨 - 매도 발생 시 당일 재매수 금지
 
         self.config.set(
             [self.setting_profit1.value(), self.setting_profit2.value(), self.setting_profit3.value()],

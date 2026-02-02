@@ -706,7 +706,7 @@ class KiwoomAPI:
         """
         result = self.ocx.dynamicCall(
             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
-            rqname, screen_no, account, order_type, code, quantity, price, hoga, org_order_no
+            [rqname, screen_no, account, order_type, code, quantity, price, hoga, org_order_no]
         )
         return result
 
