@@ -1,0 +1,86 @@
+{
+  "kiwoom": {
+    "account_number": "6544375410",
+    "account_password": "",
+    "use_mock_trading": false
+  },
+  "buy": {
+    "envelope_period": 20,
+    "envelope_percent": 19,
+    "envelope_buy_percent": 20,
+    "max_buy_count": 3,
+    "additional_buy_drop_percent": 10,
+    "buy_amount_per_stock": 1000000,
+    "max_holding_stocks": 3,
+    "allow_reentry": true,
+    "max_reentry_per_day": 1
+  },
+  "sell": {
+    "profit_targets": [
+      2.95,
+      4.95,
+      6.95
+    ],
+    "profit_sell_ratios": [
+      30,
+      30,
+      30
+    ],
+    "ma20_sell_ratio": 10,
+    "stoploss_use_market_order": true
+  },
+  "watchlist": [
+    {
+      "code": "090710",
+      "name": "휴림로봇"
+    },
+    {
+      "code": "097950",
+      "name": "CJ제일제당"
+    },
+    {
+      "code": "101490",
+      "name": "에스앤에스텍"
+    },
+    {
+      "code": "128940",
+      "name": "한미약품"
+    },
+    {
+      "code": "102710",
+      "name": "이엔에프테크놀로지"
+    },
+    {
+      "code": "007460",
+      "name": "에이프로젠"
+    }
+  ],
+  "max_watchlist_count": 200,
+  "positions": {},
+  "pending_orders": {},
+  "session": {
+    "last_trading_date": "20260130",
+    "auto_trading_enabled": false,
+    "orders_restored": true,
+    "state_synced": true
+  },
+  "error_handling": {
+    "order_retry_count": 3,
+    "order_retry_interval_ms": 1000,
+    "reconnect_interval_sec": 10
+  },
+  "reentry_history": {},
+  "execution_history": {
+    "20260129": {
+      "007460": [
+        {
+          "type": "buy",
+          "quantity": 1,
+          "price": 777,
+          "time": "144612",
+          "order_no": ""
+        }
+      ]
+    }
+  }
+}

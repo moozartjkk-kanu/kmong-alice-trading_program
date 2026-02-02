@@ -553,10 +553,39 @@ class MainWindow(QMainWindow):
             self.kiwoom = KiwoomAPI()
 
             if self.kiwoom.login():
-                self.log("[시스템] 로그인 성공!")
-                self.status_label.setText("연결 상태: 연결됨")
-                self.status_label.setStyleSheet("color: green; font-weight: bold;")
+                # ✅ 서버 구분 확인 (실서버/모의투자)
+                server_gubun = self.kiwoom.get_server_gubun()
+                is_real = self.kiwoom.is_real_server()
+
+                self.log(f"[시스템] 로그인 성공! (서버: {server_gubun})")
+
+                # ✅ 서버 구분에 따라 UI 색상 및 텍스트 변경
+                if is_real:
+                    self.status_label.setText(f"연결 상태: 연결됨 (실서버)")
+                    self.status_label.setStyleSheet("color: green; font-weight: bold;")
+                else:
+                    self.status_label.setText(f"연결 상태: 연결됨 (모의투자)")
+                    self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+                    # 모의투자 연결 시 경고 메시지
+                    self.log("[경고] 모의투자 서버에 연결되었습니다!")
+                    self.log("[안내] 실계좌 연결 방법:")
+                    self.log("  1. 영웅문HTS 자동로그인을 해제하세요.")
+                    self.log("  2. KOA Studio를 재실행하고 로그인 창에서 '모의투자' 체크 해제")
+                    self.log("  3. 계좌 비밀번호를 KOA Studio에서 다시 등록하세요.")
+                    QMessageBox.warning(
+                        self,
+                        "모의투자 서버 연결",
+                        "현재 모의투자 서버에 연결되었습니다.\n\n"
+                        "실계좌를 사용하려면:\n"
+                        "1. 영웅문HTS 자동로그인을 해제\n"
+                        "2. KOA Studio 재실행 후 로그인 시 '모의투자' 체크 해제\n"
+                        "3. 계좌 비밀번호 다시 등록"
+                    )
+
                 self.login_btn.setEnabled(False)
+
+                # ✅ 디버그 모드 활성화 (문제 해결 후 False로 변경)
+                self.kiwoom.set_debug(True)
 
                 # ✅ 계좌 데이터 시그널 연결
                 self.kiwoom.account_signals.deposit_changed.connect(self._on_deposit_changed)
@@ -856,22 +885,40 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            balance = self.kiwoom.get_balance(account)
+            # ✅ 계좌 비밀번호 가져오기 (config에서)
+            password = self.config.get("kiwoom", "account_password") or ""
+            self.log(f"[잔고조회] 계좌번호: {account} (길이: {len(account)}) 비밀번호: {'설정됨' if password else '미설정'}")
+
+            balance = self.kiwoom.get_balance(account, password)
 
             deposit = balance.get("deposit", 0) or 0
+            holdings = balance.get("holdings", [])
+            total_eval = balance.get("total_eval", 0) or 0
+            self.log(f"[잔고조회] 예수금={deposit:,}원, 총평가={total_eval:,}원, 보유종목={len(holdings)}개")
 
             # ✅ 예수금이 0이면 opw00001 TR로 재조회 시도
             if deposit == 0:
                 try:
-                    deposit_info = self.kiwoom.get_deposit(account)
+                    self.log(f"[잔고조회] opw00018 예수금=0, opw00001로 재조회...")
+                    deposit_info = self.kiwoom.get_deposit(account, password)
+                    self.log(f"[잔고조회] opw00001 결과: {deposit_info}")
                     # 주문가능금액 > D+2예수금 > 예수금 순으로 사용
                     deposit = deposit_info.get("order_available", 0) or 0
                     if deposit == 0:
                         deposit = deposit_info.get("deposit_d2", 0) or 0
                     if deposit == 0:
                         deposit = deposit_info.get("deposit", 0) or 0
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.log(f"[잔고조회] opw00001 오류: {e}")
+
+            # ✅ 예수금이 여전히 0이면 원인 안내
+            if deposit == 0 and self.kiwoom.is_real_server():
+                self.log("[경고] 실계좌 예수금 조회 실패!")
+                self.log("[안내] 해결 방법:")
+                self.log("  1. KOA Studio에서 [도구 > 계좌비밀번호 저장] 확인")
+                self.log("  2. 계좌번호 선택 후 비밀번호 입력 및 '등록' 클릭")
+                self.log("  3. 'AUTO' 체크박스가 선택되어 있는지 확인")
+                self.log("  4. 프로그램 재시작 후 다시 시도")
 
             self.balance_label.setText(f"예수금: {deposit:,}원")
 
@@ -1022,6 +1069,21 @@ class MainWindow(QMainWindow):
                 # 캐시 업데이트 (이벤트 엔진이 있으면)
                 if self.trader and self.trader.event_engine:
                     self.trader.event_engine.batch_scheduler.update_cache(code, candles)
+            else:
+                # 일봉 데이터 실패 시 현재가만이라도 조회 (opt10001 fallback)
+                self.log(f"[시스템] [{code}] 일봉 데이터 없음, 현재가 조회 시도...")
+                try:
+                    stock_info = self.kiwoom.get_stock_info(code)
+                    if stock_info and stock_info.get("price", 0) > 0:
+                        current_price = stock_info.get("price", 0)
+                        self.watchlist_table.setItem(row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price)))
+                        self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
+                        self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
+                        self.log(f"[시스템] [{code}] 현재가 조회 성공: {current_price:,}원")
+                    else:
+                        self.log(f"[시스템] [{code}] 현재가 조회 실패")
+                except Exception as e2:
+                    self.log(f"[시스템] [{code}] 현재가 조회 오류: {e2}")
 
         except Exception as e:
             self.log(f"[시스템] [{code}] 정보 조회 오류: {e}")

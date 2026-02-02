@@ -7,7 +7,7 @@ import time
 from collections import deque
 from threading import Lock
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import QEventLoop, QTimer, QObject, pyqtSignal
+from PyQt5.QtCore import QEventLoop, QObject, pyqtSignal
 from PyQt5.QtWidgets import QApplication
 
 
@@ -73,6 +73,14 @@ class KiwoomAPI:
 
         self.account_list = []
         self.tr_data = {}
+        self._expected_rqname = None
+        self._expected_trcode = None
+        self._pending_tr_data = {}
+        self._tr_timed_out = False
+        # 타임아웃 비활성화 (0 또는 None이면 무제한 대기)
+        # opw00018 등 계좌 조회는 시간이 오래 걸릴 수 있음
+        self._tr_timeout_ms = 0
+        self._tr_record_overrides = {}
 
         # TR 호출 제한 (초당 5회)
         self.rate_limiter = RateLimiter(max_calls=5, period=1.0)
@@ -94,6 +102,16 @@ class KiwoomAPI:
 
         # 이벤트 엔진 참조 (나중에 설정)
         self.event_engine = None
+        # 디버그 로그
+        self.debug = False
+
+    def set_debug(self, enabled=True):
+        """디버그 로그 토글"""
+        self.debug = bool(enabled)
+
+    def _debug(self, message):
+        if self.debug:
+            print(message)
 
     def set_event_engine(self, engine):
         """이벤트 엔진 설정"""
@@ -102,18 +120,60 @@ class KiwoomAPI:
     # ==================== 로그인 ====================
     def login(self):
         """로그인 요청"""
-        self.ocx.dynamicCall("CommConnect()")
+        server = self.ocx.dynamicCall("CommConnect()")
         self.login_event_loop = QEventLoop()
         self.login_event_loop.exec_()
+        print("server:", server)
+
+        # ✅ 로그인 성공 후 계좌 비밀번호 입력창 방지 설정
+        if self.connected:
+            self._setup_account_password()
+
         return self.connected
+
+    def _setup_account_password(self):
+        """
+        계좌 비밀번호 입력창 자동 생성 방지
+        KOA Studio에 저장된 비밀번호를 사용하도록 설정
+        """
+        try:
+            # 계좌비밀번호 입력창 표시 안함 (저장된 비밀번호 사용)
+            result = self.ocx.dynamicCall(
+                "KOA_Functions(QString, QString)",
+                "ShowAccountWindow", ""
+            )
+            print(f"[계좌설정] ShowAccountWindow: {result}")
+        except Exception as e:
+            print(f"[계좌설정] 오류: {e}")
 
     def _on_event_connect(self, err_code):
         """로그인 이벤트 핸들러"""
         if err_code == 0:
             self.connected = True
             self.account_list = self.get_account_list()
-            print(f"로그인 성공! 계좌: {self.account_list}")
+
+            # ✅ 서버 구분 확인 (실서버/모의투자)
+            server_gubun = self.get_server_gubun()
+            is_real = self.is_real_server()
+
+            print(f"=" * 50)
+            print(f"로그인 성공!")
+            print(f"서버: {server_gubun}")
+            print(f"계좌: {self.account_list}")
+            print(f"=" * 50)
+
+            # ✅ 모의투자 서버 연결 시 경고
+            if not is_real:
+                print("")
+                print("[경고] 현재 모의투자 서버에 연결되어 있습니다!")
+                print("[안내] 실계좌를 사용하려면:")
+                print("  1. 영웅문HTS 자동로그인을 해제하세요.")
+                print("  2. KOA Studio를 재실행하세요.")
+                print("  3. 로그인 창에서 '모의투자' 체크를 해제하세요.")
+                print("  4. 계좌 비밀번호를 다시 등록하세요.")
+                print("")
         else:
+            # ✅ 로그인 실패 (err_code != 0)
             self.connected = False
             print(f"로그인 실패: 에러코드 {err_code}")
 
@@ -135,6 +195,30 @@ class KiwoomAPI:
         """로그인 정보 조회"""
         return self.ocx.dynamicCall("GetLoginInfo(QString)", tag)
 
+    def get_server_gubun(self):
+        """
+        서버 구분 조회 (실서버/모의투자)
+
+        Returns:
+            str: "실서버" 또는 "모의투자"
+        """
+        gubun = self.ocx.dynamicCall("GetLoginInfo(QString)", "GetServerGubun")
+        # 반환값: "1" = 모의투자, "" 또는 다른값 = 실서버
+        if gubun == "1":
+            return "모의투자"
+        return "실서버"
+
+    def is_real_server(self):
+        """
+        실서버 연결 여부 확인
+
+        Returns:
+            bool: 실서버면 True, 모의투자면 False
+        """
+        gubun = self.ocx.dynamicCall("GetLoginInfo(QString)", "GetServerGubun")
+        # "1" = 모의투자, 그 외 = 실서버
+        return gubun != "1"
+
     # ==================== TR 요청 ====================
     def set_input_value(self, id, value):
         """TR 입력값 설정"""
@@ -145,16 +229,23 @@ class KiwoomAPI:
         # TR 호출 제한 대기
         self.rate_limiter.wait_if_needed()
 
+        self._debug(f"[TR] request rqname={rqname} trcode={trcode}")
+        self.tr_data = {}
+
         self.ocx.dynamicCall(
             "CommRqData(QString, QString, int, QString)",
             rqname, trcode, next, screen_no
         )
         self.tr_event_loop = QEventLoop()
         self.tr_event_loop.exec_()
+        self._debug(f"[TR] completed rqname={rqname} trcode={trcode}")
 
     def _on_receive_tr_data(self, screen_no, rqname, trcode, record_name, next,
                             unused1, unused2, unused3, unused4):
         """TR 데이터 수신 이벤트 핸들러"""
+        self._debug(f"[TR] received rqname={rqname} trcode={trcode} record_name={record_name}")
+
+        # TR 데이터 기본 정보 저장
         self.tr_data = {
             "screen_no": screen_no,
             "rqname": rqname,
@@ -163,23 +254,80 @@ class KiwoomAPI:
             "next": next
         }
 
-        if self.tr_event_loop:
+        # ✅ TR 응답 직후 데이터 즉시 추출 (버퍼 유실 방지)
+        # opt10001: 주식기본정보
+        if trcode == "opt10001":
+            self.tr_data["opt10001_data"] = {
+                "name": self.get_comm_data(trcode, rqname, 0, "종목명"),
+                "price": self.get_comm_data(trcode, rqname, 0, "현재가"),
+                "volume": self.get_comm_data(trcode, rqname, 0, "거래량"),
+                "high": self.get_comm_data(trcode, rqname, 0, "고가"),
+                "low": self.get_comm_data(trcode, rqname, 0, "저가"),
+                "open": self.get_comm_data(trcode, rqname, 0, "시가"),
+            }
+            self._debug(f"[TR] opt10001 extracted: {self.tr_data['opt10001_data']}")
+
+        # opt10081: 일봉데이터
+        elif trcode == "opt10081":
+            candles = []
+            repeat_cnt = self.get_repeat_cnt(trcode, rqname)
+            self._debug(f"[TR] opt10081 repeat_cnt={repeat_cnt} (rqname={rqname})")
+            for i in range(min(repeat_cnt, 60)):
+                candle = {
+                    "date": self.get_comm_data(trcode, rqname, i, "일자"),
+                    "open": self.get_comm_data(trcode, rqname, i, "시가"),
+                    "high": self.get_comm_data(trcode, rqname, i, "고가"),
+                    "low": self.get_comm_data(trcode, rqname, i, "저가"),
+                    "close": self.get_comm_data(trcode, rqname, i, "현재가"),
+                    "volume": self.get_comm_data(trcode, rqname, i, "거래량"),
+                }
+                candles.append(candle)
+            self.tr_data["opt10081_candles"] = candles
+            self._debug(f"[TR] opt10081 extracted {len(candles)} candles")
+
+        self._debug(f"[TR] received rqname={rqname} trcode={trcode} record_name={record_name} next={next}")
+
+        if self.tr_event_loop and self.tr_event_loop.isRunning():
             self.tr_event_loop.exit()
 
-    def get_comm_data(self, trcode, rqname, index, item):
+    def get_comm_data(self, trcode, record_name, index, item):
         """TR 데이터 가져오기"""
         data = self.ocx.dynamicCall(
             "GetCommData(QString, QString, int, QString)",
-            trcode, rqname, index, item
+            trcode, record_name, index, item
         )
         return data.strip()
 
-    def get_repeat_cnt(self, trcode, rqname):
+    def get_repeat_cnt(self, trcode, record_name):
         """반복 데이터 개수"""
         return self.ocx.dynamicCall(
             "GetRepeatCnt(QString, QString)",
-            trcode, rqname
+            trcode, record_name
         )
+
+    def _get_record_name(self, fallback=None, trcode=None, rqname=None):
+        """마지막 TR 응답의 레코드명 가져오기 (없으면 rqname/fallback)"""
+        if trcode:
+            override = self._tr_record_overrides.get(trcode)
+            if override:
+                self._debug(f"[TR] record override used trcode={trcode} record_name={override}")
+                return override
+        if isinstance(self.tr_data, dict):
+            name = self.tr_data.get("record_name")
+            if name:
+                return name
+        if rqname:
+            self._debug(f"[TR] record_name missing, rqname used trcode={trcode} record_name={rqname}")
+            return rqname
+        if fallback:
+            self._debug(f"[TR] record_name missing, fallback used trcode={trcode} record_name={fallback}")
+            return fallback
+        return ""
+
+    def set_tr_record_override(self, trcode, record_name):
+        """TR 레코드명 수동 설정 (매뉴얼 기준 보정용)"""
+        if trcode and record_name:
+            self._tr_record_overrides[trcode] = record_name
 
     # ==================== 주식 기본 정보 ====================
     def get_master_code_name(self, code):
@@ -191,23 +339,31 @@ class KiwoomAPI:
         self.set_input_value("종목코드", code)
         self.comm_rq_data("주식기본정보", "opt10001", 0, "0101")
 
-        price = self.get_comm_data("opt10001", "주식기본정보", 0, "현재가")
-        return abs(int(price)) if price else 0
+        # TR 핸들러에서 미리 추출된 데이터 사용
+        data = self.tr_data.get("opt10001_data", {})
+        price_str = data.get("price", "")
+        self._debug(f"[opt10001] code={code} price='{price_str}'")
+        return abs(int(price_str)) if price_str else 0
 
     def get_stock_info(self, code):
         """종목 기본 정보 조회"""
         self.set_input_value("종목코드", code)
         self.comm_rq_data("주식기본정보", "opt10001", 0, "0101")
 
+        # TR 핸들러에서 미리 추출된 데이터 사용
+        data = self.tr_data.get("opt10001_data", {})
+        self._debug(f"[opt10001] code={code} extracted_data={data}")
+
         info = {
             "code": code,
-            "name": self.get_comm_data("opt10001", "주식기본정보", 0, "종목명"),
-            "price": abs(int(self.get_comm_data("opt10001", "주식기본정보", 0, "현재가") or 0)),
-            "volume": int(self.get_comm_data("opt10001", "주식기본정보", 0, "거래량") or 0),
-            "high": abs(int(self.get_comm_data("opt10001", "주식기본정보", 0, "고가") or 0)),
-            "low": abs(int(self.get_comm_data("opt10001", "주식기본정보", 0, "저가") or 0)),
-            "open": abs(int(self.get_comm_data("opt10001", "주식기본정보", 0, "시가") or 0)),
+            "name": data.get("name", ""),
+            "price": abs(int(data.get("price") or 0)),
+            "volume": int(data.get("volume") or 0),
+            "high": abs(int(data.get("high") or 0)),
+            "low": abs(int(data.get("low") or 0)),
+            "open": abs(int(data.get("open") or 0)),
         }
+        self._debug(f"[opt10001] result: price={info['price']} name='{info['name']}'")
         return info
 
     # ==================== 일봉 데이터 (이동평균 계산용) ====================
@@ -218,30 +374,42 @@ class KiwoomAPI:
         self.set_input_value("수정주가구분", "1")
         self.comm_rq_data("일봉조회", "opt10081", 0, "0102")
 
-        candles = []
-        repeat_cnt = min(self.get_repeat_cnt("opt10081", "일봉조회"), count)
+        # TR 핸들러에서 미리 추출된 데이터 사용
+        raw_candles = self.tr_data.get("opt10081_candles", [])
+        self._debug(f"[opt10081] code={code} raw_candles_count={len(raw_candles)}")
 
-        for i in range(repeat_cnt):
+        candles = []
+        for raw in raw_candles[:count]:
             candle = {
-                "date": self.get_comm_data("opt10081", "일봉조회", i, "일자"),
-                "open": abs(int(self.get_comm_data("opt10081", "일봉조회", i, "시가") or 0)),
-                "high": abs(int(self.get_comm_data("opt10081", "일봉조회", i, "고가") or 0)),
-                "low": abs(int(self.get_comm_data("opt10081", "일봉조회", i, "저가") or 0)),
-                "close": abs(int(self.get_comm_data("opt10081", "일봉조회", i, "현재가") or 0)),
-                "volume": int(self.get_comm_data("opt10081", "일봉조회", i, "거래량") or 0),
+                "date": raw.get("date", ""),
+                "open": abs(int(raw.get("open") or 0)),
+                "high": abs(int(raw.get("high") or 0)),
+                "low": abs(int(raw.get("low") or 0)),
+                "close": abs(int(raw.get("close") or 0)),
+                "volume": int(raw.get("volume") or 0),
             }
             candles.append(candle)
 
+        self._debug(f"[opt10081] code={code} candles_count={len(candles)}")
         return candles
 
     # ==================== 계좌 잔고 ====================
-    def get_balance(self, account):
+    def get_balance(self, account, password=""):
         """계좌 잔고 조회 (opw00018)"""
+        self._debug(f"[opw00018] account={account} (len={len(account)}) password={'****' if password else '(empty)'}")
+
         self.set_input_value("계좌번호", account)
-        self.set_input_value("비밀번호", "")
+        self.set_input_value("비밀번호", password)  # 비밀번호 직접 전달
         self.set_input_value("비밀번호입력매체구분", "00")
+        # 조회구분: 1=합산, 2=개별
         self.set_input_value("조회구분", "1")
         self.comm_rq_data("계좌잔고", "opw00018", 0, "0103")
+
+        # TR 수신 후 record_name 확인
+        received_record = self.tr_data.get("record_name", "")
+        self._debug(f"[opw00018] received record_name='{received_record}'")
+
+        rqname = "계좌잔고"
 
         # 예수금 값 파싱 (빈 문자열이나 None 처리)
         def safe_int(val):
@@ -253,38 +421,44 @@ class KiwoomAPI:
                 return 0
 
         # ✅ 예수금 관련 필드들 조회
-        # opw00018 싱글 데이터: rqname은 comm_rq_data에서 사용한 "계좌잔고"를 사용
+        # opw00018 싱글 데이터: 여러 레코드명 시도 (빈 문자열 포함)
         deposit = 0
 
-        # 1차: D+2추정예수금 시도
-        deposit_d2 = self.get_comm_data("opw00018", "계좌잔고", 0, "D+2추정예수금")
-        deposit = safe_int(deposit_d2)
+        # 싱글 데이터 레코드명 후보 (빈 문자열 먼저 시도)
+        single_record_names = ["", "opw00018", "계좌잔고", "계좌평가결과"]
 
-        # 2차: 예수금 시도
-        if deposit == 0:
-            deposit_raw = self.get_comm_data("opw00018", "계좌잔고", 0, "예수금")
-            deposit = safe_int(deposit_raw)
+        # opw00018에서 사용 가능한 예수금 관련 필드들 순서대로 시도
+        deposit_fields = [
+            "D+2추정예수금",
+            "추정예탁자산",
+            "예수금",
+            "D+2예수금",
+            "출금가능금액",
+            "주문가능금액",
+            "예탁자산평가액",
+        ]
 
-        # 3차: 출금가능금액 시도
-        if deposit == 0:
-            deposit_available = self.get_comm_data("opw00018", "계좌잔고", 0, "출금가능금액")
-            deposit = safe_int(deposit_available)
+        deposit_raw = {}
+        single_record = ""  # 기본값
 
-        # 4차: 추정예탁자산 시도
-        if deposit == 0:
-            deposit_estimate = self.get_comm_data("opw00018", "계좌잔고", 0, "추정예탁자산")
-            deposit = safe_int(deposit_estimate)
+        for rec_name in single_record_names:
+            for field in deposit_fields:
+                val = self.get_comm_data("opw00018", rec_name, 0, field)
+                deposit_raw[f"{rec_name}/{field}"] = val
+                deposit = safe_int(val)
+                if deposit > 0:
+                    single_record = rec_name
+                    break
+            if deposit > 0:
+                break
 
-        # 5차: 주문가능금액 시도
-        if deposit == 0:
-            deposit_order = self.get_comm_data("opw00018", "계좌잔고", 0, "주문가능금액")
-            deposit = safe_int(deposit_order)
+        self._debug(f"[opw00018] single_record='{single_record}' deposit={deposit}")
 
-        # 싱글 데이터 필드 조회 (rqname = "계좌잔고")
-        total_purchase = safe_int(self.get_comm_data("opw00018", "계좌잔고", 0, "총매입금액"))
-        total_eval = safe_int(self.get_comm_data("opw00018", "계좌잔고", 0, "총평가금액"))
-        total_profit = safe_int(self.get_comm_data("opw00018", "계좌잔고", 0, "총평가손익금액"))
-        profit_rate_str = self.get_comm_data("opw00018", "계좌잔고", 0, "총수익률(%)")
+        # 싱글 데이터 필드 조회 - single_record 직접 사용
+        total_purchase = safe_int(self.get_comm_data("opw00018", single_record, 0, "총매입금액"))
+        total_eval = safe_int(self.get_comm_data("opw00018", single_record, 0, "총평가금액"))
+        total_profit = safe_int(self.get_comm_data("opw00018", single_record, 0, "총평가손익금액"))
+        profit_rate_str = self.get_comm_data("opw00018", single_record, 0, "총수익률(%)")
 
         try:
             profit_rate = float(profit_rate_str) if profit_rate_str else 0.0
@@ -298,23 +472,101 @@ class KiwoomAPI:
             "profit_rate": profit_rate,
             "deposit": deposit,
         }
+        self._debug(f"[opw00018] deposit_fields={deposit_raw} selected={deposit}")
 
         # 보유 종목
+        # opw00018 멀티데이터 조회 - 레코드명 없이도 시도
         holdings = []
-        repeat_cnt = self.get_repeat_cnt("opw00018", "계좌잔고")
+
+        # 여러 레코드명 시도 (환경에 따라 다를 수 있음)
+        # 빈 문자열도 시도 (키움 API에서 레코드명 무시하는 경우 있음)
+        record_names = ["", "opw00018", "계좌평가잔고개별합산", "계좌잔고"]
+        repeat_cnt = 0
+        used_record_name = ""
+
+        for rec_name in record_names:
+            repeat_cnt = self.get_repeat_cnt("opw00018", rec_name)
+            self._debug(f"[opw00018] try record_name='{rec_name}' -> repeat_cnt={repeat_cnt}")
+            if repeat_cnt > 0:
+                used_record_name = rec_name
+                break
+
+        if repeat_cnt == 0:
+            self._debug("[opw00018] No holdings found with any record name")
+
         for i in range(repeat_cnt):
+            # 종목코드 조회 (종목번호 필드 사용) - used_record_name 직접 사용
+            code_raw = self.get_comm_data("opw00018", used_record_name, i, "종목번호").strip()
+            if not code_raw:
+                code_raw = self.get_comm_data("opw00018", used_record_name, i, "종목코드").strip()
+            if not code_raw:
+                continue
+            code = code_raw.replace("A", "").replace(" ", "")
+
+            # 종목명 조회
+            name = self.get_comm_data("opw00018", used_record_name, i, "종목명").strip()
+
+            # 보유수량 조회 (여러 필드명 시도)
+            quantity_str = self.get_comm_data("opw00018", used_record_name, i, "보유수량")
+            if not quantity_str or quantity_str.strip() == "":
+                quantity_str = self.get_comm_data("opw00018", used_record_name, i, "현재보유량")
+            quantity = abs(safe_int(quantity_str))
+
+            # 매입가 조회
+            avg_price_str = self.get_comm_data("opw00018", used_record_name, i, "매입가")
+            if not avg_price_str or avg_price_str.strip() == "":
+                avg_price_str = self.get_comm_data("opw00018", used_record_name, i, "평균매입가")
+            avg_price = abs(safe_int(avg_price_str))
+
+            # 현재가 조회 (부호 있을 수 있음 -> abs 처리)
+            current_price_str = self.get_comm_data("opw00018", used_record_name, i, "현재가")
+            current_price = abs(safe_int(current_price_str))
+
+            # 평가금액 조회 (필드가 없으면 현재가 * 보유수량으로 계산)
+            eval_amount_str = self.get_comm_data("opw00018", used_record_name, i, "평가금액")
+            eval_amount = abs(safe_int(eval_amount_str))
+            if eval_amount == 0 and current_price > 0 and quantity > 0:
+                eval_amount = current_price * quantity
+
+            # 평가손익 조회 (음수 가능)
+            profit_str = self.get_comm_data("opw00018", used_record_name, i, "평가손익")
+            if not profit_str or profit_str.strip() == "":
+                profit_str = self.get_comm_data("opw00018", used_record_name, i, "손익금액")
+            profit = safe_int(profit_str)
+            # 평가손익이 없으면 계산 (평가금액 - 매입금액)
+            if profit == 0 and eval_amount > 0 and avg_price > 0:
+                profit = eval_amount - (avg_price * quantity)
+
+            # 수익률 조회
+            profit_rate_str = self.get_comm_data("opw00018", used_record_name, i, "수익률(%)")
+            if not profit_rate_str or profit_rate_str.strip() == "":
+                profit_rate_str = self.get_comm_data("opw00018", used_record_name, i, "수익률")
+            try:
+                profit_rate = float(profit_rate_str) if profit_rate_str else 0.0
+            except ValueError:
+                profit_rate = 0.0
+            # 수익률이 없으면 계산
+            if profit_rate == 0.0 and avg_price > 0:
+                profit_rate = ((current_price - avg_price) / avg_price) * 100
+
             holding = {
-                "name": self.get_comm_data("opw00018", "계좌잔고", i, "종목명").strip(),
-                "code": self.get_comm_data("opw00018", "계좌잔고", i, "종목번호").strip().replace("A", ""),
-                "quantity": int(self.get_comm_data("opw00018", "계좌잔고", i, "보유수량") or 0),
-                "avg_price": int(self.get_comm_data("opw00018", "계좌잔고", i, "매입가") or 0),
-                "current_price": int(self.get_comm_data("opw00018", "계좌잔고", i, "현재가") or 0),
-                "eval_amount": int(self.get_comm_data("opw00018", "계좌잔고", i, "평가금액") or 0),
-                "profit": int(self.get_comm_data("opw00018", "계좌잔고", i, "평가손익") or 0),
-                "profit_rate": float(self.get_comm_data("opw00018", "계좌잔고", i, "수익률(%)") or 0),
+                "code": code,
+                "name": name,
+                "quantity": quantity,
+                "avg_price": avg_price,
+                "current_price": current_price,
+                "eval_amount": eval_amount,
+                "profit": profit,
+                "profit_rate": profit_rate,
             }
+
             if holding["quantity"] > 0:
                 holdings.append(holding)
+                self._debug(
+                    "[opw00018] holding "
+                    f"code={code} name={name} qty={quantity} avg={avg_price} "
+                    f"cur={current_price} eval={eval_amount} profit={profit} rate={profit_rate:.2f}"
+                )
 
         balance["holdings"] = holdings
 
@@ -330,17 +582,18 @@ class KiwoomAPI:
 
         return balance
 
-    def get_deposit(self, account):
+    def get_deposit(self, account, password=""):
         """
         ✅ 예수금 상세 조회 (opw00001)
 
         opw00018에서 예수금이 안 나올 경우 이 함수 사용
         """
         self.set_input_value("계좌번호", account)
-        self.set_input_value("비밀번호", "")
+        self.set_input_value("비밀번호", password)  # 비밀번호 직접 전달
         self.set_input_value("비밀번호입력매체구분", "00")
         self.set_input_value("조회구분", "2")  # 2: 일반조회
         self.comm_rq_data("예수금조회", "opw00001", 0, "0106")
+        record_name = self._get_record_name("예수금조회", "opw00001", "예수금조회")
 
         def safe_int(val):
             if val is None or val.strip() == "":
@@ -354,14 +607,43 @@ class KiwoomAPI:
             except ValueError:
                 return 0
 
+        def read_field(field):
+            return safe_int(self.get_comm_data("opw00001", record_name, 0, field))
+
+        def first_nonzero(fields):
+            for field in fields:
+                val = read_field(field)
+                if val != 0:
+                    return val
+            return 0
+
         # rqname = "예수금조회" (comm_rq_data에서 사용한 이름)
+        # 증권사/환경에 따라 필드명이 달라질 수 있어 복수 필드로 시도
         deposit_info = {
-            "deposit": safe_int(self.get_comm_data("opw00001", "예수금조회", 0, "예수금")),
-            "deposit_d1": safe_int(self.get_comm_data("opw00001", "예수금조회", 0, "D+1추정예수금")),
-            "deposit_d2": safe_int(self.get_comm_data("opw00001", "예수금조회", 0, "D+2추정예수금")),
-            "available": safe_int(self.get_comm_data("opw00001", "예수금조회", 0, "출금가능금액")),
-            "order_available": safe_int(self.get_comm_data("opw00001", "예수금조회", 0, "주문가능금액")),
+            "deposit": first_nonzero(["예수금", "D+2추정예수금", "D+2예수금", "주문가능금액"]),
+            "deposit_d1": first_nonzero(["D+1예수금", "D+1추정예수금"]),
+            "deposit_d2": first_nonzero(["D+2예수금", "D+2추정예수금"]),
+            "available": first_nonzero(["출금가능금액", "인출가능금액"]),
+            "order_available": first_nonzero(["주문가능금액", "출금가능금액"]),
         }
+        deposit_raw = {
+            "예수금": self.get_comm_data("opw00001", record_name, 0, "예수금"),
+            "D+1예수금": self.get_comm_data("opw00001", record_name, 0, "D+1예수금"),
+            "D+1추정예수금": self.get_comm_data("opw00001", record_name, 0, "D+1추정예수금"),
+            "D+2예수금": self.get_comm_data("opw00001", record_name, 0, "D+2예수금"),
+            "D+2추정예수금": self.get_comm_data("opw00001", record_name, 0, "D+2추정예수금"),
+            "출금가능금액": self.get_comm_data("opw00001", record_name, 0, "출금가능금액"),
+            "인출가능금액": self.get_comm_data("opw00001", record_name, 0, "인출가능금액"),
+            "주문가능금액": self.get_comm_data("opw00001", record_name, 0, "주문가능금액"),
+        }
+        self._debug(f"[opw00001] raw_fields={deposit_raw} parsed={deposit_info}")
+
+        best_deposit = deposit_info.get("order_available", 0) or deposit_info.get("deposit_d2", 0) or deposit_info.get("deposit", 0)
+        try:
+            if best_deposit > 0:
+                self.account_signals.deposit_changed.emit(best_deposit)
+        except Exception:
+            pass
 
         return deposit_info
 
@@ -411,18 +693,19 @@ class KiwoomAPI:
         self.set_input_value("체결구분", "1")  # 1: 미체결
         self.comm_rq_data("미체결조회", "opt10075", 0, "0104")
 
+        record_name = self._get_record_name("미체결조회", "opt10075", "미체결조회")
         orders = []
-        repeat_cnt = self.get_repeat_cnt("opt10075", "미체결조회")
+        repeat_cnt = self.get_repeat_cnt("opt10075", record_name)
 
         for i in range(repeat_cnt):
             order = {
-                "order_no": self.get_comm_data("opt10075", "미체결조회", i, "주문번호").strip(),
-                "code": self.get_comm_data("opt10075", "미체결조회", i, "종목코드").strip(),
-                "name": self.get_comm_data("opt10075", "미체결조회", i, "종목명").strip(),
-                "order_type": self.get_comm_data("opt10075", "미체결조회", i, "주문구분").strip(),  # +매수, -매도
-                "order_quantity": int(self.get_comm_data("opt10075", "미체결조회", i, "주문수량") or 0),
-                "order_price": int(self.get_comm_data("opt10075", "미체결조회", i, "주문가격") or 0),
-                "not_executed": int(self.get_comm_data("opt10075", "미체결조회", i, "미체결수량") or 0),
+                "order_no": self.get_comm_data("opt10075", record_name, i, "주문번호").strip(),
+                "code": self.get_comm_data("opt10075", record_name, i, "종목코드").strip(),
+                "name": self.get_comm_data("opt10075", record_name, i, "종목명").strip(),
+                "order_type": self.get_comm_data("opt10075", record_name, i, "주문구분").strip(),  # +매수, -매도
+                "order_quantity": int(self.get_comm_data("opt10075", record_name, i, "주문수량") or 0),
+                "order_price": int(self.get_comm_data("opt10075", record_name, i, "주문가격") or 0),
+                "not_executed": int(self.get_comm_data("opt10075", record_name, i, "미체결수량") or 0),
             }
             if order["not_executed"] > 0:
                 orders.append(order)
@@ -562,19 +845,20 @@ class KiwoomAPI:
         self.set_input_value("조회구분", "0")  # 0: 전체
         self.comm_rq_data("당일체결조회", "opt10085", 0, "0105")
 
+        record_name = self._get_record_name("당일체결조회", "opt10085", "당일체결조회")
         executions = []
-        repeat_cnt = self.get_repeat_cnt("opt10085", "당일체결조회")
+        repeat_cnt = self.get_repeat_cnt("opt10085", record_name)
 
         for i in range(repeat_cnt):
             execution = {
-                "code": self.get_comm_data("opt10085", "당일체결조회", i, "종목코드").strip().replace("A", ""),
-                "name": self.get_comm_data("opt10085", "당일체결조회", i, "종목명").strip(),
-                "order_type": self.get_comm_data("opt10085", "당일체결조회", i, "매매구분").strip(),
-                "quantity": abs(int(self.get_comm_data("opt10085", "당일체결조회", i, "체결수량") or 0)),
-                "price": abs(int(self.get_comm_data("opt10085", "당일체결조회", i, "체결가") or 0)),
-                "total_amount": abs(int(self.get_comm_data("opt10085", "당일체결조회", i, "체결금액") or 0)),
-                "time": self.get_comm_data("opt10085", "당일체결조회", i, "체결시간").strip(),
-                "order_no": self.get_comm_data("opt10085", "당일체결조회", i, "주문번호").strip(),
+                "code": self.get_comm_data("opt10085", record_name, i, "종목코드").strip().replace("A", ""),
+                "name": self.get_comm_data("opt10085", record_name, i, "종목명").strip(),
+                "order_type": self.get_comm_data("opt10085", record_name, i, "매매구분").strip(),
+                "quantity": abs(int(self.get_comm_data("opt10085", record_name, i, "체결수량") or 0)),
+                "price": abs(int(self.get_comm_data("opt10085", record_name, i, "체결가") or 0)),
+                "total_amount": abs(int(self.get_comm_data("opt10085", record_name, i, "체결금액") or 0)),
+                "time": self.get_comm_data("opt10085", record_name, i, "체결시간").strip(),
+                "order_no": self.get_comm_data("opt10085", record_name, i, "주문번호").strip(),
             }
             if execution["quantity"] > 0:
                 executions.append(execution)

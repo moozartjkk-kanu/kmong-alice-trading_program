@@ -14,7 +14,7 @@ DEFAULT_CONFIG = {
     "kiwoom": {
         "account_number": "",  # 계좌번호 (로그인 후 자동으로 가져옴)
         "account_password": "",  # 계좌 비밀번호 (필요시)
-        "use_mock_trading": True,  # 모의투자 사용 여부
+        "use_mock_trading": False,  # 모의투자 사용 여부
     },
 
     # 매수 설정
