@@ -544,7 +544,8 @@ class KiwoomAPI:
         profit_rate_str = single_data.get("profit_rate_str", "")
 
         try:
-            profit_rate = float(profit_rate_str) if profit_rate_str else 0.0
+            # 키움 API는 수익률을 100배한 값으로 반환 (예: -11.58% → -1158)
+            profit_rate = float(profit_rate_str) / 100.0 if profit_rate_str else 0.0
         except ValueError:
             profit_rate = 0.0
 
@@ -602,7 +603,8 @@ class KiwoomAPI:
             if not profit_rate_str or profit_rate_str.strip() == "":
                 profit_rate_str = raw.get("profit_rate_str2", "")
             try:
-                item_profit_rate = float(profit_rate_str) if profit_rate_str else 0.0
+                # 키움 API는 수익률을 100배한 값으로 반환 (예: -11.58% → -1158)
+                item_profit_rate = float(profit_rate_str) / 100.0 if profit_rate_str else 0.0
             except ValueError:
                 item_profit_rate = 0.0
             if item_profit_rate == 0.0 and avg_price > 0:

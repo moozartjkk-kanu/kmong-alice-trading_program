@@ -56,7 +56,22 @@
     }
   ],
   "max_watchlist_count": 200,
-  "positions": {},
+  "positions": {
+    "007460": {
+      "code": "007460",
+      "name": "에이프로젠",
+      "quantity": 1,
+      "avg_price": 777,
+      "buy_count": 1,
+      "last_buy_price": 777,
+      "sold_targets": [],
+      "sell_occurred": false,
+      "initial_quantity": 1,
+      "stoploss_triggered": false,
+      "stoploss_price": 0,
+      "last_update": "2026-02-03 06:42:34"
+    }
+  },
   "pending_orders": {},
   "session": {
     "last_trading_date": "20260203",
