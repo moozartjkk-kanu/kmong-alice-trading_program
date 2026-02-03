@@ -71,6 +71,13 @@ class MainWindow(QMainWindow):
         self.trading_timer = QTimer()
         self.trading_timer.timeout.connect(self.check_trading_signals)
 
+        # ✅ 장 열림 감지 타이머 (주문 복원 자동 호출용)
+        self._orders_restored_today = False
+        self._last_market_open_check_date = None
+        self.market_open_timer = QTimer()
+        self.market_open_timer.timeout.connect(self._check_market_open_and_restore)
+        self.market_open_timer.start(60000)  # 1분마다 체크
+
         # 초기 감시 종목 로드 (로그인 전에도 목록 표시)
         QTimer.singleShot(100, self._load_initial_watchlist)
 
@@ -722,10 +729,71 @@ class MainWindow(QMainWindow):
         if self._is_stopping or not self.trader or not self.trader.is_running:
             return
 
+        # ✅ 장이 열렸을 때만 복원 실행 (장 전이면 장 열림 타이머가 처리)
+        if not self.trader.is_market_open():
+            self.log("[시스템] 장 시간이 아니어서 주문 복원 대기 - 장 열림 시 자동 복원됨")
+            return
+
         try:
             self.trader.check_and_restore_orders()
+            self._orders_restored_today = True  # ✅ 복원 완료 표시
         except Exception as e:
             self.log(f"[시스템] 주문 복원 오류: {e}")
+
+    def _check_market_open_and_restore(self):
+        """
+        장 열림 감지 시 check_and_restore_orders() 자동 호출
+        - 매 1분마다 체크
+        - 날짜 변경 시 플래그 초기화
+        - 장이 열렸고 아직 복원하지 않았으면 주문 복원 실행
+        """
+        from datetime import datetime, time as dt_time
+
+        now = datetime.now()
+        today = now.date()
+
+        # 날짜가 변경되면 플래그 초기화
+        if self._last_market_open_check_date != today:
+            self._last_market_open_check_date = today
+            self._orders_restored_today = False
+
+        # trader가 없거나 실행 중이 아니면 스킵
+        if not self.trader or not self.trader.is_running:
+            return
+
+        # 정규장 시간 체크 (09:00 ~ 15:30)
+        current_time = now.time()
+        market_open = dt_time(9, 0)
+        market_close = dt_time(15, 30)
+
+        if not (market_open <= current_time <= market_close):
+            return
+
+        # ✅ 이미 복원했어도 미체결 주문이 없으면 다시 복원 시도
+        if self._orders_restored_today:
+            try:
+                # 실제 미체결 주문 확인
+                api_pending = self.trader.kiwoom.get_open_orders(self.trader.account)
+                pending_orders = self.trader.config.get_pending_orders()
+
+                if api_pending or not pending_orders:
+                    # 미체결 주문이 있거나 복원할 주문이 없으면 스킵
+                    return
+                else:
+                    # 미체결 주문이 없고 복원할 주문이 있으면 다시 복원
+                    self.log("[시스템] 기존 주문 취소 감지 - 주문 재복원 시작")
+                    self._orders_restored_today = False
+            except Exception as e:
+                self.log(f"[시스템] 미체결 주문 확인 오류: {e}")
+                return
+
+        # 주문 복원 실행
+        self.log("[시스템] 정규장 시간 - 주문 복원 자동 실행")
+        try:
+            self.trader.check_and_restore_orders()
+            self._orders_restored_today = True
+        except Exception as e:
+            self.log(f"[시스템] 장 열림 주문 복원 오류: {e}")
 
     def _stop_autotrade_async(self):
         """UI 프리징을 줄이기 위해 stop/save를 이벤트루프 다음 tick에서 수행"""
