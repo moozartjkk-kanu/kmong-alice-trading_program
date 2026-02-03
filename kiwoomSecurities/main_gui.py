@@ -877,16 +877,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _on_balance_changed(self, code, quantity, avg_price):
+    def _on_balance_changed(self, _code, _quantity, _avg_price):
         """잔고 변경 시그널 처리 (개별 종목)"""
         try:
-            # 보유종목 테이블에서 해당 종목 찾아서 업데이트
-            for row in range(self.holdings_table.rowCount()):
-                item = self.holdings_table.item(row, 0)
-                if item and item.text() == code:
-                    self.holdings_table.setItem(row, 2, QTableWidgetItem(f"{quantity:,}"))
-                    self.holdings_table.setItem(row, 3, QTableWidgetItem(f"{avg_price:,}"))
-                    break
+            # ✅ 보유종목 전체 갱신 (수동 매수 시에도 바로 표시되도록)
+            self.refresh_holdings()
         except Exception:
             pass
 
