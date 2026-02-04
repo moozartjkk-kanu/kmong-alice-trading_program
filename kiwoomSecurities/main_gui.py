@@ -395,32 +395,26 @@ class MainWindow(QMainWindow):
         self.setting_envelope_buy_percent.setToolTip("실제 지정가 매수 주문 가격 (예: 20% = MA × 0.80 + 1호가)")
         buy_layout.addWidget(self.setting_envelope_buy_percent, 1, 1)
 
-        buy_layout.addWidget(QLabel("최대 매수 횟수:"), 1, 2)
-        self.setting_max_buy = QSpinBox()
-        self.setting_max_buy.setRange(1, 5)
-        self.setting_max_buy.setValue(self.config.get("buy", "max_buy_count"))
-        buy_layout.addWidget(self.setting_max_buy, 1, 3)
-
-        buy_layout.addWidget(QLabel("추가매수 하락률 %:"), 2, 0)
+        buy_layout.addWidget(QLabel("추가매수 하락률 %:"), 1, 2)
         self.setting_add_drop = QSpinBox()
         self.setting_add_drop.setRange(5, 30)
         self.setting_add_drop.setValue(self.config.get("buy", "additional_buy_drop_percent"))
-        buy_layout.addWidget(self.setting_add_drop, 2, 1)
+        buy_layout.addWidget(self.setting_add_drop, 1, 3)
 
-        buy_layout.addWidget(QLabel("1회 매수 금액:"), 2, 2)
+        buy_layout.addWidget(QLabel("1회 매수 금액:"), 2, 0)
         self.setting_buy_amount = QSpinBox()
         self.setting_buy_amount.setRange(100000, 100000000)
         self.setting_buy_amount.setSingleStep(100000)
         self.setting_buy_amount.setValue(self.config.get("buy", "buy_amount_per_stock"))
         self.setting_buy_amount.setSuffix(" 원")
-        buy_layout.addWidget(self.setting_buy_amount, 2, 3)
+        buy_layout.addWidget(self.setting_buy_amount, 2, 1)
 
-        buy_layout.addWidget(QLabel("최대 동시 보유 종목수:"), 3, 0)
+        buy_layout.addWidget(QLabel("최대 동시 보유 종목수:"), 2, 2)
         self.setting_max_holding = QSpinBox()
         self.setting_max_holding.setRange(1, 50)
         self.setting_max_holding.setValue(self.config.get("buy", "max_holding_stocks") or 3)
         self.setting_max_holding.setSuffix(" 종목")
-        buy_layout.addWidget(self.setting_max_holding, 3, 1)
+        buy_layout.addWidget(self.setting_max_holding, 2, 3)
 
         # 재진입 허용 체크박스 삭제됨 - 매도 발생 시 당일 재매수 금지
 
@@ -1486,7 +1480,6 @@ class MainWindow(QMainWindow):
         self.config.set(self.setting_envelope_period.value(), "buy", "envelope_period")
         self.config.set(self.setting_envelope_percent.value(), "buy", "envelope_percent")
         self.config.set(self.setting_envelope_buy_percent.value(), "buy", "envelope_buy_percent")
-        self.config.set(self.setting_max_buy.value(), "buy", "max_buy_count")
         self.config.set(self.setting_add_drop.value(), "buy", "additional_buy_drop_percent")
         self.config.set(self.setting_buy_amount.value(), "buy", "buy_amount_per_stock")
         self.config.set(self.setting_max_holding.value(), "buy", "max_holding_stocks")
