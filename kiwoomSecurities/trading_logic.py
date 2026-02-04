@@ -77,6 +77,9 @@ class AutoTrader:
         # 주문 복원 완료 여부
         self.orders_restored = False
 
+        # ✅ 자동매도 체결 추적 (수동매도 구분용)
+        self._auto_sell_executed = {}  # {code: True} - 자동매도 체결 시 설정, balance 처리 후 리셋
+
         # 체결 콜백 설정
         if self.kiwoom:
             self.kiwoom.set_chejan_callback(self._on_order_executed)
@@ -1079,20 +1082,24 @@ class AutoTrader:
                     else:
                         # ✅ 매도 체결 시 sold_targets 업데이트
                         position = self.config.get_position(code)
+                        target_name = ""
+                        is_auto_sell = False
+
                         if position:
-                            # 체결된 매도 주문의 target_name 찾기
+                            # 체결된 매도 주문의 target_name 찾기 (자동매도 여부 판단)
                             pending_orders = self.config.get_pending_orders().get(code, [])
                             for order in pending_orders:
                                 if order.get("order_type") == "sell" and int(order.get("price", 0)) == int(executed_price):
                                     target_name = order.get("target_name", "")
                                     if target_name:
+                                        is_auto_sell = True  # ✅ 자동매도
                                         sold_targets = position.get("sold_targets", [])
                                         if target_name not in sold_targets:
                                             sold_targets.append(target_name)
                                             position["sold_targets"] = sold_targets
                                             position["sell_occurred"] = True
                                             self.config.update_position(code, position)
-                                            self.log(f"[{code}] {target_name} 매도 체결 완료", "SUCCESS")
+                                            self.log(f"[{code}] {target_name} 매도 체결 완료 (자동)", "SUCCESS")
 
                                             # ✅ 매도 발생 시 미체결 매수 주문 취소
                                             self._cancel_pending_buy_orders(code)
@@ -1101,6 +1108,12 @@ class AutoTrader:
                             # placed_sell_orders에서 해당 타겟 제거
                             if code in self.placed_sell_orders and target_name in self.placed_sell_orders[code]:
                                 del self.placed_sell_orders[code][target_name]
+
+                        # ✅ 자동매도 플래그 설정 (balance에서 재계산 여부 판단용)
+                        if is_auto_sell:
+                            self._auto_sell_executed[code] = True
+                        else:
+                            self.log(f"[{code}] 수동 매도 체결 감지 @ {executed_price:,}원", "INFO")
 
                         self.config.remove_pending_order(code, order_type="sell", price=executed_price)
 
@@ -1126,6 +1139,24 @@ class AutoTrader:
                         # ✅ 매수 체결 후 매도 주문 설정
                         self._schedule_sell_orders_after_buy(code, position)
 
+                    # ✅ 매도로 인한 수량 감소 시
+                    elif quantity < old_quantity:
+                        position["sell_occurred"] = True
+                        self.config.update_position(code, position)
+
+                        # ✅ 자동매도인지 수동매도인지 확인
+                        is_auto_sell = self._auto_sell_executed.pop(code, False)
+
+                        if is_auto_sell:
+                            # 자동매도: 초기 비중대로 유지, 재계산 안 함
+                            self.log(f"[{code}] 자동매도 체결 - 기존 매도 주문 유지 (남은 {quantity}주)", "INFO")
+                        else:
+                            # 수동매도: 남은 수량 기준으로 재계산/재발주
+                            if quantity > 0:
+                                self.log(f"[{code}] 수동매도 체결 - 자동매도 주문 재계산 필요 (남은 {quantity}주)", "INFO")
+                                self._recalculate_sell_orders_on_quantity_decrease(code, position)
+                            # 남은 수량 0이면 아래 if quantity == 0에서 정리
+
                     self.config.update_position(code, position)
 
                     # 전량 매도 완료 시 정리
@@ -1139,7 +1170,7 @@ class AutoTrader:
                         # stoploss_price는 0으로 (매도 완료)
                         position["stoploss_price"] = 0
                         self.config.update_position(code, position)
-                        self.log(f"[{code}] 전량 매도 완료", "SUCCESS")
+                        self.log(f"[{code}] 전량 매도 완료 - 자동매도 재계산 스킵", "SUCCESS")
 
                 self._check_and_cancel_excess_orders()
 
@@ -1175,6 +1206,83 @@ class AutoTrader:
 
         except Exception as e:
             self.log(f"[{code}] 매도 주문 설정 중 오류: {e}", "ERROR")
+
+    def _recalculate_sell_orders_on_quantity_decrease(self, code, position):
+        """
+        ✅ 수동 매도 등으로 보유 수량이 감소했을 때 자동매도 주문 재계산/재발주
+
+        요구사항:
+        - 남은 수량이 0이면 재계산하지 않음 (호출 전 체크됨)
+        - 남은 수량이 있으면 기존 매도 주문 취소 후 남은 수량으로 재발주
+        """
+        try:
+            remaining_qty = position.get("quantity", 0)
+
+            # 남은 수량이 없으면 재계산하지 않음
+            if remaining_qty <= 0:
+                self.log(f"[{code}] 남은 수량 없음 - 자동매도 재계산 스킵", "INFO")
+                return
+
+            # 스탑로스 발동 종목은 스탑로스 주문만 유지 (별도 처리)
+            if position.get("stoploss_triggered", False):
+                self.log(f"[{code}] 스탑로스 발동 종목 - 스탑로스 주문 유지", "INFO")
+                return
+
+            # 장 시간 외면 재계산 대기
+            if not self.is_market_open():
+                self.log(f"[{code}] 장 시간 외 - 자동매도 재계산 대기", "INFO")
+                return
+
+            stock_name = position.get("name", code)
+            self.log(f"[{code} {stock_name}] 수량 감소 감지 - 자동매도 주문 재계산 시작 (남은 수량: {remaining_qty}주)", "INFO")
+
+            # 1) 해당 종목의 모든 미체결 매도 주문 취소
+            try:
+                cancelled = self.kiwoom.cancel_sell_orders_for_stock(self.account, code)
+                if cancelled > 0:
+                    self.log(f"[{code}] 기존 매도 주문 {cancelled}건 취소", "INFO")
+            except Exception as e:
+                self.log(f"[{code}] 기존 매도 주문 취소 오류: {e}", "ERROR")
+                # 취소 실패해도 계속 진행 (새 주문이 중복될 수 있지만 안전)
+
+            # 2) placed_sell_orders 초기화 (이미 체결된 타겟은 sold_targets에 있음)
+            sold_targets = position.get("sold_targets", [])
+            if code in self.placed_sell_orders:
+                # 체결 완료된 타겟만 유지
+                self.placed_sell_orders[code] = {k: v for k, v in self.placed_sell_orders[code].items() if k in sold_targets}
+
+            # 3) pending_orders에서 매도 주문 정리
+            self.config.clear_pending_orders_for_stock(code, order_type="sell")
+
+            # 4) 일봉 데이터 가져오기
+            candles = None
+            if self.event_engine:
+                candles = self.event_engine.get_candles(code)
+            if not candles:
+                candles = self.kiwoom.get_daily_candles(code, 30) if self.kiwoom else None
+
+            if not candles:
+                self.log(f"[{code}] 일봉 데이터 없음 - 자동매도 재계산 대기", "WARNING")
+                return
+
+            # 5) 남은 수량을 initial_quantity로 사용하여 새 매도 주문 계산 및 발주
+            # 기존 initial_quantity 백업
+            original_initial = position.get("initial_quantity", 0)
+
+            # 남은 수량으로 initial_quantity 임시 설정 (비중 계산용)
+            position["initial_quantity"] = remaining_qty
+
+            # 매도 주문 재발주
+            self._ensure_sell_orders_placed(code, position, candles)
+
+            # initial_quantity 복원 (전체 물량 기록 유지)
+            position["initial_quantity"] = original_initial
+            self.config.update_position(code, position)
+
+            self.log(f"[{code}] 자동매도 주문 재계산 완료 (남은 {remaining_qty}주 기준)", "SUCCESS")
+
+        except Exception as e:
+            self.log(f"[{code}] 자동매도 재계산 오류: {e}", "ERROR")
 
     def _check_and_cancel_excess_orders(self):
         """조건 8-2: 최대 보유 종목수 도달시 보유종목 외의 미체결 매수주문 취소"""

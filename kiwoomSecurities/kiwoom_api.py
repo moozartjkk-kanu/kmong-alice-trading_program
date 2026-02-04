@@ -830,6 +830,40 @@ class KiwoomAPI:
 
         return cancelled_count
 
+    def cancel_sell_orders_for_stock(self, account, code):
+        """
+        특정 종목의 미체결 매도 주문만 취소
+
+        Args:
+            account: 계좌번호
+            code: 종목코드
+
+        Returns:
+            취소된 주문 수
+        """
+        orders = self.get_open_orders(account)
+        cancelled_count = 0
+
+        for order in orders:
+            if order["code"] == code or order["code"] == code.replace("A", ""):
+                # 매도 주문인 경우만 취소
+                if "매도" in order["order_type"] or "-" in order["order_type"]:
+                    result = self.send_order(
+                        "주문취소",
+                        "0203",
+                        account,
+                        4,  # 매도취소
+                        order["code"],
+                        order["not_executed"],
+                        0,
+                        "00",
+                        order["order_no"]
+                    )
+                    if result == 0:
+                        cancelled_count += 1
+
+        return cancelled_count
+
     def cancel_buy_orders_except_holdings(self, account, holding_codes):
         """
         보유종목을 제외한 모든 종목의 미체결 매수 주문 취소 (조건 8-2)
