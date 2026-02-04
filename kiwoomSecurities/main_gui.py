@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTabWidget,
-    QMessageBox, QHeaderView, QFrame, QGridLayout
+    QMessageBox, QHeaderView, QFrame, QGridLayout, QInputDialog
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QColor
@@ -235,9 +235,9 @@ class MainWindow(QMainWindow):
         sell_group = QGroupBox("수동 매도")
         sell_layout = QGridLayout(sell_group)
 
-        sell_layout.addWidget(QLabel("종목코드:"), 0, 0)
+        sell_layout.addWidget(QLabel("종목코드/종목명:"), 0, 0)
         self.manual_sell_code = QLineEdit()
-        self.manual_sell_code.setPlaceholderText("예: 005930")
+        self.manual_sell_code.setPlaceholderText("예: 005930, 삼성전자")
         sell_layout.addWidget(self.manual_sell_code, 0, 1)
 
         sell_layout.addWidget(QLabel("수량:"), 1, 0)
@@ -285,9 +285,9 @@ class MainWindow(QMainWindow):
         buy_group = QGroupBox("수동 매수")
         buy_layout = QGridLayout(buy_group)
 
-        buy_layout.addWidget(QLabel("종목코드:"), 0, 0)
+        buy_layout.addWidget(QLabel("종목코드/종목명:"), 0, 0)
         self.manual_buy_code = QLineEdit()
-        self.manual_buy_code.setPlaceholderText("예: 005930")
+        self.manual_buy_code.setPlaceholderText("예: 005930, 삼성전자")
         buy_layout.addWidget(self.manual_buy_code, 0, 1)
 
         buy_layout.addWidget(QLabel("수량:"), 1, 0)
@@ -347,7 +347,7 @@ class MainWindow(QMainWindow):
 
         add_layout = QHBoxLayout()
         self.add_code_input = QLineEdit()
-        self.add_code_input.setPlaceholderText("종목코드 입력 (예: 005930)")
+        self.add_code_input.setPlaceholderText("종목코드 또는 종목명 입력 (예: 005930, 삼성전자)")
         add_layout.addWidget(self.add_code_input)
 
         add_btn = QPushButton("종목 추가")
@@ -1148,24 +1148,50 @@ class MainWindow(QMainWindow):
     # 워치리스트 관리
     # =========================
     def add_to_watchlist(self):
-        """감시 종목 추가"""
-        code = self.add_code_input.text().strip()
-        if not code:
-            QMessageBox.warning(self, "입력 오류", "종목코드를 입력해주세요.")
+        """감시 종목 추가 (종목코드 또는 종목명으로 검색)"""
+        input_text = self.add_code_input.text().strip()
+        if not input_text:
+            QMessageBox.warning(self, "입력 오류", "종목코드 또는 종목명을 입력해주세요.")
             return
 
-        if not code.isdigit() or len(code) != 6:
-            QMessageBox.warning(self, "입력 오류", "종목코드는 6자리 숫자입니다. (예: 005930)")
-            return
-
+        code = ""
         name = ""
-        if self.kiwoom and self.kiwoom.is_connected():
-            name = self.kiwoom.get_master_code_name(code)
-            if not name:
-                QMessageBox.warning(self, "오류", f"종목코드 '{code}'를 찾을 수 없습니다.")
-                return
+
+        # 6자리 숫자인 경우 종목코드로 처리
+        if input_text.isdigit() and len(input_text) == 6:
+            code = input_text
+            if self.kiwoom and self.kiwoom.is_connected():
+                name = self.kiwoom.get_master_code_name(code)
+                if not name:
+                    QMessageBox.warning(self, "오류", f"종목코드 '{code}'를 찾을 수 없습니다.")
+                    return
+            else:
+                self.log("[시스템] 로그인 전 종목 추가: 종목명은 로그인 후 자동 표시될 수 있습니다.")
         else:
-            self.log("[시스템] 로그인 전 종목 추가: 종목명은 로그인 후 자동 표시될 수 있습니다.")
+            # 종목명으로 검색
+            if not self.kiwoom or not self.kiwoom.is_connected():
+                QMessageBox.warning(self, "오류", "종목명 검색은 로그인 후 가능합니다.")
+                return
+
+            results = self.kiwoom.find_stocks_by_name(input_text)
+            if not results:
+                QMessageBox.warning(self, "검색 결과 없음", f"'{input_text}'에 해당하는 종목을 찾을 수 없습니다.")
+                return
+            elif len(results) == 1:
+                code, name = results[0]
+            else:
+                # 여러 결과가 있으면 사용자에게 선택하도록 함
+                items = [f"{r[0]} - {r[1]}" for r in results]
+                selected, ok = QInputDialog.getItem(
+                    self, "종목 선택",
+                    f"'{input_text}' 검색 결과 ({len(results)}건):",
+                    items, 0, False
+                )
+                if ok and selected:
+                    idx = items.index(selected)
+                    code, name = results[idx]
+                else:
+                    return
 
         success, message = self.config.add_to_watchlist(code, name)
         if success:
@@ -1195,6 +1221,56 @@ class MainWindow(QMainWindow):
             self.config.remove_from_watchlist(code)
             self.log(f"[시스템] 감시 종목 삭제: {code}")
             self.refresh_watchlist()
+
+    def resolve_stock_code(self, input_text):
+        """종목코드 또는 종목명을 입력받아 종목코드와 종목명을 반환
+
+        Args:
+            input_text: 종목코드(6자리 숫자) 또는 종목명
+
+        Returns:
+            (code, name) 튜플. 실패 시 (None, None) 반환
+        """
+        if not input_text:
+            QMessageBox.warning(self, "입력 오류", "종목코드 또는 종목명을 입력해주세요.")
+            return None, None
+
+        # 6자리 숫자인 경우 종목코드로 처리
+        if input_text.isdigit() and len(input_text) == 6:
+            code = input_text
+            if self.kiwoom and self.kiwoom.is_connected():
+                name = self.kiwoom.get_master_code_name(code)
+                if not name:
+                    QMessageBox.warning(self, "오류", f"종목코드 '{code}'를 찾을 수 없습니다.")
+                    return None, None
+                return code, name
+            else:
+                return code, ""
+        else:
+            # 종목명으로 검색
+            if not self.kiwoom or not self.kiwoom.is_connected():
+                QMessageBox.warning(self, "오류", "종목명 검색은 로그인 후 가능합니다.")
+                return None, None
+
+            results = self.kiwoom.find_stocks_by_name(input_text)
+            if not results:
+                QMessageBox.warning(self, "검색 결과 없음", f"'{input_text}'에 해당하는 종목을 찾을 수 없습니다.")
+                return None, None
+            elif len(results) == 1:
+                return results[0]
+            else:
+                # 여러 결과가 있으면 사용자에게 선택하도록 함
+                items = [f"{r[0]} - {r[1]}" for r in results]
+                selected, ok = QInputDialog.getItem(
+                    self, "종목 선택",
+                    f"'{input_text}' 검색 결과 ({len(results)}건):",
+                    items, 0, False
+                )
+                if ok and selected:
+                    idx = items.index(selected)
+                    return results[idx]
+                else:
+                    return None, None
 
     # =========================
     # 보유종목 선택 / 분석
@@ -1290,17 +1366,18 @@ class MainWindow(QMainWindow):
         if not self.trader:
             return
 
-        code = self.manual_sell_code.text().strip()
+        input_text = self.manual_sell_code.text().strip()
         quantity = self.manual_sell_qty.value()
         price = self.manual_sell_price.value()
 
+        code, name = self.resolve_stock_code(input_text)
         if not code:
-            QMessageBox.warning(self, "입력 오류", "종목코드를 입력해주세요.")
             return
 
+        display_name = f"{code} {name}" if name else code
         reply = QMessageBox.question(
             self, "매도 확인",
-            f"종목 {code}를 {quantity}주 {'시장가' if price == 0 else f'{price:,}원'}에 매도하시겠습니까?",
+            f"종목 {display_name}를 {quantity}주 {'시장가' if price == 0 else f'{price:,}원'}에 매도하시겠습니까?",
             QMessageBox.Yes | QMessageBox.No
         )
 
@@ -1312,12 +1389,12 @@ class MainWindow(QMainWindow):
         if not self.trader:
             return
 
-        code = self.manual_sell_code.text().strip()
+        input_text = self.manual_sell_code.text().strip()
         ratio = self.manual_sell_ratio.value()
         price = self.manual_sell_price.value()
 
+        code, name = self.resolve_stock_code(input_text)
         if not code:
-            QMessageBox.warning(self, "입력 오류", "종목코드를 입력해주세요.")
             return
 
         total_qty = 0
@@ -1330,15 +1407,16 @@ class MainWindow(QMainWindow):
                     pass
                 break
 
+        display_name = f"{code} {name}" if name else code
         if total_qty <= 0:
-            QMessageBox.warning(self, "오류", f"종목 {code}의 보유 수량을 확인할 수 없습니다.")
+            QMessageBox.warning(self, "오류", f"종목 {display_name}의 보유 수량을 확인할 수 없습니다.")
             return
 
         sell_qty = max(1, int(total_qty * ratio / 100))
 
         reply = QMessageBox.question(
             self, "매도 확인",
-            f"종목 {code}를 {ratio}% ({sell_qty}주/{total_qty}주) "
+            f"종목 {display_name}를 {ratio}% ({sell_qty}주/{total_qty}주) "
             f"{'시장가' if price == 0 else f'{price:,}원'}에 매도하시겠습니까?",
             QMessageBox.Yes | QMessageBox.No
         )
@@ -1351,17 +1429,18 @@ class MainWindow(QMainWindow):
         if not self.trader:
             return
 
-        code = self.manual_buy_code.text().strip()
+        input_text = self.manual_buy_code.text().strip()
         quantity = self.manual_buy_qty.value()
         price = self.manual_buy_price.value()
 
+        code, name = self.resolve_stock_code(input_text)
         if not code:
-            QMessageBox.warning(self, "입력 오류", "종목코드를 입력해주세요.")
             return
 
+        display_name = f"{code} {name}" if name else code
         reply = QMessageBox.question(
             self, "매수 확인",
-            f"종목 {code}를 {quantity}주 {'시장가' if price == 0 else f'{price:,}원'}에 매수하시겠습니까?",
+            f"종목 {display_name}를 {quantity}주 {'시장가' if price == 0 else f'{price:,}원'}에 매수하시겠습니까?",
             QMessageBox.Yes | QMessageBox.No
         )
 

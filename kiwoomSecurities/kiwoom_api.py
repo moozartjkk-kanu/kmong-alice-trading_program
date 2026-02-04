@@ -342,6 +342,42 @@ class KiwoomAPI:
         """종목명 조회"""
         return self.ocx.dynamicCall("GetMasterCodeName(QString)", code)
 
+    def get_code_list_by_market(self, market):
+        """시장별 종목코드 목록 조회
+
+        Args:
+            market: 시장 구분 (0: 코스피, 10: 코스닥, 3: ELW, 8: ETF)
+
+        Returns:
+            종목코드 리스트
+        """
+        code_list = self.ocx.dynamicCall("GetCodeListByMarket(QString)", market)
+        if code_list:
+            return code_list.split(";")[:-1]  # 마지막 빈 문자열 제거
+        return []
+
+    def find_stocks_by_name(self, search_name):
+        """종목명으로 종목코드 검색
+
+        Args:
+            search_name: 검색할 종목명 (부분 일치)
+
+        Returns:
+            [(종목코드, 종목명), ...] 리스트
+        """
+        results = []
+        search_name = search_name.upper()  # 대소문자 무시
+
+        # 코스피(0)와 코스닥(10) 종목 검색
+        for market in ["0", "10"]:
+            codes = self.get_code_list_by_market(market)
+            for code in codes:
+                name = self.get_master_code_name(code)
+                if name and search_name in name.upper():
+                    results.append((code, name))
+
+        return results
+
     def get_stock_price(self, code):
         """현재가 조회 (opt10001)"""
         self.set_input_value("종목코드", code)
