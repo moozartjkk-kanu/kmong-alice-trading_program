@@ -1129,14 +1129,36 @@ class AutoTrader:
                     position["avg_price"] = avg_price
                     position["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    # ✅ 매수로 인한 수량 증가 시 initial_quantity 설정
+                    # ✅ 매수로 인한 수량 증가 시
                     if quantity > old_quantity:
-                        # 첫 매수이거나 initial_quantity가 없으면 설정
-                        if position.get("initial_quantity", 0) == 0:
-                            position["initial_quantity"] = quantity
-                            self.log(f"[{code}] 초기 수량 설정: {quantity}주", "INFO")
+                        is_additional_buy = old_quantity > 0  # 추가 매수 여부
 
-                        # ✅ 매수 체결 후 매도 주문 설정
+                        if is_additional_buy:
+                            # ✅ 추가 매수: 기존 매도 주문 취소 후 새 수량 기준으로 재발주
+                            self.log(f"[{code}] 추가 매수 체결 - 매도 주문 재계산 ({old_quantity}주 → {quantity}주)", "INFO")
+
+                            # 기존 매도 주문 취소
+                            try:
+                                cancelled = self.kiwoom.cancel_sell_orders_for_stock(self.account, code)
+                                if cancelled > 0:
+                                    self.log(f"[{code}] 기존 매도 주문 {cancelled}건 취소", "INFO")
+                            except Exception as e:
+                                self.log(f"[{code}] 기존 매도 주문 취소 오류: {e}", "ERROR")
+
+                            # placed_sell_orders 초기화 (체결 완료된 것만 유지)
+                            sold_targets = position.get("sold_targets", [])
+                            if code in self.placed_sell_orders:
+                                self.placed_sell_orders[code] = {k: v for k, v in self.placed_sell_orders[code].items() if k in sold_targets}
+
+                            # pending_orders에서 매도 주문 정리
+                            self.config.clear_pending_orders_for_stock(code, order_type="sell")
+
+                        # initial_quantity 설정/갱신 (새로운 총 수량으로)
+                        position["initial_quantity"] = quantity
+                        log_type = "초기" if not is_additional_buy else "갱신"
+                        self.log(f"[{code}] {log_type} 수량 설정: {quantity}주", "INFO")
+
+                        # ✅ 매수 체결 후 매도 주문 설정 (새 수량 기준)
                         self._schedule_sell_orders_after_buy(code, position)
 
                     # ✅ 매도로 인한 수량 감소 시
