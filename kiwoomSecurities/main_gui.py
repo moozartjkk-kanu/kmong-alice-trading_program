@@ -78,6 +78,15 @@ class MainWindow(QMainWindow):
         self.market_open_timer.timeout.connect(self._check_market_open_and_restore)
         self.market_open_timer.start(60000)  # 1분마다 체크
 
+        # ✅ 실시간 UI 업데이트용 행 매핑 (code → row)
+        self._holdings_code_to_row = {}
+        self._watchlist_code_to_row = {}
+
+        # ✅ 잔고 변경 디바운스 타이머 (과도한 TR 호출 방지)
+        self._balance_changed_timer = QTimer()
+        self._balance_changed_timer.setSingleShot(True)
+        self._balance_changed_timer.timeout.connect(self.refresh_holdings)
+
         # 초기 감시 종목 로드 (로그인 전에도 목록 표시)
         QTimer.singleShot(100, self._load_initial_watchlist)
 
@@ -109,9 +118,11 @@ class MainWindow(QMainWindow):
         watchlist = self.config.get_watchlist()
         self.watchlist_table.setRowCount(len(watchlist))
 
+        self._watchlist_code_to_row = {}
         for row, stock in enumerate(watchlist):
             code = stock["code"]
             name = stock.get("name", "")
+            self._watchlist_code_to_row[code] = row
             self.watchlist_table.setItem(row, 0, QTableWidgetItem(code))
             self.watchlist_table.setItem(row, 1, QTableWidgetItem(name))
             self.watchlist_table.setItem(row, 2, QTableWidgetItem("-"))
@@ -582,6 +593,9 @@ class MainWindow(QMainWindow):
                 self.kiwoom.account_signals.full_balance_updated.connect(self._on_full_balance_updated)
                 self.kiwoom.account_signals.holdings_updated.connect(self._on_holdings_updated)
 
+                # ✅ 실시간 시세 콜백 등록 (보유종목/감시종목 UI 실시간 갱신)
+                self.kiwoom.set_real_data_callback(self._on_realtime_price)
+
                 self.trader = AutoTrader(self.kiwoom, self.config)
                 self.trader.set_log_callback(self.log)
 
@@ -872,10 +886,10 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_balance_changed(self, _code, _quantity, _avg_price):
-        """잔고 변경 시그널 처리 (개별 종목)"""
+        """잔고 변경 시그널 처리 (개별 종목) - 디바운스 적용으로 과도한 TR 호출 방지"""
         try:
-            # ✅ 보유종목 전체 갱신 (수동 매수 시에도 바로 표시되도록)
-            self.refresh_holdings()
+            # ✅ 1초 디바운스: 연속 체결 시 마지막 이벤트 후 1초 뒤에 한 번만 TR 조회
+            self._balance_changed_timer.start(1000)
         except Exception:
             pass
 
@@ -892,9 +906,12 @@ class MainWindow(QMainWindow):
         """보유종목 전체 갱신 시그널 처리"""
         try:
             self.holdings_table.setRowCount(len(holdings))
+            self._holdings_code_to_row = {}
 
             for row, holding in enumerate(holdings):
-                self.holdings_table.setItem(row, 0, QTableWidgetItem(holding["code"]))
+                code = holding["code"]
+                self._holdings_code_to_row[code] = row
+                self.holdings_table.setItem(row, 0, QTableWidgetItem(code))
                 self.holdings_table.setItem(row, 1, QTableWidgetItem(holding["name"]))
                 self.holdings_table.setItem(row, 2, QTableWidgetItem(f"{holding['quantity']:,}"))
                 self.holdings_table.setItem(row, 3, QTableWidgetItem(f"{holding['avg_price']:,}"))
@@ -911,6 +928,63 @@ class MainWindow(QMainWindow):
                 self.holdings_table.setItem(row, 7, rate_item)
         except Exception:
             pass
+
+    # =========================
+    # 실시간 시세 UI 반영
+    # =========================
+    def _on_realtime_price(self, code, price, volume):
+        """실시간 시세 콜백 → 보유종목/감시종목 테이블 즉시 갱신"""
+        try:
+            self._update_holdings_realtime(code, price)
+        except Exception:
+            pass
+        try:
+            self._update_watchlist_realtime(code, price)
+        except Exception:
+            pass
+
+    def _update_holdings_realtime(self, code, price):
+        """보유종목 테이블에서 해당 종목의 현재가·평가금액·손익·수익률 실시간 갱신"""
+        row = self._holdings_code_to_row.get(code)
+        if row is None or row >= self.holdings_table.rowCount():
+            return
+
+        # 보유수량·평균단가는 테이블에서 읽기
+        qty_item = self.holdings_table.item(row, 2)
+        avg_item = self.holdings_table.item(row, 3)
+        if not qty_item or not avg_item:
+            return
+
+        try:
+            quantity = int(qty_item.text().replace(",", ""))
+            avg_price = int(avg_item.text().replace(",", ""))
+        except (ValueError, AttributeError):
+            return
+
+        if quantity <= 0 or avg_price <= 0:
+            return
+
+        eval_amount = price * quantity
+        profit = eval_amount - (avg_price * quantity)
+        profit_rate = ((price - avg_price) / avg_price) * 100
+
+        self.holdings_table.setItem(row, 4, QTableWidgetItem(f"{price:,}"))
+        self.holdings_table.setItem(row, 5, QTableWidgetItem(f"{eval_amount:,}"))
+        self.holdings_table.setItem(row, 6, QTableWidgetItem(f"{profit:,}"))
+
+        rate_item = QTableWidgetItem(f"{profit_rate:.2f}%")
+        if profit_rate > 0:
+            rate_item.setForeground(QColor("red"))
+        elif profit_rate < 0:
+            rate_item.setForeground(QColor("blue"))
+        self.holdings_table.setItem(row, 7, rate_item)
+
+    def _update_watchlist_realtime(self, code, price):
+        """감시종목 테이블에서 해당 종목의 현재가 실시간 갱신"""
+        row = self._watchlist_code_to_row.get(code)
+        if row is None or row >= self.watchlist_table.rowCount():
+            return
+        self.watchlist_table.setItem(row, 2, QTableWidgetItem(f"{price:,}"))
 
     # =========================
     # 데이터 갱신
@@ -967,9 +1041,12 @@ class MainWindow(QMainWindow):
 
             holdings = balance.get("holdings", [])
             self.holdings_table.setRowCount(len(holdings))
+            self._holdings_code_to_row = {}
 
             for row, holding in enumerate(holdings):
-                self.holdings_table.setItem(row, 0, QTableWidgetItem(holding["code"]))
+                code = holding["code"]
+                self._holdings_code_to_row[code] = row
+                self.holdings_table.setItem(row, 0, QTableWidgetItem(code))
                 self.holdings_table.setItem(row, 1, QTableWidgetItem(holding["name"]))
                 self.holdings_table.setItem(row, 2, QTableWidgetItem(f"{holding['quantity']:,}"))
                 self.holdings_table.setItem(row, 3, QTableWidgetItem(f"{holding['avg_price']:,}"))
@@ -1012,6 +1089,7 @@ class MainWindow(QMainWindow):
 
             self.watchlist_table.setRowCount(0)
             self.watchlist_table.setRowCount(len(watchlist))
+            self._watchlist_code_to_row = {}
 
             period = self.config.get("buy", "envelope_period") or 20
             percent = self.config.get("buy", "envelope_percent") or 19
@@ -1020,6 +1098,7 @@ class MainWindow(QMainWindow):
             for row, stock in enumerate(watchlist):
                 code = stock["code"]
                 name = stock.get("name", "")
+                self._watchlist_code_to_row[code] = row
 
                 self.watchlist_table.setItem(row, 0, QTableWidgetItem(code))
                 self.watchlist_table.setItem(row, 1, QTableWidgetItem(name))
