@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-자동매매 로직 모듈 (StopLoss 지정가 100% 매도 + 익일 재주문 유지)
+자동매매 로직 모듈 (StopLoss 평단가 지정가 100% 매도 + 익일 재주문 유지)
 
 ✅ 요구사항 반영:
 1. 20일선 기준 -19% 도달 시 엔벨로프(period20, percent20) 하단선+1호가에 지정가 매수
-2. 스탑로스 시 지정가로 100% 전부 매도
+2. 스탑로스: 첫 매도 후 잔여수량 존재 시, 현재가가 평단가+1호가에 도달하면
+   → 평단가에 지정가 매도 주문(100%)을 걸고 체결될 때까지 유지
 3. 매도 주문은 매수 체결 직후 즉시 모두 걸어둠:
    - 평단가 +2.95%에 30%, +4.95%에 30%, +6.95%에 30%, 20일선에 10%
 4. 스탑로스 발동 시: 미체결 매수 취소, 100% 매도까지 스탑로스 유지, 익일 재주문
@@ -231,7 +232,7 @@ class AutoTrader:
             # 0) 스탑로스 주문 유지(필요 시)
             intents.append({"type": "ensure_stoploss", "code": code, "position": position})
 
-            # 1) 스탑로스 발동 조건
+            # 1) 스탑로스 발동 조건 (현재가 <= 평단가+1호가 → 평단가에 지정가 매도)
             if position and position.get("quantity", 0) > 0:
                 if self._should_trigger_stoploss(code, current_price, position):
                     intents.append({"type": "stoploss", "code": code, "price": current_price, "position": position})
@@ -346,9 +347,9 @@ class AutoTrader:
             # 0) 스탑로스 유지 강제 (스탑로스가 한번이라도 발동된 보유종목은 항상 주문 유지)
             self._ensure_stoploss_order_if_needed(code, position)
 
-            # 1) 스탑로스 조건 체크 (매도 이력 존재 + 현재가 <= 평단가)
+            # 1) 스탑로스 조건 체크 (매도 이력 존재 + 현재가 <= 평단가+1호가)
             if position and position.get("quantity", 0) > 0:
-                # 스탑로스 조건: 첫 매도 발생 후 현재가가 평단가 이하로 떨어지면 스탑로스 발동
+                # 스탑로스 조건: 첫 매도 발생 후 현재가가 평단가+1호가 이하로 떨어지면 평단가에 스탑로스 발동
                 if self._should_trigger_stoploss(code, current_price, position):
                     self._execute_stoploss(code, current_price, position)
                     return
@@ -395,7 +396,8 @@ class AutoTrader:
         """
         스탑로스 발동 조건 확인
 
-        조건: 첫 매도 발생(sold_targets가 비어있지 않음) 후 현재가 <= 평단가
+        조건: 첫 매도 발생(sold_targets가 비어있지 않음) 후 현재가 <= 평단가 + 1호가
+        → 평단가에서 1호가 위에 도달하면 스탑로스 주문(평단가 지정가)을 걸어둠
         """
         if not position:
             return False
@@ -415,16 +417,21 @@ class AutoTrader:
         if avg_price <= 0:
             return False
 
-        return current_price <= avg_price
+        # 평단가 기준 1호가 위에 현재가가 도달하면 스탑로스 발동
+        tick = self._get_tick_size(int(avg_price))
+        trigger_price = avg_price + tick  # 평단가 + 1호가
+        return current_price <= trigger_price
 
     def _execute_stoploss(self, code, current_price, position):
         """
-        ✅ 스탑로스 실행 (지정가 100% 매도)
+        ✅ 스탑로스 실행 (평단가 지정가 100% 매도)
 
         요구사항:
+        - 평단가+1호가 도달 시 평단가에 스탑로스 지정가 주문
         - 스탑로스 발동 시 미체결 매수 주문 모두 취소
         - 100% 지정가 매도
         - 스탑로스 상태 영구 기록 (익일 재주문용)
+        - 체결될 때까지 유지
         """
         try:
             total_quantity = position.get("quantity", 0)
@@ -432,15 +439,18 @@ class AutoTrader:
                 return
 
             avg_price = float(position.get("avg_price", 0) or 0)
+            if avg_price <= 0:
+                return
 
-            # 스탑로스 가격: 현재가를 호가단위로 내림
-            tick = self._get_tick_size(current_price)
-            stoploss_price = (int(current_price) // tick) * tick
-            if stoploss_price <= 0:
-                stoploss_price = max(1, int(avg_price) - tick)
+            # 스탑로스 가격: 평단가를 호가단위로 내림 (내 평단가에 걸기)
+            stoploss_price = self._floor_to_tick(avg_price)
+            if not stoploss_price or stoploss_price <= 0:
+                tick = self._get_tick_size(int(avg_price))
+                stoploss_price = max(1, (int(avg_price) // tick) * tick)
 
             stock_name = position.get("name", code)
-            self.log(f"[{code} {stock_name}] 스탑로스 발동: 현재가({current_price:,}) <= 평단가({int(avg_price):,})", "WARNING")
+            tick = self._get_tick_size(int(avg_price))
+            self.log(f"[{code} {stock_name}] 스탑로스 발동: 현재가({current_price:,}) <= 평단가+1호가({int(avg_price) + tick:,}) → 평단가({stoploss_price:,})에 지정가 매도", "WARNING")
 
             # 1) 해당 종목의 모든 미체결 주문 취소 (매수 + 기존 매도)
             try:
