@@ -538,6 +538,9 @@ class MainWindow(QMainWindow):
             return
         if not self.trader or not getattr(self.trader, "is_running", False):
             return
+        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 스킵
+        if self.kiwoom and self.kiwoom.is_tr_busy():
+            return
         try:
             self.trader.process_order_queue()
         except Exception as e:
@@ -777,6 +780,10 @@ class MainWindow(QMainWindow):
         if not (market_open <= current_time <= market_close):
             return
 
+        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 스킵
+        if self.kiwoom and self.kiwoom.is_tr_busy():
+            return
+
         # ✅ 이미 복원했어도 미체결 주문이 없으면 다시 복원 시도
         if self._orders_restored_today:
             try:
@@ -854,6 +861,11 @@ class MainWindow(QMainWindow):
 
         if self._is_checking_signals:
             return
+
+        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 스킵 (다음 타이머 주기에 재시도)
+        if self.kiwoom and self.kiwoom.is_tr_busy():
+            return
+
         self._is_checking_signals = True
 
         try:
@@ -991,8 +1003,11 @@ class MainWindow(QMainWindow):
     # =========================
     def refresh_data(self):
         """데이터 갱신"""
+        if self._is_stopping:
+            return
         self.refresh_holdings()
-        self.refresh_watchlist()
+        # ✅ 감시종목 갱신은 보유종목 갱신 완료 후 1초 뒤에 실행 (TR 충돌 방지)
+        QTimer.singleShot(1000, self.refresh_watchlist)
 
     def refresh_holdings(self):
         """보유 종목 갱신"""
@@ -1001,6 +1016,11 @@ class MainWindow(QMainWindow):
 
         account = self.account_combo.currentText().strip()
         if not account:
+            return
+
+        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 500ms 후 재시도
+        if self.kiwoom.is_tr_busy():
+            QTimer.singleShot(500, self.refresh_holdings)
             return
 
         try:
@@ -1063,7 +1083,7 @@ class MainWindow(QMainWindow):
                 self.holdings_table.setItem(row, 7, rate_item)
 
             if self.trader:
-                self.trader.sync_positions_from_account()
+                self.trader.sync_positions_from_account(balance)
 
         except Exception as e:
             self.log(f"[시스템] 잔고 조회 오류: {e}")
@@ -1163,6 +1183,11 @@ class MainWindow(QMainWindow):
 
         if not self.kiwoom or not self.kiwoom.is_connected():
             self._is_refreshing_watchlist = False
+            return
+
+        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 500ms 후 재시도
+        if self.kiwoom.is_tr_busy():
+            QTimer.singleShot(500, self._refresh_watchlist_next)
             return
 
         row, stock = self._watchlist_refresh_queue.pop(0)

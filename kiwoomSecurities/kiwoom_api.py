@@ -77,6 +77,8 @@ class KiwoomAPI:
         self._expected_trcode = None
         self._pending_tr_data = {}
         self._tr_timed_out = False
+        # ✅ TR 재진입 방지 플래그 (QEventLoop 중첩 호출 차단)
+        self._tr_busy = False
         # 타임아웃 비활성화 (0 또는 None이면 무제한 대기)
         # opw00018 등 계좌 조회는 시간이 오래 걸릴 수 있음
         self._tr_timeout_ms = 0
@@ -112,6 +114,10 @@ class KiwoomAPI:
     def _debug(self, message):
         if self.debug:
             print(message)
+
+    def is_tr_busy(self):
+        """TR 요청 처리 중 여부 확인 (재진입 방지용)"""
+        return self._tr_busy
 
     def set_event_engine(self, engine):
         """이벤트 엔진 설정"""
@@ -225,19 +231,28 @@ class KiwoomAPI:
         self.ocx.dynamicCall("SetInputValue(QString, QString)", id, value)
 
     def comm_rq_data(self, rqname, trcode, next, screen_no):
-        """TR 요청 (Rate Limiting 적용)"""
+        """TR 요청 (Rate Limiting + 재진입 방지 적용)"""
+        # ✅ 재진입 방지: 이미 TR 처리 중이면 경고 후 스킵
+        if self._tr_busy:
+            self._debug(f"[TR] BLOCKED (busy) rqname={rqname} trcode={trcode}")
+            return
+
         # TR 호출 제한 대기
         self.rate_limiter.wait_if_needed()
 
+        self._tr_busy = True
         self._debug(f"[TR] request rqname={rqname} trcode={trcode}")
         self.tr_data = {}
 
-        self.ocx.dynamicCall(
-            "CommRqData(QString, QString, int, QString)",
-            rqname, trcode, next, screen_no
-        )
-        self.tr_event_loop = QEventLoop()
-        self.tr_event_loop.exec_()
+        try:
+            self.ocx.dynamicCall(
+                "CommRqData(QString, QString, int, QString)",
+                rqname, trcode, next, screen_no
+            )
+            self.tr_event_loop = QEventLoop()
+            self.tr_event_loop.exec_()
+        finally:
+            self._tr_busy = False
         self._debug(f"[TR] completed rqname={rqname} trcode={trcode}")
 
     def _on_receive_tr_data(self, screen_no, rqname, trcode, record_name, next,

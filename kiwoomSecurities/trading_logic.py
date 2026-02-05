@@ -1422,18 +1422,22 @@ class AutoTrader:
             return None
 
     # ==================== 상태 동기화 ====================
-    def sync_positions_from_account(self):
+    def sync_positions_from_account(self, balance=None):
         """
         ✅ 계좌 잔고에서 포지션 동기화
 
         요구사항 반영:
         - initial_quantity 설정 (전체물량 기준 비중 계산용)
         - 기존 상태(stoploss_triggered, sold_targets 등) 유지
+
+        Args:
+            balance: 이미 조회된 잔고 데이터 (None이면 직접 조회)
         """
         if not self.kiwoom or not self.account:
             return
         try:
-            balance = self.kiwoom.get_balance(self.account)
+            if balance is None:
+                balance = self.kiwoom.get_balance(self.account)
             holdings = balance.get("holdings", [])
 
             for holding in holdings:

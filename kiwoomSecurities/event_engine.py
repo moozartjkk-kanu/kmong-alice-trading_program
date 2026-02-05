@@ -455,6 +455,10 @@ class EventEngine(QObject):
         if self.stock_timer.isActive():
             return
 
+        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 이번 배치 스킵 (다음 주기에 재시도)
+        if self.kiwoom.is_tr_busy():
+            return
+
         # 다음 배치 종목 가져오기
         self.current_batch = self.batch_scheduler.get_next_batch()
         if not self.current_batch:
@@ -483,6 +487,11 @@ class EventEngine(QObject):
         # 배치 내 모든 종목 처리 완료
         if self.batch_index >= len(self.current_batch):
             self.stock_timer.stop()
+            return
+
+        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 잠시 후 재시도
+        if self.kiwoom.is_tr_busy():
+            self.stock_timer.start(self.STOCK_INTERVAL_MS)
             return
 
         code = self.current_batch[self.batch_index]
@@ -518,6 +527,10 @@ class EventEngine(QObject):
             cached = self.batch_scheduler.get_cached_candles(code)
             if cached:
                 return cached
+
+        # ✅ TR 재진입 방지: busy이면 캐시 없음으로 반환
+        if self.kiwoom.is_tr_busy():
+            return None
 
         # 캐시 없으면 직접 조회
         candles = self.kiwoom.get_daily_candles(code, 25)
