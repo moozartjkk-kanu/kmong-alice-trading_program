@@ -206,14 +206,14 @@ class TradingSignal:
                 )
             }
 
-        # ✅ 2차/3차 매수는 1차 매수 시 미리 주문이 걸려있으므로 여기서는 신호 발생하지 않음
-        # (1차 매수 주문 전송 시 _place_additional_buy_orders에서 2차/3차 주문도 함께 전송됨)
+        # ✅ 2차/3차 매수는 실시간 가격이 트리거(대상가 + 5호가)에 도달하면 자동 주문됨
+        # (trading_logic._check_additional_buy_trigger에서 처리)
         if position.get("sell_occurred", False):
             return {"signal": False, "reason": "매도 발생으로 추가 매수 차단됨"}
 
         return {
             "signal": False,
-            "reason": "보유 중인 종목 - 2차/3차 매수 주문은 이미 걸려있음"
+            "reason": "보유 중인 종목 - 추가 매수는 트리거 도달 시 자동 주문"
         }
 
     # ---------------- Sell Planning / Signals ----------------

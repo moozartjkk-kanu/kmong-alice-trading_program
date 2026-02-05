@@ -241,6 +241,13 @@ class AutoTrader:
             if position and position.get("quantity", 0) > 0:
                 intents.append({"type": "ensure_sell", "code": code, "position": position, "candles": candles})
 
+            # 2.5) 추가 매수 트리거 확인 (5호가 위 도달 시 지정가 매수)
+            if position and position.get("quantity", 0) > 0:
+                if not position.get("sell_occurred", False) and not position.get("stoploss_triggered", False):
+                    additional_intent = self._check_additional_buy_trigger(code, current_price, position)
+                    if additional_intent:
+                        intents.append(additional_intent)
+
             # 3) 매수 신호 (후순위)
             position = self.config.get_position(code)  # 갱신
             if position and position.get("stoploss_triggered", False):
@@ -272,10 +279,15 @@ class AutoTrader:
 
             intent_type = intent.get("type")
             code = intent.get("code")
-            key = (code, intent_type)
 
-            # 중복 방지(특히 buy/stoploss)
-            if intent_type in ("buy", "stoploss"):
+            # 추가 매수는 차수별로 고유 키 사용 (2차/3차 각각 중복 방지)
+            if intent_type == "additional_buy":
+                key = (code, f"additional_buy_{intent.get('buy_count', 0)}")
+            else:
+                key = (code, intent_type)
+
+            # 중복 방지(특히 buy/stoploss/additional_buy)
+            if intent_type in ("buy", "stoploss", "additional_buy"):
                 if key in self._pending_order_codes:
                     continue
                 self._pending_order_codes.add(key)
@@ -288,7 +300,7 @@ class AutoTrader:
                     self.order_queue.put_nowait(intent)
                 except Exception:
                     pass
-                if key in self._pending_order_codes and intent_type in ("buy", "stoploss"):
+                if key in self._pending_order_codes and intent_type in ("buy", "stoploss", "additional_buy"):
                     self._pending_order_codes.discard(key)
                 return
 
@@ -301,6 +313,11 @@ class AutoTrader:
                     self._execute_stoploss(code, intent.get("price"), intent.get("position"))
                 elif intent_type == "buy":
                     self._execute_buy(code, intent.get("price"), intent.get("buy_signal"), intent.get("candles"))
+                elif intent_type == "additional_buy":
+                    self._execute_additional_buy(
+                        code, intent.get("buy_count"),
+                        intent.get("target_price"), intent.get("position")
+                    )
 
                 self._last_order_ts = time.time()
             except Exception as e:
@@ -309,7 +326,7 @@ class AutoTrader:
                     self.order_queue.put_nowait(intent)
                 except Exception:
                     pass
-                if key in self._pending_order_codes and intent_type in ("buy", "stoploss"):
+                if key in self._pending_order_codes and intent_type in ("buy", "stoploss", "additional_buy"):
                     self._pending_order_codes.discard(key)
 
             processed += 1
@@ -339,6 +356,16 @@ class AutoTrader:
             # 2) 보유 종목에 대해 매도 주문이 모두 걸려있는지 확인/보정
             if position and position.get("quantity", 0) > 0:
                 self._ensure_sell_orders_placed(code, position, candles)
+
+            # 2.5) 추가 매수 트리거 확인 (5호가 위 도달 시 지정가 매수)
+            if position and position.get("quantity", 0) > 0:
+                if not position.get("sell_occurred", False) and not position.get("stoploss_triggered", False):
+                    additional_intent = self._check_additional_buy_trigger(code, current_price, position)
+                    if additional_intent:
+                        buy_count = additional_intent["buy_count"]
+                        target_price = additional_intent["target_price"]
+                        self._execute_additional_buy(code, buy_count, target_price, position)
+                        return
 
             # 3) 매수 신호 확인 (매도보다 후순위)
             position = self.config.get_position(code)  # 갱신
@@ -687,7 +714,7 @@ class AutoTrader:
         요구사항 반영:
         - 스탑로스 발동 이력 종목은 재매수 차단
         - 매도가 한번이라도 발생하면 당일 재매수 완전 차단 (재진입 불가)
-        - 1차 매수 시 2차/3차 매수 주문도 미리 걸기
+        - 1차 매수 시 2차/3차 매수 대상가/트리거가격 설정 (트리거 도달 시 자동 주문)
         - 매수 체결 시 즉시 모든 매도 주문 설정
         """
         try:
@@ -788,8 +815,9 @@ class AutoTrader:
                     }
                     self.config.update_position(code, new_position)
 
-                    # ✅ 1차 매수 시 2차/3차 매수 주문도 미리 걸기
-                    self._place_additional_buy_orders(code, buy_price, ma20)
+                    # ✅ 1차 매수 시 2차/3차 매수 대상가 및 트리거 가격 설정
+                    # (실시간 가격이 트리거에 도달하면 그때 주문)
+                    self._setup_additional_buy_targets(code, buy_price)
 
                 else:
                     position["buy_count"] = buy_count
@@ -804,99 +832,199 @@ class AutoTrader:
         except Exception as e:
             self.log(f"[{code}] 매수 실행 중 오류: {e}", "ERROR")
 
-    def _place_additional_buy_orders(self, code, first_buy_price, ma20):
+    def _setup_additional_buy_targets(self, code, first_buy_price):
         """
-        ✅ 1차 매수 주문 전송 후 2차/3차 매수 주문도 미리 걸기
+        ✅ 1차 매수 후 2차/3차 매수 대상가 및 트리거 가격을 계산하여 포지션에 저장
 
-        요구사항:
-        - 2차 주문: 1차 주문 가격의 -10%
-        - 3차 주문: 2차 주문 가격의 -10% (= 1차 × 0.81)
+        변경된 로직 (기존: 즉시 주문 → 변경: 트리거 기반 주문):
+        - 2차 매수: 1차매수가의 -10% 가격의 5호가 위에 현재가 도달 시 → 1차매수가의 -10%에 지정가 매수
+        - 3차 매수: 2차매수가의 -10% 가격의 5호가 위에 현재가 도달 시 → 2차매수가의 -10%에 지정가 매수
         """
         try:
             max_buy_count = self.config.get("buy", "max_buy_count") or 3
             drop_percent = self.config.get("buy", "additional_buy_drop_percent") or 10
-            buy_amount = self.config.get("buy", "buy_amount_per_stock")
 
-            # 2차 매수가: 1차 × (1 - drop_percent/100)
+            additional_buy_targets = []
+
+            # 2차 매수 대상가: 1차매수가 × (1 - drop_percent/100)
             second_buy_price_raw = first_buy_price * (1 - drop_percent / 100.0)
             second_buy_price = self._floor_to_tick(second_buy_price_raw)
             if second_buy_price is None or second_buy_price <= 0:
-                self.log(f"[{code}] 2차 매수가 계산 실패", "WARNING")
+                self.log(f"[{code}] 2차 매수 대상가 계산 실패", "WARNING")
                 return
 
-            tick = self._get_tick_size(int(second_buy_price))
-            second_buy_price = second_buy_price + tick  # 호가단위 +1호가
+            # 2차 트리거 가격: 2차 매수 대상가 + 5호가
+            tick2 = self._get_tick_size(int(second_buy_price))
+            second_trigger_price = second_buy_price + 5 * tick2
 
-            # 3차 매수가: 2차 × (1 - drop_percent/100) = 1차 × 0.81
+            if max_buy_count >= 2:
+                additional_buy_targets.append({
+                    "buy_count": 2,
+                    "target_price": int(second_buy_price),
+                    "trigger_price": int(second_trigger_price),
+                    "ordered": False,
+                })
+                self.log(
+                    f"[{code}] 2차 매수 대상 설정: 매수가 {int(second_buy_price):,}원, "
+                    f"트리거(5호가위) {int(second_trigger_price):,}원",
+                    "INFO"
+                )
+
+            # 3차 매수 대상가: 2차매수가 × (1 - drop_percent/100)
             third_buy_price_raw = second_buy_price * (1 - drop_percent / 100.0)
             third_buy_price = self._floor_to_tick(third_buy_price_raw)
-            if third_buy_price is None or third_buy_price <= 0:
-                third_buy_price = 0
 
-            if third_buy_price > 0:
+            if max_buy_count >= 3 and third_buy_price is not None and third_buy_price > 0:
                 tick3 = self._get_tick_size(int(third_buy_price))
-                third_buy_price = third_buy_price + tick3
+                third_trigger_price = third_buy_price + 5 * tick3
 
-            # 2차 매수 주문 걸기
-            if max_buy_count >= 2 and second_buy_price > 0:
-                quantity_2 = buy_amount // second_buy_price
-                if quantity_2 > 0:
-                    result_2 = self.kiwoom.buy_stock(self.account, code, quantity_2, second_buy_price)
-                    if result_2 == 0:
-                        self.log(f"[{code}] 2차 매수 예약 주문 전송: {quantity_2}주 @ {second_buy_price:,}원", "SUCCESS")
+                additional_buy_targets.append({
+                    "buy_count": 3,
+                    "target_price": int(third_buy_price),
+                    "trigger_price": int(third_trigger_price),
+                    "ordered": False,
+                })
+                self.log(
+                    f"[{code}] 3차 매수 대상 설정: 매수가 {int(third_buy_price):,}원, "
+                    f"트리거(5호가위) {int(third_trigger_price):,}원",
+                    "INFO"
+                )
 
-                        # 미체결 주문 저장
-                        self.config.save_pending_order(code, {
-                            "order_type": "buy",
-                            "quantity": quantity_2,
-                            "price": second_buy_price,
-                            "buy_count": 2,
-                            "ma20": ma20,
-                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        })
-
-                        if code not in self.pending_buy_orders:
-                            self.pending_buy_orders[code] = []
-                        self.pending_buy_orders[code].append({
-                            "buy_count": 2,
-                            "quantity": quantity_2,
-                            "price": second_buy_price,
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        })
-                    else:
-                        self.log(f"[{code}] 2차 매수 예약 주문 실패: 에러코드 {result_2}", "ERROR")
-
-            # 3차 매수 주문 걸기
-            if max_buy_count >= 3 and third_buy_price > 0:
-                quantity_3 = buy_amount // third_buy_price
-                if quantity_3 > 0:
-                    result_3 = self.kiwoom.buy_stock(self.account, code, quantity_3, third_buy_price)
-                    if result_3 == 0:
-                        self.log(f"[{code}] 3차 매수 예약 주문 전송: {quantity_3}주 @ {third_buy_price:,}원", "SUCCESS")
-
-                        # 미체결 주문 저장
-                        self.config.save_pending_order(code, {
-                            "order_type": "buy",
-                            "quantity": quantity_3,
-                            "price": third_buy_price,
-                            "buy_count": 3,
-                            "ma20": ma20,
-                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        })
-
-                        if code not in self.pending_buy_orders:
-                            self.pending_buy_orders[code] = []
-                        self.pending_buy_orders[code].append({
-                            "buy_count": 3,
-                            "quantity": quantity_3,
-                            "price": third_buy_price,
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        })
-                    else:
-                        self.log(f"[{code}] 3차 매수 예약 주문 실패: 에러코드 {result_3}", "ERROR")
+            # 포지션에 저장
+            position = self.config.get_position(code) or {}
+            position["additional_buy_targets"] = additional_buy_targets
+            self.config.update_position(code, position)
 
         except Exception as e:
-            self.log(f"[{code}] 추가 매수 주문 설정 중 오류: {e}", "ERROR")
+            self.log(f"[{code}] 추가 매수 대상 설정 중 오류: {e}", "ERROR")
+
+    def _check_additional_buy_trigger(self, code, current_price, position):
+        """
+        ✅ 실시간 가격이 추가 매수 트리거 가격에 도달했는지 확인
+
+        - 2차: 현재가가 2차 트리거 가격(대상가 + 5호가) 이하 도달 시 주문
+        - 3차: 2차 주문 완료 후, 현재가가 3차 트리거 가격 이하 도달 시 주문
+        """
+        targets = position.get("additional_buy_targets", [])
+        if not targets:
+            return None
+
+        for target in targets:
+            if target.get("ordered", False):
+                continue
+
+            buy_count = target.get("buy_count", 0)
+            trigger_price = target.get("trigger_price", 0)
+            target_price = target.get("target_price", 0)
+
+            if trigger_price <= 0 or target_price <= 0:
+                continue
+
+            # 3차 매수는 2차 매수 주문이 완료된 후에만 트리거
+            if buy_count == 3:
+                second_ordered = any(
+                    t.get("buy_count") == 2 and t.get("ordered", False)
+                    for t in targets
+                )
+                if not second_ordered:
+                    continue
+
+            # 현재가가 트리거 가격 이하로 도달하면 매수 주문
+            if current_price <= trigger_price:
+                return {
+                    "type": "additional_buy",
+                    "code": code,
+                    "buy_count": buy_count,
+                    "target_price": target_price,
+                    "trigger_price": trigger_price,
+                    "position": position,
+                }
+
+        return None
+
+    def _execute_additional_buy(self, code, buy_count, target_price, position):
+        """
+        ✅ 추가 매수 실행 (트리거 도달 시 지정가 매수)
+
+        - 실시간 가격이 트리거(대상가 + 5호가)에 도달하면 대상가에 지정가 매수 주문
+        """
+        try:
+            # 매도 발생 / 스탑로스 확인
+            position = self.config.get_position(code) or {}
+            if position.get("sell_occurred", False):
+                self.log(f"[{code}] 매도 발생으로 {buy_count}차 추가 매수 차단", "WARNING")
+                return
+            if position.get("stoploss_triggered", False):
+                self.log(f"[{code}] 스탑로스 발동으로 {buy_count}차 추가 매수 차단", "WARNING")
+                return
+
+            buy_amount = self.config.get("buy", "buy_amount_per_stock")
+            quantity = buy_amount // target_price
+            if quantity <= 0:
+                self.log(f"[{code}] {buy_count}차 매수 수량이 0입니다.", "WARNING")
+                return
+
+            ma20 = position.get("ma20", 0)
+
+            # 주문 실행 (재시도 포함)
+            retry_count = self.config.get("error_handling", "order_retry_count") or 3
+            retry_interval = (self.config.get("error_handling", "order_retry_interval_ms") or 1000) / 1000.0
+
+            result = -1
+            for attempt in range(retry_count):
+                result = self.kiwoom.buy_stock(self.account, code, quantity, target_price)
+                if result == 0:
+                    break
+                if attempt < retry_count - 1:
+                    self.log(f"[{code}] {buy_count}차 매수 주문 재시도 {attempt + 2}/{retry_count}", "WARNING")
+                    time.sleep(retry_interval)
+
+            if result == 0:
+                self.log(
+                    f"[{code}] {buy_count}차 추가 매수 주문 전송 성공: "
+                    f"{quantity}주 @ {target_price:,}원 (지정가, 트리거 도달)",
+                    "SUCCESS"
+                )
+
+                # 미체결 매수 주문 추적 (메모리)
+                if code not in self.pending_buy_orders:
+                    self.pending_buy_orders[code] = []
+                self.pending_buy_orders[code].append({
+                    "buy_count": buy_count,
+                    "quantity": quantity,
+                    "price": target_price,
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+
+                # 미체결 주문 저장 (파일)
+                self.config.save_pending_order(code, {
+                    "order_type": "buy",
+                    "quantity": quantity,
+                    "price": target_price,
+                    "buy_count": buy_count,
+                    "ma20": ma20,
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+
+                # 포지션 업데이트 - ordered 플래그 설정
+                position = self.config.get_position(code) or {}
+                targets = position.get("additional_buy_targets", [])
+                for t in targets:
+                    if t.get("buy_count") == buy_count:
+                        t["ordered"] = True
+                        break
+                position["additional_buy_targets"] = targets
+                position["buy_count"] = buy_count
+                position["last_buy_price"] = target_price
+                position["target_buy_price"] = target_price
+                position["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.config.update_position(code, position)
+
+            else:
+                self.log(f"[{code}] {buy_count}차 추가 매수 주문 실패: 에러코드 {result}", "ERROR")
+
+        except Exception as e:
+            self.log(f"[{code}] {buy_count}차 추가 매수 실행 중 오류: {e}", "ERROR")
 
     def _floor_to_tick(self, price):
         """호가 단위로 내림"""
@@ -998,6 +1126,7 @@ class AutoTrader:
         """
         조건 2-3: 특정 종목의 미체결 매수 주문 취소
         매도가 발생하면 해당 종목의 미체결 매수 주문을 모두 취소
+        + 추가 매수 트리거 대상도 제거 (더 이상 추가 매수 안 함)
         """
         if not self.kiwoom or not self.account:
             return
@@ -1012,6 +1141,13 @@ class AutoTrader:
 
             # 저장된 미체결 주문에서도 제거 (파일)
             self.config.clear_pending_orders_for_stock(code, order_type="buy")
+
+            # ✅ 추가 매수 트리거 대상 제거 (매도 발생 시 더 이상 추가 매수 안 함)
+            position = self.config.get_position(code)
+            if position and position.get("additional_buy_targets"):
+                position["additional_buy_targets"] = []
+                self.config.update_position(code, position)
+                self.log(f"[{code}] 매도 발생으로 추가 매수 트리거 대상 제거", "INFO")
 
         except Exception as e:
             self.log(f"[{code}] 미체결 매수주문 취소 중 오류: {e}", "ERROR")
