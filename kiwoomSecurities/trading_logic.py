@@ -239,7 +239,7 @@ class AutoTrader:
 
     def is_any_trading_time(self):
         """어떤 형태로든 거래 가능한 시간인지 확인 (정규장 또는 장시간외)"""
-        return self.is_market_open() or self.is_nxt_trading_hours()
+        return self.get_current_market_type() in ("REGULAR", "NXT_PREMARKET", "NXT_AFTERMARKET")
 
     # ==================== 이벤트 콜백 ====================
     def _on_realtime_price_enqueue(self, code, price):
@@ -1759,6 +1759,11 @@ class AutoTrader:
         if not self.account:
             self.log("계좌가 설정되지 않았습니다.", "ERROR")
             return False
+        # 디버깅: 수동매수 가능 시간 판단 로그
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        market_type = self.get_current_market_type()
+        is_any = self.is_any_trading_time()
+        self.log(f"[DBG] 수동매수 시간 체크: now={now_str} market_type={market_type} is_any_trading_time={is_any}", "INFO")
         # ✅ 거래 가능 시간 체크 (정규장 또는 장시간외)
         if not self.is_any_trading_time():
             self.log("거래 가능 시간이 아닙니다. 수동 매수 불가", "ERROR")
