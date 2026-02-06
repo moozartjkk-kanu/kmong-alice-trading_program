@@ -407,6 +407,9 @@ class AutoTrader:
                     )
 
                 self._last_order_ts = time.time()
+                # ✅ 성공 시 즉시 해제 → 다음 틱에서 동일 종목 재주문 가능
+                if intent_type in ("buy", "stoploss", "additional_buy"):
+                    self._pending_order_codes.discard(key)
             except Exception as e:
                 self.log(f"[{code}] 주문 처리 오류({intent_type}): {e}", "ERROR")
                 try:
@@ -420,9 +423,9 @@ class AutoTrader:
 
     def _check_trading_conditions(self, code, current_price, candles):
         """
-        매매 조건 확인 (이벤트 엔진에서 호출)
+        매매 조건 확인 (보험용 타이머에서 호출)
 
-        ✅ 요구사항 반영:
+        ✅ 주문은 큐로만 적재 — process_order_queue()에서 실행
         - 우선순위: 스탑로스 > 매도 주문 유지/보정 > 매수 신호
         - 스탑로스 발동 종목은 추가 매수 차단
         - 매도가 한번이라도 발생하면 추가 매수 차단
@@ -430,50 +433,59 @@ class AutoTrader:
         try:
             position = self.config.get_position(code)
 
-            # 0) 스탑로스 유지 강제 (스탑로스가 한번이라도 발동된 보유종목은 항상 주문 유지)
-            self._ensure_stoploss_order_if_needed(code, position)
+            # 0) 스탑로스 유지 강제
+            try:
+                self.order_queue.put_nowait({"type": "ensure_stoploss", "code": code, "position": position})
+            except queue.Full:
+                pass
 
-            # 1) 스탑로스 조건 체크 (매도 이력 존재 + 현재가 <= 평단가+1호가)
+            # 1) 스탑로스 조건 체크
             if position and position.get("quantity", 0) > 0:
-                # 스탑로스 조건: 첫 매도 발생 후 현재가가 평단가+1호가 이하로 떨어지면 평단가에 스탑로스 발동
                 if self._should_trigger_stoploss(code, current_price, position):
-                    self._execute_stoploss(code, current_price, position)
+                    try:
+                        self.order_queue.put_nowait({"type": "stoploss", "code": code, "price": current_price, "position": position})
+                    except queue.Full:
+                        pass
                     return
 
             # 2) 보유 종목에 대해 매도 주문이 모두 걸려있는지 확인/보정
             if position and position.get("quantity", 0) > 0:
-                self._ensure_sell_orders_placed(code, position, candles)
+                try:
+                    self.order_queue.put_nowait({"type": "ensure_sell", "code": code, "position": position, "candles": candles})
+                except queue.Full:
+                    pass
 
-            # 2.5) 추가 매수 트리거 확인 (5호가 위 도달 시 지정가 매수)
+            # 2.5) 추가 매수 트리거 확인
             if position and position.get("quantity", 0) > 0:
                 if not position.get("sell_occurred", False) and not position.get("stoploss_triggered", False):
                     additional_intent = self._check_additional_buy_trigger(code, current_price, position)
                     if additional_intent:
-                        buy_count = additional_intent["buy_count"]
-                        target_price = additional_intent["target_price"]
-                        self._execute_additional_buy(code, buy_count, target_price, position)
+                        try:
+                            self.order_queue.put_nowait(additional_intent)
+                        except queue.Full:
+                            pass
                         return
 
             # 3) 매수 신호 확인 (매도보다 후순위)
             position = self.config.get_position(code)  # 갱신
 
-            # ✅ 스탑로스 발동 이력이 있으면 추가 매수 차단
             if position and position.get("stoploss_triggered", False):
                 return
-
-            # ✅ 매도가 한번이라도 발생했으면 추가 매수 차단
             if position and position.get("sell_occurred", False):
                 return
 
             buy_signal = self.signal.check_buy_signal(code, current_price, candles, position)
 
             if buy_signal.get("signal"):
-                # 신규 매수인 경우 최대 보유 종목수 체크
                 if buy_signal.get("buy_count") == 1:
                     if not self._can_buy_new_stock():
                         return
 
-                self._execute_buy(code, current_price, buy_signal, candles)
+                try:
+                    self.order_queue.put_nowait({"type": "buy", "code": code, "price": current_price,
+                                                 "buy_signal": buy_signal, "candles": candles})
+                except queue.Full:
+                    pass
 
         except Exception as e:
             self.log(f"[{code}] 매매 조건 확인 오류: {e}", "ERROR")
@@ -520,6 +532,11 @@ class AutoTrader:
         - 체결될 때까지 유지
         """
         try:
+            # ✅ 최신 포지션 재조회 (큐 적재 시점과 실행 시점 사이 상태 변경 반영)
+            position = self.config.get_position(code) or position
+            if position.get("stoploss_triggered", False):
+                return  # 이미 스탑로스 처리됨 — 중복 실행 방지
+
             total_quantity = position.get("quantity", 0)
             if total_quantity <= 0:
                 return
@@ -969,6 +986,10 @@ class AutoTrader:
                     self.log(f"[{code}] 이전 매도 이력 존재 - 당일 재매수 차단", "WARNING")
                     return
 
+            # ✅ 이미 1차 매수 포지션이 있으면 중복 매수 차단 (큐 중복 방지)
+            if buy_count == 1 and position and position.get("quantity", 0) > 0:
+                return
+
             buy_amount = self.config.get("buy", "buy_amount_per_stock")
             quantity = buy_amount // buy_price
             if quantity <= 0:
@@ -1207,6 +1228,11 @@ class AutoTrader:
             if position.get("stoploss_triggered", False):
                 self.log(f"[{code}] 스탑로스 발동으로 {buy_count}차 추가 매수 차단", "WARNING")
                 return
+
+            # ✅ 동일 차수 추가 매수 이미 주문 전송됨 → 중복 방지 (큐 중복 방지)
+            if code in self.pending_buy_orders:
+                if any(o.get("buy_count") == buy_count for o in self.pending_buy_orders[code]):
+                    return
 
             buy_amount = self.config.get("buy", "buy_amount_per_stock")
             quantity = buy_amount // target_price
