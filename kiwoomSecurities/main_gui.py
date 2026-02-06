@@ -12,8 +12,44 @@ from PyQt5.QtWidgets import (
     QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTabWidget,
     QMessageBox, QHeaderView, QFrame, QGridLayout, QInputDialog
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
+
+
+class StockSearchWorker(QThread):
+    """백그라운드 종목 검색 워커 (UI 프리징 방지)"""
+    search_finished = pyqtSignal(list)  # [(code, name), ...]
+    search_error = pyqtSignal(str)
+
+    def __init__(self, kiwoom, search_text):
+        super().__init__()
+        self.kiwoom = kiwoom
+        self.search_text = search_text
+
+    def run(self):
+        try:
+            results = self.kiwoom.find_stocks_by_name(self.search_text)
+            self.search_finished.emit(results)
+        except Exception as e:
+            self.search_error.emit(str(e))
+
+
+class StockCacheLoaderWorker(QThread):
+    """백그라운드 종목 캐시 로더 (로그인 직후 사용)"""
+    load_finished = pyqtSignal(bool, int)  # (success, count)
+
+    def __init__(self, kiwoom):
+        super().__init__()
+        self.kiwoom = kiwoom
+
+    def run(self):
+        try:
+            success = self.kiwoom.load_stock_cache()
+            count = len(self.kiwoom._stock_cache) if success else 0
+            self.load_finished.emit(success, count)
+        except Exception as e:
+            print(f"[종목캐시] 로딩 오류: {e}")
+            self.load_finished.emit(False, 0)
 
 from config import Config
 from kiwoom_api import KiwoomAPI
@@ -86,6 +122,11 @@ class MainWindow(QMainWindow):
         self._balance_changed_timer = QTimer()
         self._balance_changed_timer.setSingleShot(True)
         self._balance_changed_timer.timeout.connect(self.refresh_holdings)
+
+        # ✅ 백그라운드 검색 워커 (UI 프리징 방지)
+        self._search_worker = None
+        self._cache_loader_worker = None
+        self._pending_search_callback = None
 
         # 초기 감시 종목 로드 (로그인 전에도 목록 표시)
         QTimer.singleShot(100, self._load_initial_watchlist)
@@ -538,13 +579,33 @@ class MainWindow(QMainWindow):
             return
         if not self.trader or not getattr(self.trader, "is_running", False):
             return
-        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 스킵
-        if self.kiwoom and self.kiwoom.is_tr_busy():
+        # ✅ TR 재진입 방지: TR 또는 TR 큐 처리 중이면 스킵
+        if self.kiwoom and self.kiwoom.is_tr_queue_busy():
             return
         try:
             self.trader.process_order_queue()
         except Exception as e:
             self.log(f"[시스템] 주문 큐 처리 오류: {e}")
+
+    # =========================
+    # 종목 캐시 로딩 (UI 프리징 방지)
+    # =========================
+    def _start_stock_cache_loading(self):
+        """백그라운드에서 종목 캐시 로딩 시작"""
+        if not self.kiwoom:
+            return
+
+        self.log("[시스템] 종목 캐시 로딩 시작...")
+        self._cache_loader_worker = StockCacheLoaderWorker(self.kiwoom)
+        self._cache_loader_worker.load_finished.connect(self._on_cache_load_finished)
+        self._cache_loader_worker.start()
+
+    def _on_cache_load_finished(self, success, count):
+        """종목 캐시 로딩 완료 콜백"""
+        if success:
+            self.log(f"[시스템] 종목 캐시 로딩 완료: {count}개 종목")
+        else:
+            self.log("[시스템] 종목 캐시 로딩 실패 - 검색 시 API 호출 사용")
 
     # =========================
     # 로그인 / 계좌
@@ -598,6 +659,9 @@ class MainWindow(QMainWindow):
 
                 # ✅ 실시간 시세 콜백 등록 (보유종목/감시종목 UI 실시간 갱신)
                 self.kiwoom.set_real_data_callback(self._on_realtime_price)
+
+                # ✅ 종목 캐시 로드 (UI 프리징 방지 - 백그라운드 스레드에서 실행)
+                self._start_stock_cache_loading()
 
                 self.trader = AutoTrader(self.kiwoom, self.config)
                 self.trader.set_log_callback(self.log)
@@ -780,8 +844,8 @@ class MainWindow(QMainWindow):
         if not (market_open <= current_time <= market_close):
             return
 
-        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 스킵
-        if self.kiwoom and self.kiwoom.is_tr_busy():
+        # ✅ TR 재진입 방지: TR 또는 TR 큐 처리 중이면 스킵
+        if self.kiwoom and self.kiwoom.is_tr_queue_busy():
             return
 
         # ✅ 이미 복원했어도 미체결 주문이 없으면 다시 복원 시도
@@ -862,8 +926,8 @@ class MainWindow(QMainWindow):
         if self._is_checking_signals:
             return
 
-        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 스킵 (다음 타이머 주기에 재시도)
-        if self.kiwoom and self.kiwoom.is_tr_busy():
+        # ✅ TR 재진입 방지: TR 또는 TR 큐 처리 중이면 스킵 (다음 타이머 주기에 재시도)
+        if self.kiwoom and self.kiwoom.is_tr_queue_busy():
             return
 
         self._is_checking_signals = True
@@ -1002,15 +1066,15 @@ class MainWindow(QMainWindow):
     # 데이터 갱신
     # =========================
     def refresh_data(self):
-        """데이터 갱신"""
+        """데이터 갱신 (TR 큐 기반으로 순차 처리됨)"""
         if self._is_stopping:
             return
+        # ✅ TR 큐가 순차 처리하므로 별도 지연 없이 요청 추가
         self.refresh_holdings()
-        # ✅ 감시종목 갱신은 보유종목 갱신 완료 후 1초 뒤에 실행 (TR 충돌 방지)
-        QTimer.singleShot(1000, self.refresh_watchlist)
+        self.refresh_watchlist()
 
     def refresh_holdings(self):
-        """보유 종목 갱신"""
+        """보유 종목 갱신 (큐 기반 비동기)"""
         if not self.kiwoom or not self.kiwoom.is_connected():
             return
 
@@ -1018,35 +1082,47 @@ class MainWindow(QMainWindow):
         if not account:
             return
 
-        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 500ms 후 재시도
-        if self.kiwoom.is_tr_busy():
-            QTimer.singleShot(500, self.refresh_holdings)
+        # ✅ TR 큐에 잔고 조회 요청 추가 (중첩 호출 방지)
+        self.log(f"[잔고조회] 계좌번호: {account} (큐 기반 요청)")
+        self.kiwoom.get_balance_async(account, self._on_balance_received)
+
+    def _on_balance_received(self, balance):
+        """잔고 조회 결과 콜백 (큐에서 호출)"""
+        if balance is None:
+            self.log("[잔고조회] 조회 실패")
             return
 
         try:
-            self.log(f"[잔고조회] 계좌번호: {account} (길이: {len(account)})")
-
-            balance = self.kiwoom.get_balance(account)
-
+            account = self.account_combo.currentText().strip()
             deposit = balance.get("deposit", 0) or 0
             holdings = balance.get("holdings", [])
             total_eval = balance.get("total_eval", 0) or 0
             self.log(f"[잔고조회] 예수금={deposit:,}원, 총평가={total_eval:,}원, 보유종목={len(holdings)}개")
 
-            # ✅ 예수금이 0이면 opw00001 TR로 재조회 시도
+            # ✅ 예수금이 0이면 opw00001 TR로 재조회 시도 (큐 기반)
+            if deposit == 0 and account:
+                self.log(f"[잔고조회] opw00018 예수금=0, opw00001로 재조회 요청...")
+                self.kiwoom.get_deposit_async(account, self._on_deposit_received)
+            else:
+                self._update_holdings_ui(balance, deposit)
+
+        except Exception as e:
+            self.log(f"[시스템] 잔고 조회 결과 처리 오류: {e}")
+
+    def _on_deposit_received(self, deposit_info):
+        """예수금 재조회 결과 콜백"""
+        if deposit_info is None:
+            self.log("[잔고조회] 예수금 재조회 실패")
+            return
+
+        try:
+            self.log(f"[잔고조회] opw00001 결과: {deposit_info}")
+            # 주문가능금액 > D+2예수금 > 예수금 순으로 사용
+            deposit = deposit_info.get("order_available", 0) or 0
             if deposit == 0:
-                try:
-                    self.log(f"[잔고조회] opw00018 예수금=0, opw00001로 재조회...")
-                    deposit_info = self.kiwoom.get_deposit(account)
-                    self.log(f"[잔고조회] opw00001 결과: {deposit_info}")
-                    # 주문가능금액 > D+2예수금 > 예수금 순으로 사용
-                    deposit = deposit_info.get("order_available", 0) or 0
-                    if deposit == 0:
-                        deposit = deposit_info.get("deposit_d2", 0) or 0
-                    if deposit == 0:
-                        deposit = deposit_info.get("deposit", 0) or 0
-                except Exception as e:
-                    self.log(f"[잔고조회] opw00001 오류: {e}")
+                deposit = deposit_info.get("deposit_d2", 0) or 0
+            if deposit == 0:
+                deposit = deposit_info.get("deposit", 0) or 0
 
             # ✅ 예수금이 여전히 0이면 원인 안내
             if deposit == 0 and self.kiwoom.is_real_server():
@@ -1057,6 +1133,14 @@ class MainWindow(QMainWindow):
                 self.log("  3. 'AUTO' 체크박스가 선택되어 있는지 확인")
                 self.log("  4. 프로그램 재시작 후 다시 시도")
 
+            self.balance_label.setText(f"예수금: {deposit:,}원")
+
+        except Exception as e:
+            self.log(f"[잔고조회] 예수금 처리 오류: {e}")
+
+    def _update_holdings_ui(self, balance, deposit):
+        """보유종목 UI 업데이트"""
+        try:
             self.balance_label.setText(f"예수금: {deposit:,}원")
 
             holdings = balance.get("holdings", [])
@@ -1086,7 +1170,7 @@ class MainWindow(QMainWindow):
                 self.trader.sync_positions_from_account(balance)
 
         except Exception as e:
-            self.log(f"[시스템] 잔고 조회 오류: {e}")
+            self.log(f"[시스템] 보유종목 UI 업데이트 오류: {e}")
 
     def refresh_watchlist(self):
         """감시 종목 갱신 (비동기 방식으로 UI 프리징 방지)"""
@@ -1107,24 +1191,32 @@ class MainWindow(QMainWindow):
 
             self._update_watchlist_header()
 
-            self.watchlist_table.setRowCount(0)
-            self.watchlist_table.setRowCount(len(watchlist))
-            self._watchlist_code_to_row = {}
+            # ✅ 행 수가 다를 때만 setRowCount 호출 (불필요한 리셋 방지)
+            current_row_count = self.watchlist_table.rowCount()
+            if current_row_count != len(watchlist):
+                self.watchlist_table.setRowCount(len(watchlist))
 
             period = self.config.get("buy", "envelope_period") or 20
             percent = self.config.get("buy", "envelope_percent") or 19
 
-            # 먼저 테이블 기본 정보만 채우기 (빠름)
+            # ✅ 코드/이름 매핑 갱신 + 기본 정보 설정 (기존 값 유지)
+            self._watchlist_code_to_row = {}
             for row, stock in enumerate(watchlist):
                 code = stock["code"]
                 name = stock.get("name", "")
                 self._watchlist_code_to_row[code] = row
 
+                # 코드/이름은 항상 설정 (변경될 수 있음)
                 self.watchlist_table.setItem(row, 0, QTableWidgetItem(code))
                 self.watchlist_table.setItem(row, 1, QTableWidgetItem(name))
-                self.watchlist_table.setItem(row, 2, QTableWidgetItem("-"))
-                self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
-                self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
+
+                # ✅ 기존 값이 없을 때만 "-"로 초기화 (기존 값 유지)
+                if not self.watchlist_table.item(row, 2):
+                    self.watchlist_table.setItem(row, 2, QTableWidgetItem("-"))
+                if not self.watchlist_table.item(row, 3):
+                    self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
+                if not self.watchlist_table.item(row, 4):
+                    self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
 
             # 캐시된 데이터로 먼저 표시 (이벤트 엔진의 배치 스케줄러 캐시 사용)
             if self.trader and self.trader.event_engine:
@@ -1171,7 +1263,7 @@ class MainWindow(QMainWindow):
             self._is_refreshing_watchlist = False
 
     def _refresh_watchlist_next(self):
-        """비동기로 감시 종목 정보를 하나씩 갱신 (UI 프리징 방지)"""
+        """비동기로 감시 종목 정보를 하나씩 갱신 (TR 큐 기반)"""
         if self._is_stopping:
             self._is_refreshing_watchlist = False
             return
@@ -1185,25 +1277,33 @@ class MainWindow(QMainWindow):
             self._is_refreshing_watchlist = False
             return
 
-        # ✅ TR 재진입 방지: 다른 TR 처리 중이면 500ms 후 재시도
-        if self.kiwoom.is_tr_busy():
-            QTimer.singleShot(500, self._refresh_watchlist_next)
-            return
-
         row, stock = self._watchlist_refresh_queue.pop(0)
         code = stock["code"]
 
+        # 테이블 행 유효성 확인
+        if row >= self.watchlist_table.rowCount():
+            # 테이블이 리셋되었을 수 있음, 다음 종목으로 진행
+            if self._watchlist_refresh_queue:
+                QTimer.singleShot(100, self._refresh_watchlist_next)
+            else:
+                self._is_refreshing_watchlist = False
+            return
+
+        # ✅ TR 큐에 일봉 조회 요청 추가 (row, code를 클로저로 캡처)
+        def on_candles_received(candles, r=row, c=code):
+            self._on_watchlist_candles_received(r, c, candles)
+
+        count = max(self._watchlist_refresh_period + 5, 25)
+        self.kiwoom.get_daily_candles_async(code, on_candles_received, count)
+
+    def _on_watchlist_candles_received(self, row, code, candles):
+        """감시종목 일봉 조회 결과 콜백"""
         try:
-            # 테이블 행 유효성 확인
+            # 테이블 행 유효성 재확인
             if row >= self.watchlist_table.rowCount():
-                # 테이블이 리셋되었을 수 있음, 다음 종목으로 진행
-                if self._watchlist_refresh_queue:
-                    QTimer.singleShot(100, self._refresh_watchlist_next)
-                else:
-                    self._is_refreshing_watchlist = False
+                self._continue_watchlist_refresh()
                 return
 
-            candles = self.kiwoom.get_daily_candles(code, max(self._watchlist_refresh_period + 5, 25))
             if candles and len(candles) > 0:
                 current_price = candles[0].get("close", 0)
                 envelope = self.ta.get_envelope_levels(candles, self._watchlist_refresh_period, self._watchlist_refresh_percent)
@@ -1216,30 +1316,50 @@ class MainWindow(QMainWindow):
                 # 캐시 업데이트 (이벤트 엔진이 있으면)
                 if self.trader and self.trader.event_engine:
                     self.trader.event_engine.batch_scheduler.update_cache(code, candles)
+
+                self._continue_watchlist_refresh()
             else:
-                # 일봉 데이터 실패 시 현재가만이라도 조회 (opt10001 fallback)
+                # 일봉 데이터 실패 시 현재가만이라도 조회 (opt10001 fallback - 큐 기반)
                 self.log(f"[시스템] [{code}] 일봉 데이터 없음, 현재가 조회 시도...")
-                try:
-                    stock_info = self.kiwoom.get_stock_info(code)
-                    if stock_info and stock_info.get("price", 0) > 0:
-                        current_price = stock_info.get("price", 0)
-                        self.watchlist_table.setItem(row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price)))
-                        self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
-                        self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
-                        self.log(f"[시스템] [{code}] 현재가 조회 성공: {current_price:,}원")
-                    else:
-                        self.log(f"[시스템] [{code}] 현재가 조회 실패")
-                except Exception as e2:
-                    self.log(f"[시스템] [{code}] 현재가 조회 오류: {e2}")
+
+                def on_stock_info_received(stock_info, r=row, c=code):
+                    self._on_watchlist_stock_info_received(r, c, stock_info)
+
+                self.kiwoom.get_stock_info_async(code, on_stock_info_received)
 
         except Exception as e:
-            self.log(f"[시스템] [{code}] 정보 조회 오류: {e}")
+            self.log(f"[시스템] [{code}] 일봉 처리 오류: {e}")
+            self._continue_watchlist_refresh()
 
-        # 다음 종목 조회 (350ms 간격으로 TR 호출 제한 준수)
+    def _on_watchlist_stock_info_received(self, row, code, stock_info):
+        """감시종목 현재가 조회 결과 콜백 (fallback)"""
+        try:
+            if row >= self.watchlist_table.rowCount():
+                self._continue_watchlist_refresh()
+                return
+
+            if stock_info and stock_info.get("price", 0) > 0:
+                current_price = stock_info.get("price", 0)
+                self.watchlist_table.setItem(row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price)))
+                self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
+                self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
+                self.log(f"[시스템] [{code}] 현재가 조회 성공: {current_price:,}원")
+            else:
+                self.log(f"[시스템] [{code}] 현재가 조회 실패")
+
+        except Exception as e:
+            self.log(f"[시스템] [{code}] 현재가 처리 오류: {e}")
+
+        self._continue_watchlist_refresh()
+
+    def _continue_watchlist_refresh(self):
+        """감시종목 갱신 계속 진행"""
         if self._watchlist_refresh_queue:
-            QTimer.singleShot(350, self._refresh_watchlist_next)
+            # 다음 종목은 TR 큐가 알아서 순차 처리하므로 바로 호출
+            QTimer.singleShot(50, self._refresh_watchlist_next)
         else:
             self._is_refreshing_watchlist = False
+            self.watchlist_table.viewport().update()
             self.watchlist_table.viewport().update()
 
     # =========================
@@ -1259,38 +1379,60 @@ class MainWindow(QMainWindow):
         if input_text.isdigit() and len(input_text) == 6:
             code = input_text
             if self.kiwoom and self.kiwoom.is_connected():
-                name = self.kiwoom.get_master_code_name(code)
+                # ✅ 캐시에서 먼저 조회 (빠름)
+                name = self.kiwoom.get_stock_name_from_cache(code)
                 if not name:
                     QMessageBox.warning(self, "오류", f"종목코드 '{code}'를 찾을 수 없습니다.")
                     return
             else:
                 self.log("[시스템] 로그인 전 종목 추가: 종목명은 로그인 후 자동 표시될 수 있습니다.")
+            # 종목코드 입력은 바로 추가
+            self._add_stock_to_watchlist(code, name)
         else:
-            # 종목명으로 검색
+            # 종목명으로 검색 - 백그라운드 처리
             if not self.kiwoom or not self.kiwoom.is_connected():
                 QMessageBox.warning(self, "오류", "종목명 검색은 로그인 후 가능합니다.")
                 return
 
-            results = self.kiwoom.find_stocks_by_name(input_text)
-            if not results:
-                QMessageBox.warning(self, "검색 결과 없음", f"'{input_text}'에 해당하는 종목을 찾을 수 없습니다.")
-                return
-            elif len(results) == 1:
-                code, name = results[0]
+            # ✅ 캐시가 로드되어 있으면 동기적으로 빠르게 검색
+            if self.kiwoom.is_stock_cache_loaded():
+                results = self.kiwoom.find_stocks_by_name(input_text)
+                self._handle_watchlist_search_results(results, input_text)
             else:
-                # 여러 결과가 있으면 사용자에게 선택하도록 함
-                items = [f"{r[0]} - {r[1]}" for r in results]
-                selected, ok = QInputDialog.getItem(
-                    self, "종목 선택",
-                    f"'{input_text}' 검색 결과 ({len(results)}건):",
-                    items, 0, False
+                # 캐시 미로드 시 백그라운드 검색
+                self.log(f"[시스템] '{input_text}' 검색 중...")
+                self._search_worker = StockSearchWorker(self.kiwoom, input_text)
+                self._search_worker.search_finished.connect(
+                    lambda results: self._handle_watchlist_search_results(results, input_text)
                 )
-                if ok and selected:
-                    idx = items.index(selected)
-                    code, name = results[idx]
-                else:
-                    return
+                self._search_worker.search_error.connect(
+                    lambda err: QMessageBox.warning(self, "검색 오류", f"검색 중 오류 발생: {err}")
+                )
+                self._search_worker.start()
 
+    def _handle_watchlist_search_results(self, results, search_text):
+        """종목 검색 결과 처리 (감시종목 추가용)"""
+        if not results:
+            QMessageBox.warning(self, "검색 결과 없음", f"'{search_text}'에 해당하는 종목을 찾을 수 없습니다.")
+            return
+        elif len(results) == 1:
+            code, name = results[0]
+            self._add_stock_to_watchlist(code, name)
+        else:
+            # 여러 결과가 있으면 사용자에게 선택하도록 함
+            items = [f"{r[0]} - {r[1]}" for r in results]
+            selected, ok = QInputDialog.getItem(
+                self, "종목 선택",
+                f"'{search_text}' 검색 결과 ({len(results)}건):",
+                items, 0, False
+            )
+            if ok and selected:
+                idx = items.index(selected)
+                code, name = results[idx]
+                self._add_stock_to_watchlist(code, name)
+
+    def _add_stock_to_watchlist(self, code, name):
+        """감시종목에 종목 추가"""
         success, message = self.config.add_to_watchlist(code, name)
         if success:
             self.log(f"[시스템] 감시 종목 추가: {code} {name}")
@@ -1321,7 +1463,7 @@ class MainWindow(QMainWindow):
             self.refresh_watchlist()
 
     def resolve_stock_code(self, input_text):
-        """종목코드 또는 종목명을 입력받아 종목코드와 종목명을 반환
+        """종목코드 또는 종목명을 입력받아 종목코드와 종목명을 반환 (캐시 기반 - UI 프리징 없음)
 
         Args:
             input_text: 종목코드(6자리 숫자) 또는 종목명
@@ -1337,7 +1479,8 @@ class MainWindow(QMainWindow):
         if input_text.isdigit() and len(input_text) == 6:
             code = input_text
             if self.kiwoom and self.kiwoom.is_connected():
-                name = self.kiwoom.get_master_code_name(code)
+                # ✅ 캐시에서 먼저 조회 (빠름)
+                name = self.kiwoom.get_stock_name_from_cache(code)
                 if not name:
                     QMessageBox.warning(self, "오류", f"종목코드 '{code}'를 찾을 수 없습니다.")
                     return None, None
@@ -1345,11 +1488,12 @@ class MainWindow(QMainWindow):
             else:
                 return code, ""
         else:
-            # 종목명으로 검색
+            # 종목명으로 검색 (캐시 기반이면 빠름)
             if not self.kiwoom or not self.kiwoom.is_connected():
                 QMessageBox.warning(self, "오류", "종목명 검색은 로그인 후 가능합니다.")
                 return None, None
 
+            # ✅ 캐시 기반 검색 (캐시 로드 시 빠름, 미로드 시 기존 방식)
             results = self.kiwoom.find_stocks_by_name(input_text)
             if not results:
                 QMessageBox.warning(self, "검색 결과 없음", f"'{input_text}'에 해당하는 종목을 찾을 수 없습니다.")

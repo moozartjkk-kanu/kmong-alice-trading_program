@@ -7,7 +7,7 @@ import time
 from collections import deque
 from threading import Lock
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import QEventLoop, QObject, pyqtSignal
+from PyQt5.QtCore import QEventLoop, QObject, pyqtSignal, QTimer
 from PyQt5.QtWidgets import QApplication
 
 
@@ -61,6 +61,188 @@ class RateLimiter:
             self.calls.append(time.time())
 
 
+class OrderQueue:
+    """주문 호출 큐 - 초당 주문 제한 준수 (에러코드 -308 방지)"""
+
+    def __init__(self, kiwoom_api):
+        self.kiwoom = kiwoom_api
+        self._queue = deque()  # (order_func, args, kwargs, callback) 튜플
+        self._is_processing = False
+        self._process_timer = QTimer()
+        self._process_timer.setSingleShot(True)
+        self._process_timer.timeout.connect(self._process_next)
+        # 주문 간 최소 간격 (키움 API 초당 주문 제한: 1초에 5건 미만 권장)
+        self._min_interval_ms = 300  # 300ms 간격 = 초당 약 3건
+
+    def enqueue(self, order_func, callback=None, *args, **kwargs):
+        """
+        주문 호출을 큐에 추가
+
+        Args:
+            order_func: 실행할 주문 함수 (예: kiwoom.send_order)
+            callback: 결과를 받을 콜백 함수 (선택) - (result, args) 전달
+            *args, **kwargs: 주문 함수에 전달할 인자
+        """
+        self._queue.append((order_func, args, kwargs, callback))
+        self._debug(f"[주문큐] 추가됨: {order_func.__name__} (대기: {len(self._queue)}개)")
+
+        # 처리 중이 아니면 시작
+        if not self._is_processing:
+            self._start_processing()
+
+    def _start_processing(self):
+        """큐 처리 시작"""
+        if self._is_processing:
+            return
+        self._is_processing = True
+        # 즉시 시작하지 않고 약간의 지연 후 시작 (이벤트 루프 안정화)
+        self._process_timer.start(50)
+
+    def _process_next(self):
+        """큐에서 다음 주문 처리"""
+        if not self._queue:
+            self._is_processing = False
+            self._debug("[주문큐] 큐 비어있음 - 처리 완료")
+            return
+
+        order_func, args, kwargs, callback = self._queue.popleft()
+        self._debug(f"[주문큐] 처리 시작: {order_func.__name__} args={args[:3] if len(args) > 3 else args} (남은 대기: {len(self._queue)}개)")
+
+        try:
+            result = order_func(*args, **kwargs)
+            self._debug(f"[주문큐] 결과: {result}")
+            if callback:
+                try:
+                    callback(result, args)
+                except Exception as e:
+                    self._debug(f"[주문큐] 콜백 오류: {e}")
+        except Exception as e:
+            self._debug(f"[주문큐] 주문 실행 오류: {e}")
+            if callback:
+                try:
+                    callback(-999, args)  # 오류 코드
+                except Exception:
+                    pass
+
+        # 다음 주문 처리 (간격 유지)
+        if self._queue:
+            self._process_timer.start(self._min_interval_ms)
+        else:
+            self._is_processing = False
+            self._debug("[주문큐] 모든 주문 처리 완료")
+
+    def clear(self):
+        """큐 비우기"""
+        self._queue.clear()
+        self._is_processing = False
+        self._debug("[주문큐] 큐 초기화됨")
+
+    def is_empty(self):
+        """큐가 비어있는지 확인"""
+        return len(self._queue) == 0
+
+    def pending_count(self):
+        """대기 중인 주문 개수"""
+        return len(self._queue)
+
+    def _debug(self, message):
+        if self.kiwoom.debug:
+            print(message)
+
+
+class TRQueue:
+    """TR 호출 큐 - 순차 처리로 중첩 호출 방지"""
+
+    def __init__(self, kiwoom_api):
+        self.kiwoom = kiwoom_api
+        self._queue = deque()  # (tr_func, args, kwargs, callback) 튜플
+        self._is_processing = False
+        self._process_timer = QTimer()
+        self._process_timer.setSingleShot(True)
+        self._process_timer.timeout.connect(self._process_next)
+        self._min_interval_ms = 250  # TR 호출 간 최소 간격
+
+    def enqueue(self, tr_func, callback=None, *args, **kwargs):
+        """
+        TR 호출을 큐에 추가
+
+        Args:
+            tr_func: 실행할 TR 함수 (예: kiwoom.get_balance)
+            callback: 결과를 받을 콜백 함수 (선택)
+            *args, **kwargs: TR 함수에 전달할 인자
+        """
+        self._queue.append((tr_func, args, kwargs, callback))
+        self._debug(f"[TR큐] 추가됨: {tr_func.__name__} (대기: {len(self._queue)}개)")
+
+        # 처리 중이 아니면 시작
+        if not self._is_processing:
+            self._start_processing()
+
+    def _start_processing(self):
+        """큐 처리 시작"""
+        if self._is_processing:
+            return
+        self._is_processing = True
+        # 즉시 시작하지 않고 약간의 지연 후 시작 (이벤트 루프 안정화)
+        self._process_timer.start(50)
+
+    def _process_next(self):
+        """큐에서 다음 TR 처리"""
+        # TR이 이미 처리 중이면 대기
+        if self.kiwoom._tr_busy:
+            self._debug("[TR큐] TR 처리 중 - 대기")
+            self._process_timer.start(self._min_interval_ms)
+            return
+
+        if not self._queue:
+            self._is_processing = False
+            self._debug("[TR큐] 큐 비어있음 - 처리 완료")
+            return
+
+        tr_func, args, kwargs, callback = self._queue.popleft()
+        self._debug(f"[TR큐] 처리 시작: {tr_func.__name__} (남은 대기: {len(self._queue)}개)")
+
+        try:
+            result = tr_func(*args, **kwargs)
+            if callback:
+                try:
+                    callback(result)
+                except Exception as e:
+                    self._debug(f"[TR큐] 콜백 오류: {e}")
+        except Exception as e:
+            self._debug(f"[TR큐] TR 실행 오류: {e}")
+            if callback:
+                try:
+                    callback(None)
+                except Exception:
+                    pass
+
+        # 다음 TR 처리 (간격 유지)
+        if self._queue:
+            self._process_timer.start(self._min_interval_ms)
+        else:
+            self._is_processing = False
+            self._debug("[TR큐] 모든 TR 처리 완료")
+
+    def clear(self):
+        """큐 비우기"""
+        self._queue.clear()
+        self._is_processing = False
+        self._debug("[TR큐] 큐 초기화됨")
+
+    def is_empty(self):
+        """큐가 비어있는지 확인"""
+        return len(self._queue) == 0
+
+    def pending_count(self):
+        """대기 중인 TR 개수"""
+        return len(self._queue)
+
+    def _debug(self, message):
+        if self.kiwoom.debug:
+            print(message)
+
+
 class KiwoomAPI:
     """키움증권 Open API+ 래퍼 클래스"""
 
@@ -90,6 +272,16 @@ class KiwoomAPI:
         # ✅ 계좌 데이터 시그널 발신기
         self.account_signals = AccountSignalEmitter()
 
+        # ✅ 종목 코드/이름 캐시 (UI 프리징 방지)
+        self._stock_cache = {}  # {code: name}
+        self._stock_cache_loaded = False
+
+        # ✅ TR 호출 큐 (중첩 호출 방지)
+        self.tr_queue = TRQueue(self)
+
+        # ✅ 주문 호출 큐 (에러코드 -308 방지 - 초당 주문 제한)
+        self.order_queue = OrderQueue(self)
+
         # 이벤트 연결
         self.ocx.OnEventConnect.connect(self._on_event_connect)
         self.ocx.OnReceiveTrData.connect(self._on_receive_tr_data)
@@ -118,6 +310,27 @@ class KiwoomAPI:
     def is_tr_busy(self):
         """TR 요청 처리 중 여부 확인 (재진입 방지용)"""
         return self._tr_busy
+
+    def is_tr_queue_busy(self):
+        """TR 큐가 처리 중인지 확인"""
+        return self.tr_queue._is_processing or self._tr_busy
+
+    # ==================== 큐 기반 TR 조회 (비동기) ====================
+    def get_balance_async(self, account, callback):
+        """계좌 잔고 조회 (큐 기반 비동기)"""
+        self.tr_queue.enqueue(self.get_balance, callback, account)
+
+    def get_daily_candles_async(self, code, callback, count=60):
+        """일봉 데이터 조회 (큐 기반 비동기)"""
+        self.tr_queue.enqueue(self.get_daily_candles, callback, code, count)
+
+    def get_stock_info_async(self, code, callback):
+        """종목 기본 정보 조회 (큐 기반 비동기)"""
+        self.tr_queue.enqueue(self.get_stock_info, callback, code)
+
+    def get_deposit_async(self, account, callback):
+        """예수금 상세 조회 (큐 기반 비동기)"""
+        self.tr_queue.enqueue(self.get_deposit, callback, account)
 
     def set_event_engine(self, engine):
         """이벤트 엔진 설정"""
@@ -371,8 +584,49 @@ class KiwoomAPI:
             return code_list.split(";")[:-1]  # 마지막 빈 문자열 제거
         return []
 
+    def load_stock_cache(self):
+        """
+        전체 종목 코드/이름을 메모리 캐시에 로드 (로그인 직후 1회 호출)
+        UI 프리징 방지를 위해 로그인 직후 메인 스레드에서 한 번만 호출
+        """
+        if self._stock_cache_loaded:
+            return True
+
+        print("[종목캐시] 전체 종목 로딩 시작...")
+        self._stock_cache = {}
+
+        try:
+            # 코스피(0)와 코스닥(10) 종목 로드
+            for market in ["0", "10"]:
+                codes = self.get_code_list_by_market(market)
+                for code in codes:
+                    name = self.get_master_code_name(code)
+                    if name:
+                        self._stock_cache[code] = name
+
+            self._stock_cache_loaded = True
+            print(f"[종목캐시] 로딩 완료: {len(self._stock_cache)}개 종목")
+            return True
+        except Exception as e:
+            print(f"[종목캐시] 로딩 오류: {e}")
+            return False
+
+    def is_stock_cache_loaded(self):
+        """종목 캐시 로드 여부 확인"""
+        return self._stock_cache_loaded
+
+    def get_stock_name_from_cache(self, code):
+        """캐시에서 종목명 조회 (캐시 미스 시 API 호출)"""
+        if code in self._stock_cache:
+            return self._stock_cache[code]
+        # 캐시에 없으면 API 호출 후 캐시에 추가
+        name = self.get_master_code_name(code)
+        if name:
+            self._stock_cache[code] = name
+        return name
+
     def find_stocks_by_name(self, search_name):
-        """종목명으로 종목코드 검색
+        """종목명으로 종목코드 검색 (캐시 기반 - UI 프리징 없음)
 
         Args:
             search_name: 검색할 종목명 (부분 일치)
@@ -383,7 +637,14 @@ class KiwoomAPI:
         results = []
         search_name = search_name.upper()  # 대소문자 무시
 
-        # 코스피(0)와 코스닥(10) 종목 검색
+        # ✅ 캐시가 로드되어 있으면 캐시에서 검색 (빠름)
+        if self._stock_cache_loaded:
+            for code, name in self._stock_cache.items():
+                if name and search_name in name.upper():
+                    results.append((code, name))
+            return results
+
+        # 캐시가 없으면 기존 방식 (느림 - 호환성 유지)
         for market in ["0", "10"]:
             codes = self.get_code_list_by_market(market)
             for code in codes:
@@ -776,6 +1037,44 @@ class KiwoomAPI:
         """
         hoga = "03" if price == 0 else "00"
         return self.send_order("매도주문", "0202", account, 2, code, quantity, price, hoga)
+
+    # ==================== 큐 기반 주문 (에러코드 -308 방지) ====================
+    def send_order_queued(self, rqname, screen_no, account, order_type, code, quantity, price, hoga, callback=None, org_order_no=""):
+        """
+        주문 전송 (큐 기반 - 초당 주문 제한 준수)
+
+        Args:
+            callback: 주문 결과 콜백 (result, args) 전달
+        """
+        self.order_queue.enqueue(
+            self.send_order,
+            callback,
+            rqname, screen_no, account, order_type, code, quantity, price, hoga, org_order_no
+        )
+
+    def buy_stock_queued(self, account, code, quantity, price=0, callback=None):
+        """
+        매수 주문 (큐 기반)
+        price=0이면 시장가
+        """
+        hoga = "03" if price == 0 else "00"
+        self.order_queue.enqueue(
+            self.send_order,
+            callback,
+            "매수주문", "0201", account, 1, code, quantity, price, hoga, ""
+        )
+
+    def sell_stock_queued(self, account, code, quantity, price=0, callback=None):
+        """
+        매도 주문 (큐 기반)
+        price=0이면 시장가
+        """
+        hoga = "03" if price == 0 else "00"
+        self.order_queue.enqueue(
+            self.send_order,
+            callback,
+            "매도주문", "0202", account, 2, code, quantity, price, hoga, ""
+        )
 
     def cancel_order(self, account, code, order_no, quantity):
         """

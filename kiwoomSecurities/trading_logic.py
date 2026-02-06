@@ -18,6 +18,9 @@ from datetime import datetime, time as dt_time
 import time
 import queue
 import threading
+from functools import partial
+
+from PyQt5.QtCore import QTimer
 
 from technical_analysis import TechnicalAnalysis, TradingSignal
 from event_engine import init_engine
@@ -550,7 +553,7 @@ class AutoTrader:
             avg_price, initial_qty, current_qty, ma20, sold_targets
         )
 
-        # 주문 걸기
+        # 주문 걸기 (큐 기반 - 에러코드 -308 방지)
         for order in sell_orders_to_place:
             target_name = order["target_name"]
 
@@ -574,24 +577,80 @@ class AutoTrader:
                 })
                 continue
 
-            # 주문 전송
-            result = self.kiwoom.sell_stock(self.account, code, order["quantity"], order["price"])
+            # 주문 전송 (큐 기반 - 콜백으로 결과 처리)
+            order_info = {
+                "code": code,
+                "target_name": target_name,
+                "quantity": order["quantity"],
+                "price": order["price"],
+                "sell_ratio": order.get("sell_ratio", 0)
+            }
+            self.kiwoom.sell_stock_queued(
+                self.account, code, order["quantity"], order["price"],
+                callback=lambda result, _, info=order_info: self._on_sell_order_result(result, info)
+            )
+            # 주문 요청 즉시 placed_sell_orders에 등록 (중복 방지)
+            self.placed_sell_orders[code][target_name] = True
 
-            if result == 0:
-                self.log(f"[{code}] {target_name} 매도 주문 설정: {order['quantity']}주 @ {order['price']:,}원", "SUCCESS")
-                self.placed_sell_orders[code][target_name] = True
+    def _on_sell_order_result(self, result, order_info):
+        """
+        ✅ 큐 기반 매도 주문 결과 콜백
 
-                # 미체결 주문 저장
-                self.config.save_pending_order(code, {
-                    "order_type": "sell",
-                    "quantity": order["quantity"],
-                    "price": order["price"],
-                    "target_name": target_name,
-                    "sell_ratio": order.get("sell_ratio", 0),
-                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                })
-            else:
-                self.log(f"[{code}] {target_name} 매도 주문 실패: 에러코드 {result}", "ERROR")
+        Args:
+            result: 주문 결과 코드 (0=성공)
+            order_info: 주문 정보 dict (code, target_name, quantity, price, sell_ratio)
+        """
+        code = order_info["code"]
+        target_name = order_info["target_name"]
+        quantity = order_info["quantity"]
+        price = order_info["price"]
+        sell_ratio = order_info.get("sell_ratio", 0)
+
+        if result == 0:
+            self.log(f"[{code}] {target_name} 매도 주문 설정: {quantity}주 @ {price:,}원", "SUCCESS")
+
+            # 미체결 주문 저장
+            self.config.save_pending_order(code, {
+                "order_type": "sell",
+                "quantity": quantity,
+                "price": price,
+                "target_name": target_name,
+                "sell_ratio": sell_ratio,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+        else:
+            self.log(f"[{code}] {target_name} 매도 주문 실패: 에러코드 {result}", "ERROR")
+            # 실패 시 placed_sell_orders에서 제거 (재시도 가능하도록)
+            if code in self.placed_sell_orders:
+                self.placed_sell_orders[code].pop(target_name, None)
+
+    def _on_buy_restore_result(self, result, restore_info):
+        """
+        ✅ 큐 기반 매수 복원 결과 콜백
+        """
+        code = restore_info["code"]
+        buy_count = restore_info["buy_count"]
+        quantity = restore_info["quantity"]
+        price = restore_info["price"]
+
+        if result == 0:
+            self.log(f"[{code}] {buy_count}차 매수 주문 복원: {quantity}주 @ {price:,}원", "SUCCESS")
+        else:
+            self.log(f"[{code}] 매수 주문 복원 실패: 에러코드 {result}", "ERROR")
+
+    def _on_sell_restore_result(self, result, restore_info):
+        """
+        ✅ 큐 기반 매도 복원 결과 콜백
+        """
+        code = restore_info["code"]
+        target_name = restore_info["target_name"]
+        quantity = restore_info["quantity"]
+        price = restore_info["price"]
+
+        if result == 0:
+            self.log(f"[{code}] {target_name} 매도 주문 복원: {quantity}주 @ {price:,}원", "SUCCESS")
+        else:
+            self.log(f"[{code}] 매도 주문 복원 실패: 에러코드 {result}", "ERROR")
 
     def _calculate_sell_orders(self, avg_price, initial_qty, current_qty, ma20, sold_targets):
         """
@@ -1223,7 +1282,8 @@ class AutoTrader:
                             self.config.update_position(code, position)
 
                         self.config.remove_pending_order(code, order_type="buy", price=executed_price)
-                        self._check_and_cancel_excess_orders()
+                        # ✅ 동기 TR 호출을 지연 실행 (콜백 내 QEventLoop 중첩 방지)
+                        QTimer.singleShot(0, self._check_and_cancel_excess_orders)
 
                     else:
                         # ✅ 매도 체결 시 sold_targets 업데이트
@@ -1247,8 +1307,8 @@ class AutoTrader:
                                             self.config.update_position(code, position)
                                             self.log(f"[{code}] {target_name} 매도 체결 완료 (자동)", "SUCCESS")
 
-                                            # ✅ 매도 발생 시 미체결 매수 주문 취소
-                                            self._cancel_pending_buy_orders(code)
+                                            # ✅ 매도 발생 시 미체결 매수 주문 취소 (지연 실행)
+                                            QTimer.singleShot(0, partial(self._cancel_pending_buy_orders, code))
                                     break
 
                             # placed_sell_orders에서 해당 타겟 제거
@@ -1283,13 +1343,16 @@ class AutoTrader:
                             # ✅ 추가 매수: 기존 매도 주문 취소 후 새 수량 기준으로 재발주
                             self.log(f"[{code}] 추가 매수 체결 - 매도 주문 재계산 ({old_quantity}주 → {quantity}주)", "INFO")
 
-                            # 기존 매도 주문 취소
-                            try:
-                                cancelled = self.kiwoom.cancel_sell_orders_for_stock(self.account, code)
-                                if cancelled > 0:
-                                    self.log(f"[{code}] 기존 매도 주문 {cancelled}건 취소", "INFO")
-                            except Exception as e:
-                                self.log(f"[{code}] 기존 매도 주문 취소 오류: {e}", "ERROR")
+                            # ✅ 기존 매도 주문 취소 (지연 실행 - 콜백 내 QEventLoop 중첩 방지)
+                            def _cancel_sell_orders(stock_code=code):
+                                try:
+                                    cancelled = self.kiwoom.cancel_sell_orders_for_stock(self.account, stock_code)
+                                    if cancelled > 0:
+                                        self.log(f"[{stock_code}] 기존 매도 주문 {cancelled}건 취소", "INFO")
+                                except Exception as e:
+                                    self.log(f"[{stock_code}] 기존 매도 주문 취소 오류: {e}", "ERROR")
+
+                            QTimer.singleShot(0, _cancel_sell_orders)
 
                             # placed_sell_orders 초기화 (체결 완료된 것만 유지)
                             sold_targets = position.get("sold_targets", [])
@@ -1304,8 +1367,10 @@ class AutoTrader:
                         log_type = "초기" if not is_additional_buy else "갱신"
                         self.log(f"[{code}] {log_type} 수량 설정: {quantity}주", "INFO")
 
-                        # ✅ 매수 체결 후 매도 주문 설정 (새 수량 기준)
-                        self._schedule_sell_orders_after_buy(code, position)
+                        # ✅ 매수 체결 후 매도 주문 설정 (새 수량 기준) - 지연 실행
+                        # position은 dict이므로 copy하여 전달
+                        pos_copy = dict(position)
+                        QTimer.singleShot(0, partial(self._schedule_sell_orders_after_buy, code, pos_copy))
 
                     # ✅ 매도로 인한 수량 감소 시
                     elif quantity < old_quantity:
@@ -1322,7 +1387,10 @@ class AutoTrader:
                             # 수동매도: 남은 수량 기준으로 재계산/재발주
                             if quantity > 0:
                                 self.log(f"[{code}] 수동매도 체결 - 자동매도 주문 재계산 필요 (남은 {quantity}주)", "INFO")
-                                self._recalculate_sell_orders_on_quantity_decrease(code, position)
+                                # ✅ 동기 TR 포함 함수 지연 실행 (콜백 내 QEventLoop 중첩 방지)
+                                # position은 dict이므로 copy하여 전달 (이후 변경 가능성 대비)
+                                pos_copy = dict(position)
+                                QTimer.singleShot(0, partial(self._recalculate_sell_orders_on_quantity_decrease, code, pos_copy))
                             # 남은 수량 0이면 아래 if quantity == 0에서 정리
 
                     self.config.update_position(code, position)
@@ -1340,7 +1408,8 @@ class AutoTrader:
                         self.config.update_position(code, position)
                         self.log(f"[{code}] 전량 매도 완료 - 자동매도 재계산 스킵", "SUCCESS")
 
-                self._check_and_cancel_excess_orders()
+                # ✅ 동기 TR 호출을 지연 실행 (콜백 내 QEventLoop 중첩 방지)
+                QTimer.singleShot(0, self._check_and_cancel_excess_orders)
 
         except Exception as e:
             self.log(f"체결 처리 중 오류: {e}", "ERROR")
@@ -1933,12 +2002,13 @@ class AutoTrader:
                         self.config.remove_pending_order(code, order_type="buy", price=price)
                         continue
 
-                    result = self.kiwoom.buy_stock(self.account, code, quantity, price)
-                    if result == 0:
-                        self.log(f"[{code}] {buy_count}차 매수 주문 복원: {quantity}주 @ {price:,}원", "SUCCESS")
-                        restored_count += 1
-                    else:
-                        self.log(f"[{code}] 매수 주문 복원 실패: 에러코드 {result}", "ERROR")
+                    # 큐 기반 매수 복원 (에러코드 -308 방지)
+                    restore_info = {"code": code, "buy_count": buy_count, "quantity": quantity, "price": price}
+                    self.kiwoom.buy_stock_queued(
+                        self.account, code, quantity, price,
+                        callback=lambda result, _, info=restore_info: self._on_buy_restore_result(result, info)
+                    )
+                    restored_count += 1  # 요청 카운트
 
                 elif order_type == "sell":
                     # 보유 수량 없으면 매도 복원 X
@@ -1953,12 +2023,13 @@ class AutoTrader:
                         self.log(f"[{code}] 매도 수량 조정: {quantity} -> {holding_qty}", "INFO")
                         quantity = holding_qty
 
-                    result = self.kiwoom.sell_stock(self.account, code, quantity, price)
-                    if result == 0:
-                        self.log(f"[{code}] {target_name} 매도 주문 복원: {quantity}주 @ {price:,}원", "SUCCESS")
-                        restored_count += 1
-                    else:
-                        self.log(f"[{code}] 매도 주문 복원 실패: 에러코드 {result}", "ERROR")
+                    # 큐 기반 매도 복원 (에러코드 -308 방지)
+                    restore_info = {"code": code, "target_name": target_name, "quantity": quantity, "price": price}
+                    self.kiwoom.sell_stock_queued(
+                        self.account, code, quantity, price,
+                        callback=lambda result, _, info=restore_info: self._on_sell_restore_result(result, info)
+                    )
+                    restored_count += 1  # 요청 카운트
 
         # 복원 후 스탑로스 유지 주문 강제 점검
         self.ensure_all_stoploss_orders()

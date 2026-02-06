@@ -1,6 +1,6 @@
 {
   "kiwoom": {
-    "account_number": "6544375410",
+    "account_number": "8118849611",
     "account_password": "",
     "use_mock_trading": false
   },
@@ -11,7 +11,7 @@
     "max_buy_count": 3,
     "additional_buy_drop_percent": 10,
     "buy_amount_per_stock": 1000000,
-    "max_holding_stocks": 3,
+    "max_holding_stocks": 10,
     "allow_reentry": true,
     "max_reentry_per_day": 1
   },
@@ -53,6 +53,42 @@
     {
       "code": "007460",
       "name": "에이프로젠"
+    },
+    {
+      "code": "000660",
+      "name": "SK하이닉스"
+    },
+    {
+      "code": "005930",
+      "name": "삼성전자"
+    },
+    {
+      "code": "036630",
+      "name": "세종텔레콤"
+    },
+    {
+      "code": "316140",
+      "name": "우리금융지주"
+    },
+    {
+      "code": "055550",
+      "name": "신한지주"
+    },
+    {
+      "code": "004410",
+      "name": "서울식품"
+    },
+    {
+      "code": "000910",
+      "name": "유니온"
+    },
+    {
+      "code": "001510",
+      "name": "SK증권"
+    },
+    {
+      "code": "001450",
+      "name": "현대해상"
     }
   ],
   "max_watchlist_count": 200,
@@ -60,23 +96,276 @@
     "007460": {
       "code": "007460",
       "name": "에이프로젠",
-      "quantity": 1,
+      "quantity": 0,
       "avg_price": 777,
       "buy_count": 1,
       "last_buy_price": 777,
+      "sold_targets": [],
+      "sell_occurred": true,
+      "initial_quantity": 1,
+      "stoploss_triggered": false,
+      "stoploss_price": 0,
+      "last_update": "2026-02-03 06:42:34"
+    },
+    "000660": {
+      "code": "000660",
+      "name": "SK하이닉스",
+      "quantity": 13,
+      "avg_price": 828180,
+      "buy_count": 1,
+      "last_buy_price": 846175,
+      "sold_targets": [],
+      "sell_occurred": true,
+      "initial_quantity": 16,
+      "stoploss_triggered": false,
+      "stoploss_price": 0,
+      "last_update": "2026-02-06 14:24:50",
+      "last_executed_price": 824304,
+      "last_executed_qty": 23
+    },
+    "005930": {
+      "code": "005930",
+      "name": "삼성전자",
+      "quantity": 32,
+      "avg_price": 155751,
+      "buy_count": 1,
+      "last_buy_price": 153500,
+      "sold_targets": [],
+      "sell_occurred": true,
+      "initial_quantity": 32,
+      "stoploss_triggered": false,
+      "stoploss_price": 0,
+      "last_update": "2026-02-06 14:02:52",
+      "last_executed_price": 156036,
+      "last_executed_qty": 76
+    },
+    "090710": {
+      "code": "090710",
+      "name": "휴림로봇",
+      "quantity": 1,
+      "avg_price": 14490,
+      "buy_count": 1,
+      "last_buy_price": 14490,
       "sold_targets": [],
       "sell_occurred": false,
       "initial_quantity": 1,
       "stoploss_triggered": false,
       "stoploss_price": 0,
-      "last_update": "2026-02-03 06:42:34"
+      "last_update": "2026-02-06 13:55:10"
+    },
+    "097950": {
+      "code": "097950",
+      "name": "CJ제일제당",
+      "quantity": 2,
+      "avg_price": 210500,
+      "buy_count": 1,
+      "last_buy_price": 210500,
+      "sold_targets": [],
+      "sell_occurred": false,
+      "initial_quantity": 2,
+      "stoploss_triggered": false,
+      "stoploss_price": 0,
+      "last_update": "2026-02-06 13:56:07"
+    },
+    "128940": {
+      "code": "128940",
+      "name": "한미약품",
+      "quantity": 5,
+      "avg_price": 546400,
+      "buy_count": 1,
+      "last_buy_price": 546500,
+      "sold_targets": [],
+      "sell_occurred": false,
+      "initial_quantity": 5,
+      "stoploss_triggered": false,
+      "stoploss_price": 0,
+      "last_update": "2026-02-06 14:12:59",
+      "last_executed_price": 546332,
+      "last_executed_qty": 12
+    },
+    "055550": {
+      "code": "055550",
+      "name": "신한지주",
+      "quantity": 8,
+      "avg_price": 92162,
+      "buy_count": 1,
+      "last_buy_price": 92162,
+      "sold_targets": [],
+      "sell_occurred": false,
+      "initial_quantity": 8,
+      "stoploss_triggered": false,
+      "stoploss_price": 0,
+      "last_update": "2026-02-06 14:26:41"
+    },
+    "017670": {
+      "code": "017670",
+      "name": "SK텔레콤",
+      "quantity": 2,
+      "avg_price": 68400,
+      "buy_count": 1,
+      "last_buy_price": 68400,
+      "sold_targets": [],
+      "sell_occurred": true,
+      "initial_quantity": 3,
+      "stoploss_triggered": false,
+      "stoploss_price": 0,
+      "last_update": "2026-02-06 14:29:30"
     }
   },
-  "pending_orders": {},
+  "pending_orders": {
+    "090710": [
+      {
+        "order_type": "sell",
+        "quantity": 1,
+        "price": 14950,
+        "target_name": "익절1",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 13:55:10"
+      }
+    ],
+    "097950": [
+      {
+        "order_type": "sell",
+        "quantity": 1,
+        "price": 217000,
+        "target_name": "익절1",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 13:56:07"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 1,
+        "price": 221000,
+        "target_name": "익절2",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 13:56:07"
+      }
+    ],
+    "005930": [
+      {
+        "order_type": "sell",
+        "quantity": 7,
+        "price": 160500,
+        "target_name": "익절1",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:02:52"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 7,
+        "price": 163500,
+        "target_name": "익절2",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:02:52"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 7,
+        "price": 167000,
+        "target_name": "익절3",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:02:52"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 5,
+        "price": 153000,
+        "target_name": "20일선",
+        "sell_ratio": 10,
+        "created_at": "2026-02-06 14:02:52"
+      }
+    ],
+    "128940": [
+      {
+        "order_type": "sell",
+        "quantity": 1,
+        "price": 563000,
+        "target_name": "익절1",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:12:59"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 1,
+        "price": 574000,
+        "target_name": "익절2",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:12:59"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 1,
+        "price": 585000,
+        "target_name": "익절3",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:12:59"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 2,
+        "price": 474000,
+        "target_name": "20일선",
+        "sell_ratio": 10,
+        "created_at": "2026-02-06 14:12:59"
+      }
+    ],
+    "000660": [
+      {
+        "order_type": "sell",
+        "quantity": 3,
+        "price": 853000,
+        "target_name": "익절1",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:24:50"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 3,
+        "price": 870000,
+        "target_name": "익절2",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:24:50"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 3,
+        "price": 886000,
+        "target_name": "익절3",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:24:50"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 4,
+        "price": 798000,
+        "target_name": "20일선",
+        "sell_ratio": 10,
+        "created_at": "2026-02-06 14:24:50"
+      }
+    ],
+    "017670": [
+      {
+        "order_type": "sell",
+        "quantity": 1,
+        "price": 70500,
+        "target_name": "익절1",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:29:29"
+      },
+      {
+        "order_type": "sell",
+        "quantity": 1,
+        "price": 71800,
+        "target_name": "익절2",
+        "sell_ratio": 30,
+        "created_at": "2026-02-06 14:29:29"
+      }
+    ]
+  },
   "session": {
-    "last_trading_date": "20260203",
+    "last_trading_date": "20260206",
     "auto_trading_enabled": false,
-    "orders_restored": false,
+    "orders_restored": true,
     "state_synced": true
   },
   "error_handling": {
@@ -86,13 +375,308 @@
   },
   "reentry_history": {},
   "execution_history": {
-    "20260129": {
-      "007460": [
+    "20260206": {
+      "005930": [
+        {
+          "type": "sell",
+          "quantity": 2,
+          "price": 154300,
+          "time": "104933",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 2,
+          "price": 157100,
+          "time": "110725",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 1,
+          "price": 158450,
+          "time": "112824",
+          "order_no": ""
+        },
         {
           "type": "buy",
           "quantity": 1,
-          "price": 777,
-          "time": "144612",
+          "price": 157700,
+          "time": "131532",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 1,
+          "price": 157600,
+          "time": "132939",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 1,
+          "price": 156000,
+          "time": "134519",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 2,
+          "price": 155950,
+          "time": "134600",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 8,
+          "price": 155988,
+          "time": "134632",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 9,
+          "price": 155989,
+          "time": "134704",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 11,
+          "price": 155991,
+          "time": "134736",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 1,
+          "price": 156400,
+          "time": "135002",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 3,
+          "price": 156333,
+          "time": "135002",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 1,
+          "price": 156400,
+          "time": "135020",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 2,
+          "price": 156400,
+          "time": "135052",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 3,
+          "price": 156400,
+          "time": "135124",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 3,
+          "price": 155600,
+          "time": "135514",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 1,
+          "price": 155600,
+          "time": "135541",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 2,
+          "price": 155600,
+          "time": "135542",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 3,
+          "price": 155600,
+          "time": "135542",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 3,
+          "price": 155600,
+          "time": "135544",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 8,
+          "price": 156000,
+          "time": "140252",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 10,
+          "price": 156000,
+          "time": "140252",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 14,
+          "price": 156000,
+          "time": "140252",
+          "order_no": ""
+        }
+      ],
+      "000660": [
+        {
+          "type": "sell",
+          "quantity": 3,
+          "price": 826000,
+          "time": "135517",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 2,
+          "price": 824000,
+          "time": "135711",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 3,
+          "price": 824000,
+          "time": "135711",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 4,
+          "price": 824000,
+          "time": "135711",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 7,
+          "price": 824000,
+          "time": "135711",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 1,
+          "price": 825000,
+          "time": "135714",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 7,
+          "price": 825000,
+          "time": "135825",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 1,
+          "price": 829000,
+          "time": "140602",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 1,
+          "price": 828000,
+          "time": "140614",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 1,
+          "price": 827500,
+          "time": "142450",
+          "order_no": ""
+        }
+      ],
+      "128940": [
+        {
+          "type": "buy",
+          "quantity": 1,
+          "price": 547000,
+          "time": "141233",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 2,
+          "price": 546500,
+          "time": "141233",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 3,
+          "price": 546333,
+          "time": "141235",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 4,
+          "price": 546250,
+          "time": "141235",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 5,
+          "price": 546400,
+          "time": "141235",
+          "order_no": ""
+        }
+      ],
+      "055550": [
+        {
+          "type": "buy",
+          "quantity": 3,
+          "price": 92100,
+          "time": "142640",
+          "order_no": ""
+        },
+        {
+          "type": "buy",
+          "quantity": 8,
+          "price": 92163,
+          "time": "142640",
+          "order_no": ""
+        }
+      ],
+      "017670": [
+        {
+          "type": "buy",
+          "quantity": 3,
+          "price": 68400,
+          "time": "142917",
+          "order_no": ""
+        },
+        {
+          "type": "sell",
+          "quantity": 1,
+          "price": 68500,
+          "time": "142929",
           "order_no": ""
         }
       ]
