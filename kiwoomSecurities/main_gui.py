@@ -804,9 +804,9 @@ class MainWindow(QMainWindow):
         if self._is_stopping or not self.trader or not self.trader.is_running:
             return
 
-        # ✅ 장이 열렸을 때만 복원 실행 (장 전이면 장 열림 타이머가 처리)
-        if not self.trader.is_market_open():
-            self.log("[시스템] 장 시간이 아니어서 주문 복원 대기 - 장 열림 시 자동 복원됨")
+        # ✅ 거래 가능 시간에만 복원 실행 (정규장 또는 NXT 프리/애프터)
+        if not self.trader.is_any_trading_time():
+            self.log("[시스템] 거래 가능 시간이 아니어서 주문 복원 대기 - 장 열림 시 자동 복원됨")
             return
 
         try:
@@ -836,12 +836,8 @@ class MainWindow(QMainWindow):
         if not self.trader or not self.trader.is_running:
             return
 
-        # 정규장 시간 체크 (09:00 ~ 15:30)
-        current_time = now.time()
-        market_open = dt_time(9, 0)
-        market_close = dt_time(15, 30)
-
-        if not (market_open <= current_time <= market_close):
+        # 거래 가능 시간(정규장 또는 NXT 프리/애프터) 체크
+        if not self.trader.is_any_trading_time():
             return
 
         # ✅ TR 재진입 방지: TR 또는 TR 큐 처리 중이면 스킵
@@ -867,7 +863,8 @@ class MainWindow(QMainWindow):
                 return
 
         # 주문 복원 실행
-        self.log("[시스템] 정규장 시간 - 주문 복원 자동 실행")
+        market_type = self.trader.get_current_market_type()
+        self.log(f"[시스템] 거래 가능 시간({market_type}) - 주문 복원 자동 실행")
         try:
             self.trader.check_and_restore_orders()
             self._orders_restored_today = True

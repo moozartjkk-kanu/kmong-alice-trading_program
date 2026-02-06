@@ -5,10 +5,97 @@
 import sys
 import time
 from collections import deque
+from datetime import datetime, time as dt_time
 from threading import Lock
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QObject, pyqtSignal, QTimer
 from PyQt5.QtWidgets import QApplication
+
+
+# ==================== NXT 시간대 상수 ====================
+NXT_PREMARKET_START = dt_time(8, 0, 0)    # 프리마켓 시작
+NXT_PREMARKET_END = dt_time(8, 50, 0)     # 프리마켓 종료
+NXT_AFTERMARKET_START = dt_time(15, 40, 0)  # 애프터마켓 시작
+NXT_AFTERMARKET_END = dt_time(20, 0, 0)    # 애프터마켓 종료
+REGULAR_MARKET_START = dt_time(9, 0, 0)   # 정규장 시작
+REGULAR_MARKET_END = dt_time(15, 30, 0)   # 정규장 종료
+
+
+# ==================== NXT 시간대 판단 함수 ====================
+def is_premarket():
+    """프리마켓 시간인지 확인 (08:00 ~ 08:50)"""
+    now = datetime.now().time()
+    return NXT_PREMARKET_START <= now <= NXT_PREMARKET_END
+
+
+def is_aftermarket():
+    """애프터마켓 시간인지 확인 (15:40 ~ 20:00)"""
+    now = datetime.now().time()
+    return NXT_AFTERMARKET_START <= now <= NXT_AFTERMARKET_END
+
+
+def is_extended_hours():
+    """장시간외(프리마켓 또는 애프터마켓)인지 확인"""
+    return is_premarket() or is_aftermarket()
+
+
+def is_regular_market():
+    """정규장 시간인지 확인 (09:00 ~ 15:30)"""
+    now = datetime.now().time()
+    return REGULAR_MARKET_START <= now <= REGULAR_MARKET_END
+
+
+def get_market_type():
+    """
+    현재 시장 타입 반환
+
+    Returns:
+        "NXT_PREMARKET" | "REGULAR" | "NXT_AFTERMARKET" | "CLOSED"
+    """
+    if is_premarket():
+        return "NXT_PREMARKET"
+    elif is_regular_market():
+        return "REGULAR"
+    elif is_aftermarket():
+        return "NXT_AFTERMARKET"
+    else:
+        return "CLOSED"
+
+
+# ==================== NXT 코드 변환 함수 ====================
+def to_nxt_code(code: str) -> str:
+    """
+    KRX 종목코드를 NXT 종목코드로 변환
+
+    Args:
+        code: KRX 종목코드 (예: "039490")
+
+    Returns:
+        NXT 종목코드 (예: "039490_NX")
+    """
+    if code.endswith("_NX"):
+        return code  # 이미 NXT 코드
+    return f"{code}_NX"
+
+
+def from_nxt_code(nxt_code: str) -> str:
+    """
+    NXT 종목코드를 KRX 종목코드로 변환
+
+    Args:
+        nxt_code: NXT 종목코드 (예: "039490_NX")
+
+    Returns:
+        KRX 종목코드 (예: "039490")
+    """
+    if nxt_code.endswith("_NX"):
+        return nxt_code[:-3]
+    return nxt_code
+
+
+def is_nxt_code(code: str) -> bool:
+    """NXT 종목코드인지 확인"""
+    return code.endswith("_NX")
 
 
 class AccountSignalEmitter(QObject):
@@ -1016,6 +1103,11 @@ class KiwoomAPI:
         order_type: 1=신규매수, 2=신규매도, 3=매수취소, 4=매도취소, 5=매수정정, 6=매도정정
         hoga: 00=지정가, 03=시장가
         """
+        self._debug(
+            f"[SendOrder] rqname={rqname} screen_no={screen_no} account={account} "
+            f"order_type={order_type} code={code} quantity={quantity} price={price} "
+            f"hoga={hoga} org_order_no={org_order_no}"
+        )
         result = self.ocx.dynamicCall(
             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
             [rqname, screen_no, account, order_type, code, quantity, price, hoga, org_order_no]
@@ -1037,6 +1129,43 @@ class KiwoomAPI:
         """
         hoga = "03" if price == 0 else "00"
         return self.send_order("매도주문", "0202", account, 2, code, quantity, price, hoga)
+
+    # ==================== NXT 주문 (장시간외) ====================
+    def buy_stock_nxt(self, account, code, quantity, price=0):
+        """
+        NXT 매수 주문 (장시간외 전용)
+
+        Args:
+            account: 계좌번호
+            code: KRX 종목코드 (자동으로 NXT 코드로 변환됨)
+            quantity: 수량
+            price: 가격 (0이면 시장가)
+
+        Returns:
+            주문 결과 코드 (0=성공)
+        """
+        # SendOrder는 KRX 코드 형식을 요구하므로 _NX 변환 금지
+        nxt_code = code
+        hoga = "03" if price == 0 else "00"
+        return self.send_order("NXT매수주문", "0211", account, 1, nxt_code, quantity, price, hoga)
+
+    def sell_stock_nxt(self, account, code, quantity, price=0):
+        """
+        NXT 매도 주문 (장시간외 전용)
+
+        Args:
+            account: 계좌번호
+            code: KRX 종목코드 (자동으로 NXT 코드로 변환됨)
+            quantity: 수량
+            price: 가격 (0이면 시장가)
+
+        Returns:
+            주문 결과 코드 (0=성공)
+        """
+        # SendOrder는 KRX 코드 형식을 요구하므로 _NX 변환 금지
+        nxt_code = code
+        hoga = "03" if price == 0 else "00"
+        return self.send_order("NXT매도주문", "0212", account, 2, nxt_code, quantity, price, hoga)
 
     # ==================== 큐 기반 주문 (에러코드 -308 방지) ====================
     def send_order_queued(self, rqname, screen_no, account, order_type, code, quantity, price, hoga, callback=None, org_order_no=""):
@@ -1074,6 +1203,47 @@ class KiwoomAPI:
             self.send_order,
             callback,
             "매도주문", "0202", account, 2, code, quantity, price, hoga, ""
+        )
+
+    # ==================== NXT 큐 기반 주문 ====================
+    def buy_stock_nxt_queued(self, account, code, quantity, price=0, callback=None):
+        """
+        NXT 매수 주문 (큐 기반, 장시간외 전용)
+
+        Args:
+            account: 계좌번호
+            code: KRX 종목코드 (자동으로 NXT 코드로 변환됨)
+            quantity: 수량
+            price: 가격 (0이면 시장가)
+            callback: 결과 콜백 함수
+        """
+        # SendOrder는 KRX 코드 형식을 요구하므로 _NX 변환 금지
+        nxt_code = code
+        hoga = "03" if price == 0 else "00"
+        self.order_queue.enqueue(
+            self.send_order,
+            callback,
+            "NXT매수주문", "0211", account, 1, nxt_code, quantity, price, hoga, ""
+        )
+
+    def sell_stock_nxt_queued(self, account, code, quantity, price=0, callback=None):
+        """
+        NXT 매도 주문 (큐 기반, 장시간외 전용)
+
+        Args:
+            account: 계좌번호
+            code: KRX 종목코드 (자동으로 NXT 코드로 변환됨)
+            quantity: 수량
+            price: 가격 (0이면 시장가)
+            callback: 결과 콜백 함수
+        """
+        # SendOrder는 KRX 코드 형식을 요구하므로 _NX 변환 금지
+        nxt_code = code
+        hoga = "03" if price == 0 else "00"
+        self.order_queue.enqueue(
+            self.send_order,
+            callback,
+            "NXT매도주문", "0212", account, 2, nxt_code, quantity, price, hoga, ""
         )
 
     def cancel_order(self, account, code, order_no, quantity):
@@ -1358,15 +1528,30 @@ class KiwoomAPI:
             executed_quantity = int(self.get_chejan_data(911) or 0)  # 체결수량
             executed_price = int(self.get_chejan_data(910) or 0)  # 체결가격
             order_type = self.get_chejan_data(905)  # 주문구분 (+매수, -매도)
+            order_no = self.get_chejan_data(9203).strip()  # 주문번호
+            remaining_quantity = int(self.get_chejan_data(902) or 0)  # 미체결수량
+            order_price = int(self.get_chejan_data(901) or 0)  # 주문가격
+
+            if self.debug:
+                self._debug(
+                    "[Chejan:Order] "
+                    f"code={code} order_no={order_no} status={order_status} "
+                    f"type={order_type} order_qty={order_quantity} "
+                    f"filled_qty={executed_quantity} remaining_qty={remaining_quantity} "
+                    f"order_price={order_price} exec_price={executed_price}"
+                )
 
             if self.on_chejan_callback:
                 self.on_chejan_callback({
                     "type": "order",
                     "code": code,
+                    "order_no": order_no,
                     "status": order_status,
                     "order_quantity": order_quantity,
                     "executed_quantity": executed_quantity,
                     "executed_price": executed_price,
+                    "remaining_quantity": remaining_quantity,
+                    "order_price": order_price,
                     "order_type": order_type
                 })
 

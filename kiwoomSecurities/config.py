@@ -63,13 +63,24 @@ DEFAULT_CONFIG = {
         "auto_trading_enabled": False,  # 자동매매 활성화 상태
         "orders_restored": False,  # 주문 복원 완료 여부
         "state_synced": False,  # 체결내역 기반 상태 동기화 완료 여부
+        "last_krx_convert_date": "",  # 마지막 NXT→KRX 전환 날짜 (YYYYMMDD)
     },
 
     # 에러 처리 설정
     "error_handling": {
-        "order_retry_count": 3,  # 주문 실패 시 재시도 횟수
+        "order_retry_count": 3,  # 주문 실패 시 재시도 횟수 (KRX만 적용, NXT는 1회)
         "order_retry_interval_ms": 1000,  # 재시도 간격 (밀리초)
         "reconnect_interval_sec": 10,  # API 연결 끊김 시 재연결 간격 (초)
+    },
+
+    # NXT 거래소 설정 (장시간외)
+    "nxt": {
+        "enabled": True,  # NXT 거래 활성화 여부
+        "premarket_start": "08:00",  # 프리마켓 시작
+        "premarket_end": "08:50",  # 프리마켓 종료
+        "aftermarket_start": "15:40",  # 애프터마켓 시작
+        "aftermarket_end": "20:00",  # 애프터마켓 종료
+        "no_retry_on_failure": True,  # NXT 주문 실패 시 재시도 금지
     },
 
     # 재진입 기록 (당일 재진입 횟수 추적)
