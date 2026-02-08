@@ -1504,12 +1504,15 @@ class KiwoomAPI:
             price = abs(int(self.get_comm_real_data(code, 10)))  # 현재가
             volume = int(self.get_comm_real_data(code, 15))  # 거래량
 
+            # NXT 코드(_NX) → base code 변환 (하위 시스템은 KRX 코드 기준으로 동작)
+            base_code = from_nxt_code(code) if is_nxt_code(code) else code
+
             # 이벤트 엔진으로 전달 (디바운스 적용됨)
             if self.event_engine:
-                self.event_engine.push_event("price", code, {"price": price, "volume": volume})
+                self.event_engine.push_event("price", base_code, {"price": price, "volume": volume})
 
             if self.on_real_data_callback:
-                self.on_real_data_callback(code, price, volume)
+                self.on_real_data_callback(base_code, price, volume)
 
     def get_comm_real_data(self, code, fid):
         """실시간 데이터 가져오기"""

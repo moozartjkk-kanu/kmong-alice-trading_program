@@ -9,6 +9,8 @@ from collections import defaultdict
 from datetime import datetime
 from PyQt5.QtCore import QTimer, QObject, pyqtSignal
 
+from kiwoom_api import is_extended_hours, to_nxt_code, is_nxt_code
+
 
 class Debouncer:
     """디바운스 처리 클래스 - 동일 종목의 연속 이벤트 병합"""
@@ -244,6 +246,9 @@ class EventEngine(QObject):
     BATCH_INTERVAL_MS = 3000  # 배치 간격 (3초)
     STOCK_INTERVAL_MS = 350   # 종목 간 간격 (350ms)
 
+    # NXT 실시간 전용 화면번호
+    NXT_SCREEN_NO = "1002"
+
     def __init__(self, kiwoom_api, config, log_callback=None):
         """
         Args:
@@ -284,6 +289,9 @@ class EventEngine(QObject):
 
         self.batch_index = 0  # 현재 배치 내 처리 중인 인덱스
         self.current_batch = []  # 현재 배치 종목 리스트
+
+        # NXT 실시간 등록 상태
+        self._nxt_realtime_active = False
 
         # 콜백
         self.on_price_update = None  # (code, price) 콜백
@@ -347,6 +355,9 @@ class EventEngine(QObject):
         if self.kiwoom:
             for screen_no in self.realtime_manager.get_screen_numbers():
                 self.kiwoom.set_real_remove(screen_no, "ALL")
+            # NXT 실시간 화면도 해제
+            self.kiwoom.set_real_remove(self.NXT_SCREEN_NO, "ALL")
+            self._nxt_realtime_active = False
             self.kiwoom.set_event_engine(None)
 
         self.log("이벤트 엔진 중지")
@@ -358,6 +369,7 @@ class EventEngine(QObject):
         키움 OpenAPI+ 규칙:
         - 한 화면번호당 최대 100종목
         - 200종목은 화면번호 2개로 분배 (1000, 1001)
+        - NXT 시간대에는 NXT 코드(_NX)를 별도 화면(1002)에 추가 등록
         """
         result = self.realtime_manager.calculate_registrations(watchlist_codes)
         screen_registrations = result["screen_registrations"]
@@ -390,6 +402,68 @@ class EventEngine(QObject):
         unregistered = self.realtime_manager.get_unregistered_stocks(watchlist_codes)
         if unregistered:
             self.log(f"순환 조회 대상: {len(unregistered)}종목 (200종목 초과분)")
+
+        # NXT 시간대이면 NXT 코드 추가 등록
+        if is_extended_hours():
+            self._setup_nxt_realtime(watchlist_codes)
+        else:
+            self._remove_nxt_realtime()
+
+    def _setup_nxt_realtime(self, watchlist_codes):
+        """
+        NXT 실시간 등록 (NXT 전용 화면번호 1002 사용)
+
+        NXT 시간대(프리마켓/애프터마켓)에 _NX 접미사 코드로 실시간 등록하여
+        NXT 시세를 수신. NXT 데이터를 받지 못하는 종목은 KRX 시세 그대로 유지.
+        """
+        if not self.kiwoom or not watchlist_codes:
+            return
+
+        # 기존 NXT 등록 해제 후 재등록
+        self.kiwoom.set_real_remove(self.NXT_SCREEN_NO, "ALL")
+
+        # KRX 코드 → NXT 코드 변환
+        nxt_codes = [to_nxt_code(code) for code in watchlist_codes if not is_nxt_code(code)]
+        if not nxt_codes:
+            return
+
+        # 최대 100종목 제한 (화면번호 1개)
+        nxt_codes = nxt_codes[:100]
+        codes_str = ";".join(nxt_codes)
+        self.kiwoom.set_real_reg(self.NXT_SCREEN_NO, codes_str, "10;15;20", "0")
+
+        self._nxt_realtime_active = True
+        self.log(f"NXT 실시간 등록: {len(nxt_codes)}종목 (화면 {self.NXT_SCREEN_NO})")
+
+    def _remove_nxt_realtime(self):
+        """NXT 실시간 등록 해제"""
+        if not self._nxt_realtime_active:
+            return
+
+        if self.kiwoom:
+            self.kiwoom.set_real_remove(self.NXT_SCREEN_NO, "ALL")
+
+        self._nxt_realtime_active = False
+        self.log("NXT 실시간 등록 해제")
+
+    def refresh_realtime(self, watchlist_codes, priority_codes=None):
+        """
+        실시간 등록 갱신 (시장 전환 시 호출)
+
+        NXT 시간대 진입 시 NXT 코드 등록, 종료 시 해제.
+        KRX 등록은 유지.
+        """
+        if not self.is_running or not self.kiwoom:
+            return
+
+        if priority_codes:
+            self.realtime_manager.set_priority_stocks(priority_codes)
+
+        if is_extended_hours():
+            if not self._nxt_realtime_active:
+                self._setup_nxt_realtime(watchlist_codes)
+        else:
+            self._remove_nxt_realtime()
 
     def push_event(self, event_type, code, data):
         """

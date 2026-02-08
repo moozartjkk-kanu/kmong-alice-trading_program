@@ -231,7 +231,7 @@ class AutoTrader:
         return get_market_type()
 
     def _check_market_transition(self):
-        """시장 시간 전환 감지 -> 주문 복원 재실행"""
+        """시장 시간 전환 감지 -> 주문 복원 재실행 + NXT 실시간 등록 갱신"""
         try:
             current_type = self.get_current_market_type()
             if self._last_market_type is None:
@@ -241,6 +241,17 @@ class AutoTrader:
             if current_type != self._last_market_type:
                 self.log(f"시장 전환 감지: {self._last_market_type} -> {current_type}", "INFO")
                 self._last_market_type = current_type
+
+                # NXT 실시간 등록 갱신 (NXT 진입 시 등록, 종료 시 해제)
+                if self.event_engine:
+                    try:
+                        watchlist = self.config.get_watchlist()
+                        watchlist_codes = [item["code"] for item in watchlist] if watchlist else []
+                        positions = self.config.get("positions") or {}
+                        priority_codes = [c for c, p in positions.items() if p.get("quantity", 0) > 0]
+                        self.event_engine.refresh_realtime(watchlist_codes, priority_codes)
+                    except Exception as e:
+                        self.log(f"NXT 실시간 등록 갱신 오류: {e}", "ERROR")
 
                 if current_type in ("REGULAR", "NXT_PREMARKET", "NXT_AFTERMARKET"):
                     # 전환 시 복원 재실행하도록 플래그 초기화
