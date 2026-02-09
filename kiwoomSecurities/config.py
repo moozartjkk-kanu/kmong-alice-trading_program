@@ -183,7 +183,7 @@ class Config:
 
     def add_to_watchlist(self, stock_code, stock_name=""):
         watchlist = self.get_watchlist()
-        max_count = self.get("max_watchlist_count") or 200
+        max_count = min(self.get("max_watchlist_count") or 200, 200)
 
         # 최대 개수 체크
         if len(watchlist) >= max_count:

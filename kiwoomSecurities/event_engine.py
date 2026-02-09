@@ -73,7 +73,7 @@ class BatchScheduler:
 
         # 캐시된 봉데이터 {code: {"candles": [...], "updated_at": timestamp}}
         self.candle_cache = {}
-        self.cache_ttl = 60  # 캐시 유효 시간 (초)
+        self.cache_ttl = 300  # 캐시 유효 시간 (5분) - TR 호출 최소화
 
     def set_stocks(self, stock_codes):
         """관리할 종목 설정"""
@@ -243,8 +243,8 @@ class EventEngine(QObject):
     """
 
     # 배치 처리 타이밍 상수
-    BATCH_INTERVAL_MS = 3000  # 배치 간격 (3초)
-    STOCK_INTERVAL_MS = 350   # 종목 간 간격 (350ms)
+    BATCH_INTERVAL_MS = 5000  # 배치 간격 (5초)
+    STOCK_INTERVAL_MS = 1000  # 종목 간 간격 (1초) - TR 호출 제한 준수
 
     # NXT 실시간 전용 화면번호
     NXT_SCREEN_NO = "1002"
@@ -264,12 +264,12 @@ class EventEngine(QObject):
         # 이벤트 큐
         self.event_queue = Queue()
 
-        # 디바운서 (200ms)
-        self.debouncer = Debouncer(delay_ms=200)
+        # 디바운서 (10ms - 매수 신호 지연 최소화)
+        self.debouncer = Debouncer(delay_ms=10)
 
-        # 배치 스케줄러 (10종목씩, 60초 주기로 전체 갱신)
-        # 200종목 기준: 10종목/3초 = 200종목/60초
-        self.batch_scheduler = BatchScheduler(batch_size=10, interval_seconds=60)
+        # 배치 스케줄러 (5종목씩, 300초 주기로 전체 갱신)
+        # TR 호출 제한 준수: 5종목/5초 = 60종목/분 (키움 제한 이내)
+        self.batch_scheduler = BatchScheduler(batch_size=5, interval_seconds=300)
 
         # 실시간 관리자
         self.realtime_manager = RealTimeManager()
@@ -467,17 +467,27 @@ class EventEngine(QObject):
 
     def push_event(self, event_type, code, data):
         """
-        이벤트 큐에 추가 (디바운스 적용)
+        이벤트 처리 (디바운스 적용)
+
+        price 이벤트: 디바운스 후 직접 콜백 호출 (event_queue 바이패스로 지연 최소화)
+        trade/batch 이벤트: 기존대로 event_queue 경유
 
         Args:
             event_type: 이벤트 타입 ('price', 'trade', 'batch')
             code: 종목 코드
             data: 이벤트 데이터
         """
-        # 가격 이벤트는 디바운스 적용
         if event_type == "price":
+            # 디바운스 적용
             if not self.debouncer.should_process(code, data):
-                return  # 디바운스로 스킵
+                return
+            # 직접 콜백 호출 (event_queue/worker 스레드 홉 제거)
+            if self.on_price_update:
+                try:
+                    self.on_price_update(code, data.get("price", 0))
+                except Exception:
+                    pass
+            return
 
         self.event_queue.put({
             "type": event_type,
@@ -533,6 +543,10 @@ class EventEngine(QObject):
         if self.kiwoom.is_tr_busy():
             return
 
+        # ✅ TR 쿨다운 중이면 배치 스킵 (-209 에러 방지)
+        if self.kiwoom.is_tr_cooldown():
+            return
+
         # 다음 배치 종목 가져오기
         self.current_batch = self.batch_scheduler.get_next_batch()
         if not self.current_batch:
@@ -568,6 +582,11 @@ class EventEngine(QObject):
             self.stock_timer.start(self.STOCK_INTERVAL_MS)
             return
 
+        # ✅ TR 쿨다운 중이면 현재 배치 중단 (-209 에러 방지)
+        if self.kiwoom.is_tr_cooldown():
+            self.stock_timer.stop()
+            return
+
         code = self.current_batch[self.batch_index]
         self.batch_index += 1
 
@@ -586,13 +605,14 @@ class EventEngine(QObject):
         if self.batch_index < len(self.current_batch):
             self.stock_timer.start(self.STOCK_INTERVAL_MS)
 
-    def get_candles(self, code, force_refresh=False):
+    def get_candles(self, code, force_refresh=False, cache_only=False):
         """
         봉데이터 가져오기 (캐시 우선)
 
         Args:
             code: 종목 코드
             force_refresh: 강제 새로고침 여부
+            cache_only: True이면 캐시만 사용 (TR 호출 안 함, -209 방지)
 
         Returns:
             봉데이터 리스트
@@ -602,8 +622,16 @@ class EventEngine(QObject):
             if cached:
                 return cached
 
+        # 캐시 전용 모드: TR 호출 없이 캐시만 사용
+        if cache_only:
+            return None
+
         # ✅ TR 재진입 방지: busy이면 캐시 없음으로 반환
         if self.kiwoom.is_tr_busy():
+            return None
+
+        # ✅ TR 쿨다운 중이면 TR 호출 스킵
+        if self.kiwoom.is_tr_cooldown():
             return None
 
         # 캐시 없으면 직접 조회

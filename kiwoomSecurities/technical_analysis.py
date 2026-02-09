@@ -424,6 +424,26 @@ class TradingSignal:
         profit_rate = ((current_price - avg_price) / avg_price) * 100 if avg_price > 0 else 0
         profit_amount = (current_price - avg_price) * quantity
 
+        # 매도 목표가 리스트 계산 (UI 표시용)
+        sell_targets = []
+        if avg_price > 0:
+            # 실제 매도 로직과 동일한 기준(고정 익절 1~3 + MA)
+            target_rates = [2.95, 4.95, 6.95]
+            raw1 = avg_price * (1 + target_rates[0] / 100.0)
+            raw2 = avg_price * (1 + target_rates[1] / 100.0)
+            raw3 = avg_price * (1 + target_rates[2] / 100.0)
+            p1 = self._ceil_to_tick(raw1) or int(raw1)
+            p2 = self._ceil_to_tick(raw2) or int(raw2)
+            p3 = self._ceil_to_tick(raw3) or int(raw3)
+
+            sell_targets.append({"name": "익절1", "price": int(p1)})
+            sell_targets.append({"name": "익절2", "price": int(p2)})
+            sell_targets.append({"name": "익절3", "price": int(p3)})
+
+            if ma is not None:
+                ma_price = self._ceil_to_tick(ma) or int(ma)
+                sell_targets.append({"name": f"{period}일선", "price": int(ma_price)})
+
         return {
             "avg_price": int(avg_price) if avg_price else 0,
             "quantity": quantity,
@@ -435,6 +455,7 @@ class TradingSignal:
             "ma20": int(ma) if ma is not None else None,
             "trigger_price_ma_minus_percent": trigger_price,
             "envelope_lower": int(env_buy["lower"]) if env_buy.get("lower") is not None else None,
+            "sell_targets": sell_targets,
             "sold_targets": position.get("sold_targets", []) or []
         }
 

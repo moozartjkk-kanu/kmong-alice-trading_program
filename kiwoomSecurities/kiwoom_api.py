@@ -111,41 +111,54 @@ class AccountSignalEmitter(QObject):
 
 
 class RateLimiter:
-    """TR 호출 제한 관리 클래스 (초당 5회 제한)"""
+    """TR 호출 제한 관리 클래스 (초당 5회 + 분당 60회 제한)"""
 
-    def __init__(self, max_calls=5, period=1.0):
+    def __init__(self, max_calls=5, period=1.0, max_calls_per_min=60):
         """
         Args:
-            max_calls: 기간 내 최대 호출 횟수
-            period: 기간 (초)
+            max_calls: 초당 최대 호출 횟수
+            period: 초당 기간 (초)
+            max_calls_per_min: 분당 최대 호출 횟수
         """
         self.max_calls = max_calls
         self.period = period
-        self.calls = deque()
+        self.max_calls_per_min = max_calls_per_min
+        self.calls = deque()          # 초당 제한용
+        self.calls_minute = deque()   # 분당 제한용
         self.lock = Lock()
 
     def wait_if_needed(self):
-        """필요시 대기하여 호출 제한 준수"""
+        """필요시 대기하여 호출 제한 준수 (초당 + 분당)"""
         with self.lock:
             now = time.time()
 
-            # 기간이 지난 호출 기록 제거
+            # === 초당 제한 ===
             while self.calls and self.calls[0] < now - self.period:
                 self.calls.popleft()
 
-            # 제한에 도달했으면 대기
             if len(self.calls) >= self.max_calls:
-                sleep_time = self.calls[0] + self.period - now + 0.05  # 50ms 여유
+                sleep_time = self.calls[0] + self.period - now + 0.05
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-
-                # 다시 정리
                 now = time.time()
                 while self.calls and self.calls[0] < now - self.period:
                     self.calls.popleft()
 
+            # === 분당 제한 ===
+            while self.calls_minute and self.calls_minute[0] < now - 60.0:
+                self.calls_minute.popleft()
+
+            if len(self.calls_minute) >= self.max_calls_per_min:
+                sleep_time = self.calls_minute[0] + 60.0 - now + 0.1
+                if sleep_time > 0:
+                    time.sleep(min(sleep_time, 5.0))  # 최대 5초 대기
+                now = time.time()
+                while self.calls_minute and self.calls_minute[0] < now - 60.0:
+                    self.calls_minute.popleft()
+
             # 현재 호출 기록
             self.calls.append(time.time())
+            self.calls_minute.append(time.time())
 
 
 class OrderQueue:
@@ -153,15 +166,17 @@ class OrderQueue:
 
     def __init__(self, kiwoom_api):
         self.kiwoom = kiwoom_api
+        # 우선순위(긴급)와 일반 주문을 분리해 처리
+        self._high_queue = deque()  # (order_func, args, kwargs, callback)
         self._queue = deque()  # (order_func, args, kwargs, callback) 튜플
         self._is_processing = False
         self._process_timer = QTimer()
         self._process_timer.setSingleShot(True)
         self._process_timer.timeout.connect(self._process_next)
         # 주문 간 최소 간격 (키움 API 초당 주문 제한: 1초에 5건 미만 권장)
-        self._min_interval_ms = 300  # 300ms 간격 = 초당 약 3건
+        self._min_interval_ms = 200  # 200ms 간격 = 초당 5건
 
-    def enqueue(self, order_func, callback=None, *args, **kwargs):
+    def enqueue(self, order_func, callback=None, *args, priority=False, **kwargs):
         """
         주문 호출을 큐에 추가
 
@@ -170,8 +185,11 @@ class OrderQueue:
             callback: 결과를 받을 콜백 함수 (선택) - (result, args) 전달
             *args, **kwargs: 주문 함수에 전달할 인자
         """
-        self._queue.append((order_func, args, kwargs, callback))
-        self._debug(f"[주문큐] 추가됨: {order_func.__name__} (대기: {len(self._queue)}개)")
+        if priority:
+            self._high_queue.append((order_func, args, kwargs, callback))
+        else:
+            self._queue.append((order_func, args, kwargs, callback))
+        self._debug(f"[주문큐] 추가됨: {order_func.__name__} (긴급:{len(self._high_queue)} 일반:{len(self._queue)})")
 
         # 처리 중이 아니면 시작
         if not self._is_processing:
@@ -183,17 +201,20 @@ class OrderQueue:
             return
         self._is_processing = True
         # 즉시 시작하지 않고 약간의 지연 후 시작 (이벤트 루프 안정화)
-        self._process_timer.start(50)
+        self._process_timer.start(10)
 
     def _process_next(self):
         """큐에서 다음 주문 처리"""
-        if not self._queue:
+        if not self._high_queue and not self._queue:
             self._is_processing = False
             self._debug("[주문큐] 큐 비어있음 - 처리 완료")
             return
 
-        order_func, args, kwargs, callback = self._queue.popleft()
-        self._debug(f"[주문큐] 처리 시작: {order_func.__name__} args={args[:3] if len(args) > 3 else args} (남은 대기: {len(self._queue)}개)")
+        if self._high_queue:
+            order_func, args, kwargs, callback = self._high_queue.popleft()
+        else:
+            order_func, args, kwargs, callback = self._queue.popleft()
+        self._debug(f"[주문큐] 처리 시작: {order_func.__name__} args={args[:3] if len(args) > 3 else args} (남은 대기: 긴급:{len(self._high_queue)} 일반:{len(self._queue)})")
 
         try:
             result = order_func(*args, **kwargs)
@@ -212,7 +233,7 @@ class OrderQueue:
                     pass
 
         # 다음 주문 처리 (간격 유지)
-        if self._queue:
+        if self._high_queue or self._queue:
             self._process_timer.start(self._min_interval_ms)
         else:
             self._is_processing = False
@@ -220,17 +241,18 @@ class OrderQueue:
 
     def clear(self):
         """큐 비우기"""
+        self._high_queue.clear()
         self._queue.clear()
         self._is_processing = False
         self._debug("[주문큐] 큐 초기화됨")
 
     def is_empty(self):
         """큐가 비어있는지 확인"""
-        return len(self._queue) == 0
+        return len(self._high_queue) == 0 and len(self._queue) == 0
 
     def pending_count(self):
         """대기 중인 주문 개수"""
-        return len(self._queue)
+        return len(self._high_queue) + len(self._queue)
 
     def _debug(self, message):
         if self.kiwoom.debug:
@@ -353,8 +375,11 @@ class KiwoomAPI:
         self._tr_timeout_ms = 0
         self._tr_record_overrides = {}
 
-        # TR 호출 제한 (초당 5회)
-        self.rate_limiter = RateLimiter(max_calls=5, period=1.0)
+        # TR 호출 제한 (초당 5회 + 분당 60회)
+        self.rate_limiter = RateLimiter(max_calls=5, period=1.0, max_calls_per_min=60)
+
+        # ✅ -209 에러 감지 시 TR 쿨다운 (일시적 TR 호출 차단)
+        self._tr_cooldown_until = 0  # 쿨다운 해제 시각 (timestamp)
 
         # ✅ 계좌 데이터 시그널 발신기
         self.account_signals = AccountSignalEmitter()
@@ -397,6 +422,15 @@ class KiwoomAPI:
     def is_tr_busy(self):
         """TR 요청 처리 중 여부 확인 (재진입 방지용)"""
         return self._tr_busy
+
+    def is_tr_cooldown(self):
+        """TR 쿨다운 중인지 확인 (-209 에러 후 일시적 차단)"""
+        return time.time() < self._tr_cooldown_until
+
+    def _activate_tr_cooldown(self, duration_sec=30):
+        """TR 쿨다운 활성화 (-209 에러 감지 시 호출)"""
+        self._tr_cooldown_until = time.time() + duration_sec
+        print(f"[TR쿨다운] {duration_sec}초간 TR 호출 차단 (-209 에러 감지)")
 
     def is_tr_queue_busy(self):
         """TR 큐가 처리 중인지 확인"""
@@ -531,10 +565,15 @@ class KiwoomAPI:
         self.ocx.dynamicCall("SetInputValue(QString, QString)", id, value)
 
     def comm_rq_data(self, rqname, trcode, next, screen_no):
-        """TR 요청 (Rate Limiting + 재진입 방지 적용)"""
+        """TR 요청 (Rate Limiting + 재진입 방지 + 쿨다운 적용)"""
         # ✅ 재진입 방지: 이미 TR 처리 중이면 경고 후 스킵
         if self._tr_busy:
             self._debug(f"[TR] BLOCKED (busy) rqname={rqname} trcode={trcode}")
+            return
+
+        # ✅ 쿨다운 중이면 TR 요청 스킵 (-209 에러 방지)
+        if self.is_tr_cooldown():
+            self._debug(f"[TR] BLOCKED (cooldown) rqname={rqname} trcode={trcode}")
             return
 
         # TR 호출 제한 대기
@@ -1168,7 +1207,7 @@ class KiwoomAPI:
         return self.send_order("NXT매도주문", "0212", account, 2, nxt_code, quantity, price, hoga)
 
     # ==================== 큐 기반 주문 (에러코드 -308 방지) ====================
-    def send_order_queued(self, rqname, screen_no, account, order_type, code, quantity, price, hoga, callback=None, org_order_no=""):
+    def send_order_queued(self, rqname, screen_no, account, order_type, code, quantity, price, hoga, callback=None, org_order_no="", priority=False):
         """
         주문 전송 (큐 기반 - 초당 주문 제한 준수)
 
@@ -1178,10 +1217,11 @@ class KiwoomAPI:
         self.order_queue.enqueue(
             self.send_order,
             callback,
-            rqname, screen_no, account, order_type, code, quantity, price, hoga, org_order_no
+            rqname, screen_no, account, order_type, code, quantity, price, hoga, org_order_no,
+            priority=priority
         )
 
-    def buy_stock_queued(self, account, code, quantity, price=0, callback=None):
+    def buy_stock_queued(self, account, code, quantity, price=0, callback=None, priority=False):
         """
         매수 주문 (큐 기반)
         price=0이면 시장가
@@ -1190,10 +1230,11 @@ class KiwoomAPI:
         self.order_queue.enqueue(
             self.send_order,
             callback,
-            "매수주문", "0201", account, 1, code, quantity, price, hoga, ""
+            "매수주문", "0201", account, 1, code, quantity, price, hoga, "",
+            priority=priority
         )
 
-    def sell_stock_queued(self, account, code, quantity, price=0, callback=None):
+    def sell_stock_queued(self, account, code, quantity, price=0, callback=None, priority=False):
         """
         매도 주문 (큐 기반)
         price=0이면 시장가
@@ -1202,11 +1243,12 @@ class KiwoomAPI:
         self.order_queue.enqueue(
             self.send_order,
             callback,
-            "매도주문", "0202", account, 2, code, quantity, price, hoga, ""
+            "매도주문", "0202", account, 2, code, quantity, price, hoga, "",
+            priority=priority
         )
 
     # ==================== NXT 큐 기반 주문 ====================
-    def buy_stock_nxt_queued(self, account, code, quantity, price=0, callback=None):
+    def buy_stock_nxt_queued(self, account, code, quantity, price=0, callback=None, priority=False):
         """
         NXT 매수 주문 (큐 기반, 장시간외 전용)
 
@@ -1223,10 +1265,11 @@ class KiwoomAPI:
         self.order_queue.enqueue(
             self.send_order,
             callback,
-            "NXT매수주문", "0211", account, 1, nxt_code, quantity, price, hoga, ""
+            "NXT매수주문", "0211", account, 1, nxt_code, quantity, price, hoga, "",
+            priority=priority
         )
 
-    def sell_stock_nxt_queued(self, account, code, quantity, price=0, callback=None):
+    def sell_stock_nxt_queued(self, account, code, quantity, price=0, callback=None, priority=False):
         """
         NXT 매도 주문 (큐 기반, 장시간외 전용)
 
@@ -1243,7 +1286,8 @@ class KiwoomAPI:
         self.order_queue.enqueue(
             self.send_order,
             callback,
-            "NXT매도주문", "0212", account, 2, nxt_code, quantity, price, hoga, ""
+            "NXT매도주문", "0212", account, 2, nxt_code, quantity, price, hoga, "",
+            priority=priority
         )
 
     def cancel_order(self, account, code, order_no, quantity):
@@ -1585,6 +1629,11 @@ class KiwoomAPI:
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):
         """메시지 수신 이벤트"""
         print(f"[메시지] {msg}")
+
+        # ✅ -209 에러 감지: 과도한 조회요청 → TR 쿨다운 활성화
+        if "-209" in msg or "과도한 조회" in msg:
+            self._activate_tr_cooldown(30)  # 30초 쿨다운
+
         if self.on_message_callback:
             self.on_message_callback(screen_no, rqname, trcode, msg)
 
