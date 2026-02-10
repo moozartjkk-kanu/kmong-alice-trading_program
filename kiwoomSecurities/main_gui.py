@@ -1277,8 +1277,8 @@ class MainWindow(QMainWindow):
                             self.watchlist_table.setItem(row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price)))
                             self.watchlist_table.setItem(row, 3, QTableWidgetItem(self._fmt_int_or_dash(envelope.get("ma"))))
                             self.watchlist_table.setItem(row, 4, QTableWidgetItem(self._fmt_int_or_dash(envelope.get("lower"))))
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            self.log(f"[시스템] 감시 종목 지표 갱신 실패: {code} ({e})")
 
             self.watchlist_table.viewport().update()
 
