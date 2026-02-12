@@ -150,6 +150,24 @@ class AutoTrader:
         self._nxt_failed_codes.add(code)
         self.log(f"[{code}] NXT 주문 실패 - 당일 NXT 시도 금지 등록", "WARNING")
 
+    def _clear_pending_orders_nxt_flags(self):
+        """NXT 시간대 진입 시 pending_orders의 is_nxt 플래그를 전부 제거하여 재시도 가능하도록 초기화"""
+        try:
+            pending_orders = self.config.get_pending_orders()
+            if not pending_orders:
+                return
+            updated = False
+            for code, orders in pending_orders.items():
+                for o in orders:
+                    if "is_nxt" in o:
+                        o.pop("is_nxt")
+                        updated = True
+            if updated:
+                self.config.set(pending_orders, "pending_orders")
+                self.log("NXT 시간대 진입 - pending_orders is_nxt 플래그 초기화 (재시도 가능)", "INFO")
+        except Exception as e:
+            self.log(f"pending_orders is_nxt 플래그 초기화 오류: {e}", "ERROR")
+
     # ==================== 기본 ====================
     def set_account(self, account):
         """계좌 설정"""
@@ -274,6 +292,11 @@ class AutoTrader:
                         self.event_engine.refresh_realtime(watchlist_codes, priority_codes)
                     except Exception as e:
                         self.log(f"NXT 실시간 등록 갱신 오류: {e}", "ERROR")
+
+                # NXT 시간대 진입 시 pending_orders is_nxt 플래그 초기화 + 실패 이력 초기화
+                if current_type in ("NXT_PREMARKET", "NXT_AFTERMARKET"):
+                    self._nxt_failed_codes.clear()
+                    self._clear_pending_orders_nxt_flags()
 
                 if current_type in ("REGULAR", "NXT_PREMARKET", "NXT_AFTERMARKET"):
                     # 전환 시 복원 재실행하도록 플래그 초기화
@@ -2691,7 +2714,10 @@ class AutoTrader:
 
                 order_is_nxt = order.get("is_nxt")
                 if order_is_nxt is None:
-                    order_is_nxt = bool(position.get("is_nxt_order", False)) if position else False
+                    if restore_nxt:
+                        order_is_nxt = True  # NXT 시간대: 일단 시도
+                    else:
+                        order_is_nxt = bool(position.get("is_nxt_order", False)) if position else False
 
                 if restore_nxt and not order_is_nxt:
                     self.log(f"[{code}] 주문 복원 스킵 (KRX 주문, NXT 시간대)", "INFO")

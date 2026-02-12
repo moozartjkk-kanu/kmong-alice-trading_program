@@ -789,7 +789,7 @@ class MainWindow(QMainWindow):
 
             self.trading_timer.start(20000)
             self.refresh_timer.start(60000)  # 잔고 갱신 60초
-            self.watchlist_refresh_timer.start(300000)  # 감시 종목 갱신 5분
+            self.watchlist_refresh_timer.start(180000)  # 감시 종목 갱신 3분
         else:
             self.log("[시스템] 자동매매 시작 실패 (AutoTrader.start()가 False 반환)")
             QMessageBox.warning(self, "시작 실패", "자동매매 시작에 실패했습니다. 로그를 확인해주세요.")
