@@ -108,6 +108,7 @@ class AutoTrader:
 
         # ✅ 자동매도 체결 추적 (수동매도 구분용)
         self._auto_sell_executed = {}  # {code: True} - 자동매도 체결 시 설정, balance 처리 후 리셋
+        self._manual_buy_codes = set()  # 수동매수 종목 코드 추적
 
         # ✅ NXT 주문 실패 종목 추적 (당일 NXT 시도 금지)
         self._nxt_failed_codes = set()  # {code} - NXT 주문 실패 시 등록, 새로운 거래일에 초기화
@@ -128,6 +129,16 @@ class AutoTrader:
         print(log_msg)
         if self.log_callback:
             self.log_callback(log_msg)
+
+    def _pending_key(self, code, intent_type, buy_count=None):
+        """pending 키 생성 (추가매수는 차수별로 분리)"""
+        if intent_type == "additional_buy":
+            return (code, f"additional_buy_{int(buy_count or 0)}")
+        return (code, intent_type)
+
+    def _clear_pending_key(self, code, intent_type, buy_count=None):
+        key = self._pending_key(code, intent_type, buy_count)
+        self._pending_order_codes.discard(key)
 
     # ==================== NXT 실패 종목 관리 ====================
     def _is_nxt_order_blocked(self, code):
@@ -445,7 +456,7 @@ class AutoTrader:
 
                     self._last_order_ts = time.time()
                     # ✅ 성공 시 즉시 해제 → 다음 틱에서 동일 종목 재주문 가능
-                    if intent_type in ("buy", "stoploss", "additional_buy"):
+                    if intent_type == "stoploss":
                         self._pending_order_codes.discard(key)
                 except Exception as e:
                     self.log(f"[{code}] 주문 처리 오류({intent_type}): {e}", "ERROR")
@@ -686,11 +697,10 @@ class AutoTrader:
         """
         ✅ 보유 종목에 대해 모든 매도 주문이 걸려있는지 확인하고 없으면 걸기
 
-        요구사항: 매수 체결 시점에 바로 모든 매도 주문(익절1~3 + 20일선)이 걸려있어야 함
-        - 평단가 +2.95%에 30%
-        - 평단가 +4.95%에 30%
-        - 평단가 +6.95%에 30%
-        - 20일선 가격에 나머지 10%
+        요구사항: 매수 체결 시점에 바로 모든 매도 주문이 걸려있어야 함
+
+        자동매수: 익절1~3 (30/30/30) + 20일선 (10%)
+        수동매수: 익절1~3 (30/40/30), 20일선 매도 없음
         """
         if not position or position.get("quantity", 0) <= 0:
             return
@@ -716,13 +726,18 @@ class AutoTrader:
         if initial_qty <= 0:
             initial_qty = current_qty
 
-        # 20일선 가격 계산
-        period = 20
-        ma20 = self.ta.get_ma_from_candles(candles, period)
+        # 수동매수 여부 확인
+        is_manual_buy = position.get("is_manual_buy", False)
+
+        # 20일선 가격 계산 (수동매수는 20일선 매도 없으므로 None)
+        ma20 = None
+        if not is_manual_buy:
+            period = 20
+            ma20 = self.ta.get_ma_from_candles(candles, period)
 
         # 매도 주문 계획 생성
         sell_orders_to_place = self._calculate_sell_orders(
-            avg_price, initial_qty, current_qty, ma20, sold_targets
+            avg_price, initial_qty, current_qty, ma20, sold_targets, is_manual_buy=is_manual_buy
         )
 
         # 주문 걸기 (큐 기반 - 에러코드 -308 방지)
@@ -865,23 +880,36 @@ class AutoTrader:
                     "is_nxt": False
                 })
 
-    def _calculate_sell_orders(self, avg_price, initial_qty, current_qty, ma20, sold_targets):
+    def _calculate_sell_orders(self, avg_price, initial_qty, current_qty, ma20, sold_targets, is_manual_buy=False):
         """
         ✅ 매도 주문 계획 계산
 
-        전체물량 기준:
+        자동매수 전체물량 기준:
         - 익절1 (+2.95%): 30%
         - 익절2 (+4.95%): 30%
         - 익절3 (+6.95%): 30%
         - 20일선: 나머지 10%
+
+        수동매수 전체물량 기준:
+        - 익절1 (+2.95%): 30%
+        - 익절2 (+4.95%): 40%
+        - 익절3 (+6.95%): 30%
+        - 20일선: 없음
         """
         orders = []
 
-        # 비중 계산 (초기 수량 기준)
-        q1 = int(initial_qty * 0.30)  # 30%
-        q2 = int(initial_qty * 0.30)  # 30%
-        q3 = int(initial_qty * 0.30)  # 30%
-        q_ma = initial_qty - q1 - q2 - q3  # 나머지 (약 10%)
+        if is_manual_buy:
+            # ✅ 수동매수: [30, 40, 30] 비중, 20일선 매도 없음
+            q1 = int(initial_qty * 0.30)  # 30%
+            q2 = int(initial_qty * 0.40)  # 40%
+            q3 = initial_qty - q1 - q2    # 나머지 (약 30%)
+            ratios = [30, 40, 30]
+        else:
+            # 자동매수: [30, 30, 30] 비중 + 20일선 10%
+            q1 = int(initial_qty * 0.30)  # 30%
+            q2 = int(initial_qty * 0.30)  # 30%
+            q3 = int(initial_qty * 0.30)  # 30%
+            ratios = [30, 30, 30]
 
         # 최소 1주 보장
         if q1 <= 0:
@@ -890,8 +918,6 @@ class AutoTrader:
             q2 = 1
         if q3 <= 0:
             q3 = 1
-        if q_ma <= 0:
-            q_ma = 1
 
         # 이미 체결된 타겟들의 수량을 현재 수량에서 제외하여 계산
         used_qty = 0
@@ -904,7 +930,7 @@ class AutoTrader:
                     "target_name": "익절1",
                     "quantity": min(q1, current_qty - used_qty),
                     "price": price1,
-                    "sell_ratio": 30
+                    "sell_ratio": ratios[0]
                 })
                 used_qty += min(q1, current_qty - used_qty)
 
@@ -916,7 +942,7 @@ class AutoTrader:
                     "target_name": "익절2",
                     "quantity": min(q2, current_qty - used_qty),
                     "price": price2,
-                    "sell_ratio": 30
+                    "sell_ratio": ratios[1]
                 })
                 used_qty += min(q2, current_qty - used_qty)
 
@@ -928,12 +954,15 @@ class AutoTrader:
                     "target_name": "익절3",
                     "quantity": min(q3, current_qty - used_qty),
                     "price": price3,
-                    "sell_ratio": 30
+                    "sell_ratio": ratios[2]
                 })
                 used_qty += min(q3, current_qty - used_qty)
 
-        # 20일선: 나머지
-        if ma20 and "20일선" not in sold_targets:
+        # 20일선: 나머지 (수동매수는 20일선 매도 없음)
+        if not is_manual_buy and ma20 and "20일선" not in sold_targets:
+            q_ma = initial_qty - int(initial_qty * 0.30) * 3  # 나머지 (약 10%)
+            if q_ma <= 0:
+                q_ma = 1
             remaining = current_qty - used_qty
             if remaining > 0:
                 ma_price = self._ceil_to_tick(ma20)
@@ -1141,6 +1170,8 @@ class AutoTrader:
                     position["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self.config.update_position(code, position)
             else:
+                # 주문 실패 시 pending 해제
+                self._clear_pending_key(code, "buy")
                 if is_nxt:
                     self._mark_nxt_order_failed(code)
                 self.log(f"[{code}] 매수 주문 실패 ({market_type}): 에러코드 {result}", "ERROR")
@@ -1370,6 +1401,8 @@ class AutoTrader:
                 position["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.config.update_position(code, position)
             else:
+                # 주문 실패 시 pending 해제
+                self._clear_pending_key(code, "additional_buy", buy_count)
                 if is_nxt:
                     self._mark_nxt_order_failed(code)
                 self.log(f"[{code}] {buy_count}차 추가 매수 주문 실패 ({market_type}): 에러코드 {result}", "ERROR")
@@ -1596,17 +1629,22 @@ class AutoTrader:
                 executed_price = data["executed_price"]
                 order_type = data["order_type"]
                 order_no = str(data.get("order_no", "") or "")
+                order_status = str(data.get("status", "") or "")
                 order_price = int(data.get("order_price", 0) or 0)
                 order_quantity = int(data.get("order_quantity", 0) or 0)
+                remaining_quantity = int(data.get("remaining_quantity", 0) or 0)
 
-                # 주문 접수/체결 이벤트에서 order_no를 pending_orders에 반영 (매도 주문 식별 정확도 개선)
+                # 주문 접수/체결 이벤트에서 order_no를 pending_orders에 반영 (매수/매도 식별 정확도 개선)
                 try:
-                    if order_no and (("-" in order_type) or ("매도" in order_type)):
+                    if order_no:
                         pending_orders = self.config.get_pending_orders()
                         orders = pending_orders.get(code, [])
                         updated = False
+                        is_buy = ("+" in order_type) or ("매수" in order_type)
                         for o in orders:
-                            if o.get("order_type") != "sell":
+                            if is_buy and o.get("order_type") != "buy":
+                                continue
+                            if (not is_buy) and o.get("order_type") != "sell":
                                 continue
                             if o.get("order_no"):
                                 continue
@@ -1617,6 +1655,48 @@ class AutoTrader:
                                     break
                         if updated:
                             self.config.set(pending_orders, "pending_orders")
+                except Exception:
+                    pass
+
+                # 미체결 주문 취소/거부 시 pending 해제 (재주문 허용)
+                try:
+                    is_buy = ("+" in order_type) or ("매수" in order_type)
+                    is_cancel = ("취소" in order_status) or ("거부" in order_status)
+                    is_filled_like = ("체결" in order_status) or ("완료" in order_status)
+                    status_known = is_cancel or is_filled_like or ("접수" in order_status) or ("확인" in order_status)
+                    # 부분체결 후 취소 포함: 잔량 0이면 pending 해제
+                    # order_status가 비정상이어도 잔량 0이면 안전하게 pending 해제 (재주문 허용)
+                    if is_buy and remaining_quantity == 0 and (is_cancel or is_filled_like or not status_known):
+                        pending_orders = self.config.get_pending_orders().get(code, [])
+                        matched_buy_count = None
+                        matched_price = None
+                        for order in pending_orders:
+                            if order.get("order_type") != "buy":
+                                continue
+                            if order_no and order.get("order_no") == order_no:
+                                matched_buy_count = int(order.get("buy_count", 1) or 1)
+                                matched_price = int(order.get("price", 0) or 0)
+                                break
+                            if order_price > 0 and int(order.get("price", 0) or 0) == order_price:
+                                if order_quantity and int(order.get("quantity", 0) or 0) == order_quantity:
+                                    matched_buy_count = int(order.get("buy_count", 1) or 1)
+                                    matched_price = int(order.get("price", 0) or 0)
+                                    break
+                        if matched_buy_count is not None:
+                            if matched_buy_count >= 2:
+                                self._clear_pending_key(code, "additional_buy", matched_buy_count)
+                            else:
+                                self._clear_pending_key(code, "buy")
+                            if matched_price is not None:
+                                # 메모리 pending 주문도 정리
+                                if code in self.pending_buy_orders:
+                                    self.pending_buy_orders[code] = [
+                                        o for o in self.pending_buy_orders[code]
+                                        if int(o.get("price", 0) or 0) != matched_price
+                                    ]
+                                    if not self.pending_buy_orders[code]:
+                                        del self.pending_buy_orders[code]
+                                self.config.remove_pending_order(code, order_type="buy", price=matched_price)
                 except Exception:
                     pass
 
@@ -1662,7 +1742,24 @@ class AutoTrader:
 
                             self.config.update_position(code, position)
 
-                        self.config.remove_pending_order(code, order_type="buy", price=executed_price)
+                        # 체결 발생 시 pending 해제 (완전 체결/취소 시점에만)
+                        if remaining_quantity == 0:
+                            order_buy_count = 1
+                            try:
+                                pending_orders = self.config.get_pending_orders().get(code, [])
+                                for order in pending_orders:
+                                    if order.get("order_type") == "buy" and int(order.get("price", 0)) == int(executed_price):
+                                        order_buy_count = int(order.get("buy_count", 1) or 1)
+                                        break
+                            except Exception:
+                                order_buy_count = 1
+
+                            if order_buy_count >= 2:
+                                self._clear_pending_key(code, "additional_buy", order_buy_count)
+                            else:
+                                self._clear_pending_key(code, "buy")
+
+                            self.config.remove_pending_order(code, order_type="buy", price=executed_price)
                         # ✅ 동기 TR 호출을 지연 실행 (콜백 내 QEventLoop 중첩 방지)
                         QTimer.singleShot(0, self._check_and_cancel_excess_orders)
 
@@ -1758,6 +1855,11 @@ class AutoTrader:
                         position["initial_quantity"] = quantity
                         log_type = "초기" if not is_additional_buy else "갱신"
                         self.log(f"[{code}] {log_type} 수량 설정: {quantity}주", "INFO")
+
+                        # ✅ 수동매수 플래그 설정 (매도 비중 [30, 40, 30] 적용)
+                        if code in self._manual_buy_codes:
+                            position["is_manual_buy"] = True
+                            self.log(f"[{code}] 수동매수 종목 - 매도 비중 [30, 40, 30] 적용", "INFO")
 
                         # ✅ 매수 체결 후 매도 주문 설정 (새 수량 기준) - 지연 실행
                         # position은 dict이므로 copy하여 전달
@@ -2010,6 +2112,9 @@ class AutoTrader:
             if is_nxt and self._is_nxt_order_blocked(code):
                 self.log(f"[{code}] NXT 주문 차단 종목 - 수동 매수 불가", "ERROR")
                 return False
+
+            # ✅ 수동매수 종목 등록 (매도 비중 [30, 40, 30] 적용용)
+            self._manual_buy_codes.add(code)
 
             price_str = f"{price:,}원" if price > 0 else "시장가"
             self.log(f"[{code} {stock_name}] 수동 매수 주문 ({market_type}): {quantity}주 @ {price_str}")
