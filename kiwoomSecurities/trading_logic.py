@@ -150,6 +150,42 @@ class AutoTrader:
         self._nxt_failed_codes.add(code)
         self.log(f"[{code}] NXT 주문 실패 - 당일 NXT 시도 금지 등록", "WARNING")
 
+    def _cancel_all_open_orders(self):
+        """장 전환 시 기존 API 미체결 주문 전부 취소"""
+        try:
+            if not self.kiwoom or not self.account:
+                return 0
+            orders = self.kiwoom.get_open_orders(self.account)
+            if not orders:
+                self.log("장 전환: 취소할 미체결 주문 없음", "INFO")
+                return 0
+            cancelled = 0
+            for order in orders:
+                code = order["code"]
+                cancel_type = 3 if "매수" in order["order_type"] or "+" in order["order_type"] else 4
+                result = self.kiwoom.send_order(
+                    "장전환_주문취소",
+                    "0203",
+                    self.account,
+                    cancel_type,
+                    code,
+                    order["not_executed"],
+                    0,
+                    "00",
+                    order["order_no"]
+                )
+                if result == 0:
+                    cancelled += 1
+                    order_side = "매수" if cancel_type == 3 else "매도"
+                    self.log(f"[{code}] 장 전환 미체결 취소: {order_side} {order['not_executed']}주 @ {order['order_price']:,}원", "INFO")
+                else:
+                    self.log(f"[{code}] 장 전환 미체결 취소 실패: 에러코드 {result}", "WARNING")
+            self.log(f"장 전환 미체결 취소 완료: {cancelled}/{len(orders)}건", "INFO")
+            return cancelled
+        except Exception as e:
+            self.log(f"장 전환 미체결 취소 오류: {e}", "ERROR")
+            return 0
+
     def _clear_pending_orders_nxt_flags(self):
         """NXT 시간대 진입 시 pending_orders의 is_nxt 플래그를 전부 제거하여 재시도 가능하도록 초기화"""
         try:
@@ -299,10 +335,15 @@ class AutoTrader:
                     self._clear_pending_orders_nxt_flags()
 
                 if current_type in ("REGULAR", "NXT_PREMARKET", "NXT_AFTERMARKET"):
-                    # 전환 시 복원 재실행하도록 플래그 초기화
+                    # 장 전환 시 기존 미체결 주문 전부 취소 후 새 시장에 맞게 복원
+                    cancelled = self._cancel_all_open_orders()
                     self.orders_restored = False
                     self.config.set_orders_restored(False)
-                    self.check_and_restore_orders()
+                    if cancelled > 0:
+                        # 취소 처리 반영 대기 후 복원 (3초)
+                        QTimer.singleShot(3000, self.check_and_restore_orders)
+                    else:
+                        self.check_and_restore_orders()
         except Exception as e:
             self.log(f"시장 전환 감지 오류: {e}", "ERROR")
 
