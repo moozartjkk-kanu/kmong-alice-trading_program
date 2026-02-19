@@ -113,6 +113,9 @@ class AutoTrader:
         # ✅ NXT 주문 실패 종목 추적 (당일 NXT 시도 금지)
         self._nxt_failed_codes = set()  # {code} - NXT 주문 실패 시 등록, 새로운 거래일에 초기화
 
+        # ✅ 예수금 캐시 (None: 아직 미수신, 0 이상: 최신 예수금)
+        self._available_funds = None
+
         # 체결 콜백 설정
         if self.kiwoom:
             self.kiwoom.set_chejan_callback(self._on_order_executed)
@@ -129,6 +132,10 @@ class AutoTrader:
         print(log_msg)
         if self.log_callback:
             self.log_callback(log_msg)
+
+    def update_available_funds(self, amount):
+        """예수금 캐시 갱신 (main_gui에서 호출)"""
+        self._available_funds = amount
 
     def _pending_key(self, code, intent_type, buy_count=None):
         """pending 키 생성 (추가매수는 차수별로 분리)"""
@@ -443,6 +450,13 @@ class AutoTrader:
                 if not position.get("sell_occurred", False) and not position.get("stoploss_triggered", False):
                     additional_intent = self._check_additional_buy_trigger(code, current_price, position)
                     if additional_intent:
+                        t_price = additional_intent.get("target_price") or current_price
+                        if t_price > 0:
+                            buy_amount = self.config.get("buy", "buy_amount_per_stock")
+                            required = (buy_amount // t_price) * t_price
+                            if self._available_funds is not None and self._available_funds < required:
+                                self.log(f"[{code}] 예수금 부족 - 추가매수 스킵 (예수금: {self._available_funds:,}, 필요: {required:,})", "WARNING")
+                                return intents
                         intents.append(additional_intent)
 
             # 3) 매수 신호 (후순위) — 항상 즉시
@@ -455,6 +469,12 @@ class AutoTrader:
             if buy_signal.get("signal"):
                 if buy_signal.get("buy_count") == 1 and not self._can_buy_new_stock():
                     return intents
+                if current_price > 0:
+                    buy_amount = self.config.get("buy", "buy_amount_per_stock")
+                    required = (buy_amount // current_price) * current_price
+                    if self._available_funds is not None and self._available_funds < required:
+                        self.log(f"[{code}] 예수금 부족 - 매수 스킵 (예수금: {self._available_funds:,}, 필요: {required:,})", "WARNING")
+                        return intents
                 intents.append({"type": "buy", "code": code, "price": current_price,
                                 "buy_signal": buy_signal, "candles": candles})
         except Exception as e:
@@ -572,6 +592,13 @@ class AutoTrader:
                 if not position.get("sell_occurred", False) and not position.get("stoploss_triggered", False):
                     additional_intent = self._check_additional_buy_trigger(code, current_price, position)
                     if additional_intent:
+                        t_price = additional_intent.get("target_price") or current_price
+                        if t_price > 0:
+                            buy_amount = self.config.get("buy", "buy_amount_per_stock")
+                            required = (buy_amount // t_price) * t_price
+                            if self._available_funds is not None and self._available_funds < required:
+                                self.log(f"[{code}] 예수금 부족 - 추가매수 스킵 (예수금: {self._available_funds:,}, 필요: {required:,})", "WARNING")
+                                return
                         try:
                             self.urgent_order_queue.put_nowait(additional_intent)
                         except queue.Full:
@@ -589,6 +616,13 @@ class AutoTrader:
             if buy_signal.get("signal"):
                 if buy_signal.get("buy_count") == 1:
                     if not self._can_buy_new_stock():
+                        return
+
+                if current_price > 0:
+                    buy_amount = self.config.get("buy", "buy_amount_per_stock")
+                    required = (buy_amount // current_price) * current_price
+                    if self._available_funds is not None and self._available_funds < required:
+                        self.log(f"[{code}] 예수금 부족 - 매수 스킵 (예수금: {self._available_funds:,}, 필요: {required:,})", "WARNING")
                         return
 
                 try:

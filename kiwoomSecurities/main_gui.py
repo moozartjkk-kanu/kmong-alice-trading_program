@@ -979,6 +979,8 @@ class MainWindow(QMainWindow):
             self.balance_label.setText(f"예수금: {deposit:,}원")
         except Exception:
             pass
+        if self.trader:
+            self.trader.update_available_funds(deposit)
 
     def _on_balance_changed(self, _code, _quantity, _avg_price):
         """잔고 변경 시그널 처리 (개별 종목) - 디바운스 적용으로 과도한 TR 호출 방지"""
@@ -1151,6 +1153,8 @@ class MainWindow(QMainWindow):
                 self.log(f"[잔고조회] opw00018 예수금=0, opw00001로 재조회 요청...")
                 self.kiwoom.get_deposit_async(account, self._on_deposit_received)
             else:
+                if self.trader:
+                    self.trader.update_available_funds(deposit)
                 self._update_holdings_ui(balance, deposit)
 
         except Exception as e:
@@ -1181,6 +1185,8 @@ class MainWindow(QMainWindow):
                 self.log("  4. 프로그램 재시작 후 다시 시도")
 
             self.balance_label.setText(f"예수금: {deposit:,}원")
+            if self.trader:
+                self.trader.update_available_funds(deposit)
 
         except Exception as e:
             self.log(f"[잔고조회] 예수금 처리 오류: {e}")
@@ -1906,7 +1912,8 @@ def main():
 
     if today > expiry_date:
         QMessageBox.critical(None, "사용 기간 만료",
-            "프로그램 사용 기간이 만료되었습니다.\n관리자에게 문의해 주세요.")
+            "프로그램 사용 기간이 만료되었습니다.\n관리자에게 문의해 주세요.\n"
+            f"kanu:010-8646-8906")
         sys.exit(0)
 
     if today.year == 2026 and today.month == 12:
@@ -1916,6 +1923,9 @@ def main():
             f"만료일: 2026년 12월 31일\n\n"
             f"계속 사용하시려면 관리자에게 문의해 주세요.\n"
             f"kanu:010-8646-8906")
+
+    QMessageBox.information(None, "안내",
+        "검증이 되지 않은 테스트 버전입니다. 사용에 유의 바랍니다.")
 
     window = MainWindow()
     window.show()
