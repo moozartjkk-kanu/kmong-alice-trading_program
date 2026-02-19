@@ -3,6 +3,7 @@
 키움증권 자동매매 시스템 - 메인 GUI
 """
 import sys
+import datetime
 from collections import deque
 import time  # ✅ 추가: 로그 스팸/쓰로틀용
 
@@ -1898,6 +1899,23 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # 사용 기간 체크
+    today = datetime.date.today()
+    expiry_date = datetime.date(2026, 12, 31)
+
+    if today > expiry_date:
+        QMessageBox.critical(None, "사용 기간 만료",
+            "프로그램 사용 기간이 만료되었습니다.\n관리자에게 문의해 주세요.")
+        sys.exit(0)
+
+    if today.year == 2026 and today.month == 12:
+        remaining = (expiry_date - today).days
+        QMessageBox.warning(None, "사용 기간 안내",
+            f"프로그램 사용 기간이 {remaining}일 남았습니다.\n"
+            f"만료일: 2026년 12월 31일\n\n"
+            f"계속 사용하시려면 관리자에게 문의해 주세요.\n"
+            f"kanu:010-8646-8906")
 
     window = MainWindow()
     window.show()
