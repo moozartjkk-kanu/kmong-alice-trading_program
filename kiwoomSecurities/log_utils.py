@@ -4,6 +4,7 @@
 날짜가 바뀌면 자동으로 새 파일에 저장
 """
 import os
+import sys
 import threading
 from datetime import datetime
 
@@ -51,3 +52,37 @@ class DailyFileLogger:
                 except Exception:
                     pass
                 self._file = None
+
+
+class ConsoleLogger:
+    """sys.stdout을 가로채어 CMD 출력 전체를 파일로 저장하는 클래스"""
+
+    def __init__(self, prefix="console"):
+        self._logger = DailyFileLogger(prefix)
+        self._original_stdout = sys.stdout
+        self._buffer = ""
+        self._lock = threading.Lock()
+
+    def start(self):
+        sys.stdout = self
+
+    def stop(self):
+        sys.stdout = self._original_stdout
+
+    def write(self, text):
+        self._original_stdout.write(text)
+        with self._lock:
+            self._buffer += text
+            if "\n" in self._buffer:
+                lines = self._buffer.split("\n")
+                for line in lines[:-1]:
+                    if line.strip():
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        self._logger.write(f"[{timestamp}] {line}")
+                self._buffer = lines[-1]
+
+    def flush(self):
+        self._original_stdout.flush()
+
+    def fileno(self):
+        return self._original_stdout.fileno()
