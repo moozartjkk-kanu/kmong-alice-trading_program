@@ -24,6 +24,10 @@ from PyQt5.QtCore import QTimer
 
 from technical_analysis import TechnicalAnalysis, TradingSignal
 from event_engine import init_engine
+from kiwoom_api import (
+    is_premarket, is_aftermarket, is_extended_hours, is_regular_market,
+    get_market_type, to_nxt_code, from_nxt_code, is_nxt_code
+)
 
 
 class AutoTrader:
@@ -33,6 +37,12 @@ class AutoTrader:
     MARKET_OPEN_TIME = dt_time(9, 0, 0)       # 장 시작
     MARKET_CLOSE_TIME = dt_time(15, 30, 0)    # 장 마감
     PRE_MARKET_TIME = dt_time(8, 30, 0)       # 동시호가 시작
+
+    # NXT 시간대 설정
+    NXT_PREMARKET_START = dt_time(8, 0, 0)    # 프리마켓 시작
+    NXT_PREMARKET_END = dt_time(8, 50, 0)     # 프리마켓 종료
+    NXT_AFTERMARKET_START = dt_time(15, 40, 0)  # 애프터마켓 시작
+    NXT_AFTERMARKET_END = dt_time(20, 0, 0)    # 애프터마켓 종료
 
     # 매도 목표 설정 (고정)
     PROFIT_TARGETS = [2.95, 4.95, 6.95]  # 익절 목표 수익률 (%)
@@ -69,20 +79,42 @@ class AutoTrader:
         # ==================== 비동기 처리(실시간 콜백 경량화) ====================
         # 실시간 콜백에서는 큐 적재만 하고, 조건 계산은 워커 스레드에서 수행
         self.tick_queue = queue.Queue(maxsize=5000)   # (code, price, ts)
-        self.order_queue = queue.Queue(maxsize=5000)  # 주문 의도(intent) 큐
+        self.order_queue = queue.Queue(maxsize=5000)  # 유지보수 인텐트 큐 (ensure_stoploss, ensure_sell)
+        self.urgent_order_queue = queue.Queue(maxsize=1000)  # 긴급 주문 큐 (stoploss, buy, additional_buy)
 
         self._latest_price = {}  # {code: last_price}
         self._pending_order_codes = set()  # {(code, intent_type)} 중복 방지
-        self._order_min_interval = 0.35    # 주문 전송 최소 간격(초)
+        self._order_min_interval = 0.0     # 주문 전송 최소 간격(초) - 실제 제한은 Kiwoom 주문 큐가 제어
         self._last_order_ts = 0.0
+        self._last_ensure_ts = {}  # {code: timestamp} ensure 인텐트 스로틀 (중복 방지)
+        self._ensure_throttle_sec = 3.0    # ensure 인텐트 최소 간격 (초)
+
+        # 스탑로스 유지 주문 과도 호출 방지
+        self._stoploss_last_check = {}  # {code: timestamp}
+        self._stoploss_check_min_interval = 5.0  # 스탑로스 미체결 확인 최소 간격(초)
+        self._stoploss_last_reorder = {}  # {code: timestamp}
+        # 재주문 성공 후에는 일정 시간 동안 재조회/재주문을 막는다 (과도 반복 방지)
+        self._stoploss_reorder_cooldown = 300.0  # 재주문 쿨다운(초)
+        self._stoploss_reorder_pending = set()  # 재주문 진행 중 코드
 
         self._worker_stop = threading.Event()
         self._signal_worker = None
+        self._last_market_type = None
+        self._market_type_timer = QTimer()
+        self._market_type_timer.setInterval(30 * 1000)
+        self._market_type_timer.timeout.connect(self._check_market_transition)
         # 주문 복원 완료 여부
         self.orders_restored = False
 
         # ✅ 자동매도 체결 추적 (수동매도 구분용)
         self._auto_sell_executed = {}  # {code: True} - 자동매도 체결 시 설정, balance 처리 후 리셋
+        self._manual_buy_codes = set()  # 수동매수 종목 코드 추적
+
+        # ✅ NXT 주문 실패 종목 추적 (당일 NXT 시도 금지)
+        self._nxt_failed_codes = set()  # {code} - NXT 주문 실패 시 등록, 새로운 거래일에 초기화
+
+        # ✅ 예수금 캐시 (None: 아직 미수신, 0 이상: 최신 예수금)
+        self._available_funds = None
 
         # 체결 콜백 설정
         if self.kiwoom:
@@ -100,6 +132,84 @@ class AutoTrader:
         print(log_msg)
         if self.log_callback:
             self.log_callback(log_msg)
+
+    def update_available_funds(self, amount):
+        """예수금 캐시 갱신 (main_gui에서 호출)"""
+        self._available_funds = amount
+
+    def _pending_key(self, code, intent_type, buy_count=None):
+        """pending 키 생성 (추가매수는 차수별로 분리)"""
+        if intent_type == "additional_buy":
+            return (code, f"additional_buy_{int(buy_count or 0)}")
+        return (code, intent_type)
+
+    def _clear_pending_key(self, code, intent_type, buy_count=None):
+        key = self._pending_key(code, intent_type, buy_count)
+        self._pending_order_codes.discard(key)
+
+    # ==================== NXT 실패 종목 관리 ====================
+    def _is_nxt_order_blocked(self, code):
+        """NXT 주문 실패 이력으로 당일 차단된 종목인지 확인"""
+        return code in self._nxt_failed_codes
+
+    def _mark_nxt_order_failed(self, code):
+        """NXT 주문 실패 종목 기록 (당일 NXT 시도 금지)"""
+        self._nxt_failed_codes.add(code)
+        self.log(f"[{code}] NXT 주문 실패 - 당일 NXT 시도 금지 등록", "WARNING")
+
+    def _cancel_all_open_orders(self):
+        """장 전환 시 기존 API 미체결 주문 전부 취소"""
+        try:
+            if not self.kiwoom or not self.account:
+                return 0
+            orders = self.kiwoom.get_open_orders(self.account)
+            if not orders:
+                self.log("장 전환: 취소할 미체결 주문 없음", "INFO")
+                return 0
+            cancelled = 0
+            for order in orders:
+                code = order["code"]
+                cancel_type = 3 if "매수" in order["order_type"] or "+" in order["order_type"] else 4
+                result = self.kiwoom.send_order(
+                    "장전환_주문취소",
+                    "0203",
+                    self.account,
+                    cancel_type,
+                    code,
+                    order["not_executed"],
+                    0,
+                    "00",
+                    order["order_no"]
+                )
+                if result == 0:
+                    cancelled += 1
+                    order_side = "매수" if cancel_type == 3 else "매도"
+                    self.log(f"[{code}] 장 전환 미체결 취소: {order_side} {order['not_executed']}주 @ {order['order_price']:,}원", "INFO")
+                else:
+                    self.log(f"[{code}] 장 전환 미체결 취소 실패: 에러코드 {result}", "WARNING")
+            self.log(f"장 전환 미체결 취소 완료: {cancelled}/{len(orders)}건", "INFO")
+            return cancelled
+        except Exception as e:
+            self.log(f"장 전환 미체결 취소 오류: {e}", "ERROR")
+            return 0
+
+    def _clear_pending_orders_nxt_flags(self):
+        """NXT 시간대 진입 시 pending_orders의 is_nxt 플래그를 전부 제거하여 재시도 가능하도록 초기화"""
+        try:
+            pending_orders = self.config.get_pending_orders()
+            if not pending_orders:
+                return
+            updated = False
+            for code, orders in pending_orders.items():
+                for o in orders:
+                    if "is_nxt" in o:
+                        o.pop("is_nxt")
+                        updated = True
+            if updated:
+                self.config.set(pending_orders, "pending_orders")
+                self.log("NXT 시간대 진입 - pending_orders is_nxt 플래그 초기화 (재시도 가능)", "INFO")
+        except Exception as e:
+            self.log(f"pending_orders is_nxt 플래그 초기화 오류: {e}", "ERROR")
 
     # ==================== 기본 ====================
     def set_account(self, account):
@@ -139,6 +249,10 @@ class AutoTrader:
         self.event_engine.on_trade_signal = self._on_trade_signal
         self.event_engine.start(watchlist_codes, priority_codes)
 
+        # 시장 전환 감지 타이머 시작
+        self._last_market_type = self.get_current_market_type()
+        self._market_type_timer.start()
+
 
         # 신호 워커 스레드 시작 (조건 계산/신호 생성 전용)
         if not self._signal_worker or not self._signal_worker.is_alive():
@@ -153,6 +267,8 @@ class AutoTrader:
         self.is_running = False
         self.log("자동매매를 중지합니다.")
 
+        if self._market_type_timer:
+            self._market_type_timer.stop()
 
         # 워커 정지
         self._worker_stop.set()
@@ -164,12 +280,83 @@ class AutoTrader:
     def is_market_open(self):
         """장이 열려있는지 확인 (동시호가 포함)"""
         now = datetime.now().time()
-        return self.PRE_MARKET_TIME <= now <= self.MARKET_CLOSE_TIME
+        return self.is_any_trading_time()
 
     def is_trading_time(self):
         """거래 시간인지 확인 (동시호가 제외)"""
         now = datetime.now().time()
         return self.MARKET_OPEN_TIME <= now <= self.MARKET_CLOSE_TIME
+
+    # ==================== NXT 시간대 체크 ====================
+    def is_nxt_premarket(self):
+        """NXT 프리마켓 시간인지 확인 (08:00 ~ 08:50)"""
+        return is_premarket()
+
+    def is_nxt_aftermarket(self):
+        """NXT 애프터마켓 시간인지 확인 (15:40 ~ 20:00)"""
+        return is_aftermarket()
+
+    def is_nxt_trading_hours(self):
+        """NXT 장시간외(프리마켓 또는 애프터마켓)인지 확인"""
+        return is_extended_hours()
+
+    def is_regular_trading_hours(self):
+        """정규장 시간인지 확인 (09:00 ~ 15:30)"""
+        return is_regular_market()
+
+    def get_current_market_type(self):
+        """
+        현재 시장 타입 반환
+
+        Returns:
+            "NXT_PREMARKET" | "REGULAR" | "NXT_AFTERMARKET" | "CLOSED"
+        """
+        return get_market_type()
+
+    def _check_market_transition(self):
+        """시장 시간 전환 감지 -> 주문 복원 재실행 + NXT 실시간 등록 갱신"""
+        try:
+            current_type = self.get_current_market_type()
+            if self._last_market_type is None:
+                self._last_market_type = current_type
+                return
+
+            if current_type != self._last_market_type:
+                self.log(f"시장 전환 감지: {self._last_market_type} -> {current_type}", "INFO")
+                self._last_market_type = current_type
+
+                # NXT 실시간 등록 갱신 (NXT 진입 시 등록, 종료 시 해제)
+                if self.event_engine:
+                    try:
+                        watchlist = self.config.get_watchlist()
+                        watchlist_codes = [item["code"] for item in watchlist] if watchlist else []
+                        positions = self.config.get("positions") or {}
+                        priority_codes = [c for c, p in positions.items() if p.get("quantity", 0) > 0]
+                        self.event_engine.refresh_realtime(watchlist_codes, priority_codes)
+                    except Exception as e:
+                        self.log(f"NXT 실시간 등록 갱신 오류: {e}", "ERROR")
+
+                # NXT 시간대 진입 시 pending_orders is_nxt 플래그 초기화 + 실패 이력 초기화
+                if current_type in ("NXT_PREMARKET", "NXT_AFTERMARKET"):
+                    self._nxt_failed_codes.clear()
+                    self._clear_pending_orders_nxt_flags()
+
+                if current_type in ("REGULAR", "NXT_PREMARKET", "NXT_AFTERMARKET"):
+                    # 장 전환 시 기존 미체결 주문 전부 취소 후 새 시장에 맞게 복원
+                    cancelled = self._cancel_all_open_orders()
+                    self.orders_restored = False
+                    self.config.set_orders_restored(False)
+                    if cancelled > 0:
+                        # 취소 처리 반영 대기 후 복원 (3초)
+                        QTimer.singleShot(3000, self.check_and_restore_orders)
+                    else:
+                        self.check_and_restore_orders()
+        except Exception as e:
+            self.log(f"시장 전환 감지 오류: {e}", "ERROR")
+
+    def is_any_trading_time(self):
+        """어떤 형태로든 거래 가능한 시간인지 확인 (정규장 또는 장시간외)"""
+        return self.get_current_market_type() in ("REGULAR", "NXT_PREMARKET", "NXT_AFTERMARKET")
 
     # ==================== 이벤트 콜백 ====================
     def _on_realtime_price_enqueue(self, code, price):
@@ -221,8 +408,10 @@ class AutoTrader:
 
             intents = self._evaluate_intents(code, price, candles)
             for intent in intents:
+                intent_type = intent.get("type")
+                target_q = self.urgent_order_queue if intent_type in ("stoploss", "buy", "additional_buy") else self.order_queue
                 try:
-                    self.order_queue.put_nowait(intent)
+                    target_q.put_nowait(intent)
                 except queue.Full:
                     break
 
@@ -232,28 +421,45 @@ class AutoTrader:
         try:
             position = self.config.get_position(code)
 
-            # 0) 스탑로스 주문 유지(필요 시)
-            intents.append({"type": "ensure_stoploss", "code": code, "position": position})
+            # ensure 인텐트 스로틀 체크 (동일 종목에 대해 _ensure_throttle_sec 내 중복 방지)
+            now = time.time()
+            last_ensure = self._last_ensure_ts.get(code, 0.0)
+            ensure_allowed = (now - last_ensure) >= self._ensure_throttle_sec
 
-            # 1) 스탑로스 발동 조건 (현재가 <= 평단가+1호가 → 평단가에 지정가 매도)
+            # 0) 스탑로스 주문 유지(필요 시) — 스로틀 적용
+            if ensure_allowed:
+                intents.append({"type": "ensure_stoploss", "code": code, "position": position})
+
+            # 1) 스탑로스 발동 조건 (현재가 <= 평단가+1호가 → 평단가에 지정가 매도) — 항상 즉시
             if position and position.get("quantity", 0) > 0:
                 if self._should_trigger_stoploss(code, current_price, position):
                     intents.append({"type": "stoploss", "code": code, "price": current_price, "position": position})
                     return intents  # 스탑로스 최우선
 
-            # 2) 보유 종목 매도 주문 보정
+            # 2) 보유 종목 매도 주문 보정 — 스로틀 적용
             if position and position.get("quantity", 0) > 0:
-                intents.append({"type": "ensure_sell", "code": code, "position": position, "candles": candles})
+                if ensure_allowed:
+                    intents.append({"type": "ensure_sell", "code": code, "position": position, "candles": candles})
 
-            # 2.5) 추가 매수 트리거 확인 (5호가 위 도달 시 지정가 매수)
+            # ensure 스로틀 타임스탬프 갱신
+            if ensure_allowed:
+                self._last_ensure_ts[code] = now
+
+            # 2.5) 추가 매수 트리거 확인 (5호가 위 도달 시 지정가 매수) — 항상 즉시
             if position and position.get("quantity", 0) > 0:
                 if not position.get("sell_occurred", False) and not position.get("stoploss_triggered", False):
                     additional_intent = self._check_additional_buy_trigger(code, current_price, position)
                     if additional_intent:
+                        t_price = additional_intent.get("target_price") or current_price
+                        if t_price > 0:
+                            buy_amount = self.config.get("buy", "buy_amount_per_stock")
+                            required = (buy_amount // t_price) * t_price
+                            if self._available_funds is not None and self._available_funds < required:
+                                self.log(f"[{code}] 예수금 부족 - 추가매수 스킵 (예수금: {self._available_funds:,}, 필요: {required:,})", "WARNING")
+                                return intents
                         intents.append(additional_intent)
 
-            # 3) 매수 신호 (후순위)
-            position = self.config.get_position(code)  # 갱신
+            # 3) 매수 신호 (후순위) — 항상 즉시
             if position and position.get("stoploss_triggered", False):
                 return intents
             if position and position.get("sell_occurred", False):
@@ -263,6 +469,12 @@ class AutoTrader:
             if buy_signal.get("signal"):
                 if buy_signal.get("buy_count") == 1 and not self._can_buy_new_stock():
                     return intents
+                if current_price > 0:
+                    buy_amount = self.config.get("buy", "buy_amount_per_stock")
+                    required = (buy_amount // current_price) * current_price
+                    if self._available_funds is not None and self._available_funds < required:
+                        self.log(f"[{code}] 예수금 부족 - 매수 스킵 (예수금: {self._available_funds:,}, 필요: {required:,})", "WARNING")
+                        return intents
                 intents.append({"type": "buy", "code": code, "price": current_price,
                                 "buy_signal": buy_signal, "candles": candles})
         except Exception as e:
@@ -270,76 +482,82 @@ class AutoTrader:
         return intents
 
     # ==================== 주문 큐 처리(메인 스레드) ====================
-    def process_order_queue(self, max_per_tick=1):
-        """메인(UI) 스레드에서 주기적으로 호출해 order_queue를 처리"""
+    def process_order_queue(self, max_per_tick=20):
+        """메인(UI) 스레드에서 주기적으로 호출해 order_queue를 처리
+        긴급 큐(stoploss/buy/additional_buy)를 먼저 처리한 후 유지보수 큐 처리"""
         if not self.is_running:
             return
         processed = 0
-        while processed < max_per_tick:
-            try:
-                intent = self.order_queue.get_nowait()
-            except Exception:
-                return
-
-            intent_type = intent.get("type")
-            code = intent.get("code")
-
-            # 추가 매수는 차수별로 고유 키 사용 (2차/3차 각각 중복 방지)
-            if intent_type == "additional_buy":
-                key = (code, f"additional_buy_{intent.get('buy_count', 0)}")
-            else:
-                key = (code, intent_type)
-
-            # 중복 방지(특히 buy/stoploss/additional_buy)
-            if intent_type in ("buy", "stoploss", "additional_buy"):
-                if key in self._pending_order_codes:
-                    continue
-                self._pending_order_codes.add(key)
-
-            # 주문 속도 제한
-            now = time.time()
-            if now - self._last_order_ts < self._order_min_interval:
-                # 다시 큐잉(슬립 금지)
+        # 긴급 큐 → 유지보수 큐 순서로 처리
+        for current_queue in (self.urgent_order_queue, self.order_queue):
+            while processed < max_per_tick:
                 try:
-                    self.order_queue.put_nowait(intent)
+                    intent = current_queue.get_nowait()
                 except Exception:
-                    pass
-                if key in self._pending_order_codes and intent_type in ("buy", "stoploss", "additional_buy"):
-                    self._pending_order_codes.discard(key)
-                return
+                    break  # 현재 큐 소진 → 다음 큐로
 
-            try:
-                if intent_type == "ensure_stoploss":
-                    self._ensure_stoploss_order_if_needed(code, intent.get("position"))
-                elif intent_type == "ensure_sell":
-                    self._ensure_sell_orders_placed(code, intent.get("position"), intent.get("candles"))
-                elif intent_type == "stoploss":
-                    self._execute_stoploss(code, intent.get("price"), intent.get("position"))
-                elif intent_type == "buy":
-                    self._execute_buy(code, intent.get("price"), intent.get("buy_signal"), intent.get("candles"))
-                elif intent_type == "additional_buy":
-                    self._execute_additional_buy(
-                        code, intent.get("buy_count"),
-                        intent.get("target_price"), intent.get("position")
-                    )
+                intent_type = intent.get("type")
+                code = intent.get("code")
 
-                self._last_order_ts = time.time()
-            except Exception as e:
-                self.log(f"[{code}] 주문 처리 오류({intent_type}): {e}", "ERROR")
+                # 추가 매수는 차수별로 고유 키 사용 (2차/3차 각각 중복 방지)
+                if intent_type == "additional_buy":
+                    key = (code, f"additional_buy_{intent.get('buy_count', 0)}")
+                else:
+                    key = (code, intent_type)
+
+                # 중복 방지(특히 buy/stoploss/additional_buy)
+                if intent_type in ("buy", "stoploss", "additional_buy"):
+                    if key in self._pending_order_codes:
+                        continue
+                    self._pending_order_codes.add(key)
+
+                # 주문 속도 제한
+                now = time.time()
+                if now - self._last_order_ts < self._order_min_interval:
+                    # 다시 큐잉(슬립 금지)
+                    try:
+                        current_queue.put_nowait(intent)
+                    except Exception:
+                        pass
+                    if key in self._pending_order_codes and intent_type in ("buy", "stoploss", "additional_buy"):
+                        self._pending_order_codes.discard(key)
+                    return
+
                 try:
-                    self.order_queue.put_nowait(intent)
-                except Exception:
-                    pass
-                if key in self._pending_order_codes and intent_type in ("buy", "stoploss", "additional_buy"):
-                    self._pending_order_codes.discard(key)
+                    if intent_type == "ensure_stoploss":
+                        self._ensure_stoploss_order_if_needed(code, intent.get("position"))
+                    elif intent_type == "ensure_sell":
+                        self._ensure_sell_orders_placed(code, intent.get("position"), intent.get("candles"))
+                    elif intent_type == "stoploss":
+                        self._execute_stoploss(code, intent.get("price"), intent.get("position"))
+                    elif intent_type == "buy":
+                        self._execute_buy(code, intent.get("price"), intent.get("buy_signal"), intent.get("candles"))
+                    elif intent_type == "additional_buy":
+                        self._execute_additional_buy(
+                            code, intent.get("buy_count"),
+                            intent.get("target_price"), intent.get("position")
+                        )
 
-            processed += 1
+                    self._last_order_ts = time.time()
+                    # ✅ 성공 시 즉시 해제 → 다음 틱에서 동일 종목 재주문 가능
+                    if intent_type == "stoploss":
+                        self._pending_order_codes.discard(key)
+                except Exception as e:
+                    self.log(f"[{code}] 주문 처리 오류({intent_type}): {e}", "ERROR")
+                    try:
+                        current_queue.put_nowait(intent)
+                    except Exception:
+                        pass
+                    if key in self._pending_order_codes and intent_type in ("buy", "stoploss", "additional_buy"):
+                        self._pending_order_codes.discard(key)
+
+                processed += 1
 
     def _check_trading_conditions(self, code, current_price, candles):
         """
-        매매 조건 확인 (이벤트 엔진에서 호출)
+        매매 조건 확인 (보험용 타이머에서 호출)
 
-        ✅ 요구사항 반영:
+        ✅ 주문은 큐로만 적재 — process_order_queue()에서 실행
         - 우선순위: 스탑로스 > 매도 주문 유지/보정 > 매수 신호
         - 스탑로스 발동 종목은 추가 매수 차단
         - 매도가 한번이라도 발생하면 추가 매수 차단
@@ -347,50 +565,71 @@ class AutoTrader:
         try:
             position = self.config.get_position(code)
 
-            # 0) 스탑로스 유지 강제 (스탑로스가 한번이라도 발동된 보유종목은 항상 주문 유지)
-            self._ensure_stoploss_order_if_needed(code, position)
+            # 0) 스탑로스 유지 강제
+            try:
+                self.order_queue.put_nowait({"type": "ensure_stoploss", "code": code, "position": position})
+            except queue.Full:
+                pass
 
-            # 1) 스탑로스 조건 체크 (매도 이력 존재 + 현재가 <= 평단가+1호가)
+            # 1) 스탑로스 조건 체크 → 긴급 큐
             if position and position.get("quantity", 0) > 0:
-                # 스탑로스 조건: 첫 매도 발생 후 현재가가 평단가+1호가 이하로 떨어지면 평단가에 스탑로스 발동
                 if self._should_trigger_stoploss(code, current_price, position):
-                    self._execute_stoploss(code, current_price, position)
+                    try:
+                        self.urgent_order_queue.put_nowait({"type": "stoploss", "code": code, "price": current_price, "position": position})
+                    except queue.Full:
+                        pass
                     return
 
-            # 2) 보유 종목에 대해 매도 주문이 모두 걸려있는지 확인/보정
+            # 2) 보유 종목에 대해 매도 주문이 모두 걸려있는지 확인/보정 → 유지보수 큐
             if position and position.get("quantity", 0) > 0:
-                self._ensure_sell_orders_placed(code, position, candles)
+                try:
+                    self.order_queue.put_nowait({"type": "ensure_sell", "code": code, "position": position, "candles": candles})
+                except queue.Full:
+                    pass
 
-            # 2.5) 추가 매수 트리거 확인 (5호가 위 도달 시 지정가 매수)
+            # 2.5) 추가 매수 트리거 확인 → 긴급 큐
             if position and position.get("quantity", 0) > 0:
                 if not position.get("sell_occurred", False) and not position.get("stoploss_triggered", False):
                     additional_intent = self._check_additional_buy_trigger(code, current_price, position)
                     if additional_intent:
-                        buy_count = additional_intent["buy_count"]
-                        target_price = additional_intent["target_price"]
-                        self._execute_additional_buy(code, buy_count, target_price, position)
+                        t_price = additional_intent.get("target_price") or current_price
+                        if t_price > 0:
+                            buy_amount = self.config.get("buy", "buy_amount_per_stock")
+                            required = (buy_amount // t_price) * t_price
+                            if self._available_funds is not None and self._available_funds < required:
+                                self.log(f"[{code}] 예수금 부족 - 추가매수 스킵 (예수금: {self._available_funds:,}, 필요: {required:,})", "WARNING")
+                                return
+                        try:
+                            self.urgent_order_queue.put_nowait(additional_intent)
+                        except queue.Full:
+                            pass
                         return
 
-            # 3) 매수 신호 확인 (매도보다 후순위)
-            position = self.config.get_position(code)  # 갱신
-
-            # ✅ 스탑로스 발동 이력이 있으면 추가 매수 차단
+            # 3) 매수 신호 확인 (매도보다 후순위) → 긴급 큐
             if position and position.get("stoploss_triggered", False):
                 return
-
-            # ✅ 매도가 한번이라도 발생했으면 추가 매수 차단
             if position and position.get("sell_occurred", False):
                 return
 
             buy_signal = self.signal.check_buy_signal(code, current_price, candles, position)
 
             if buy_signal.get("signal"):
-                # 신규 매수인 경우 최대 보유 종목수 체크
                 if buy_signal.get("buy_count") == 1:
                     if not self._can_buy_new_stock():
                         return
 
-                self._execute_buy(code, current_price, buy_signal, candles)
+                if current_price > 0:
+                    buy_amount = self.config.get("buy", "buy_amount_per_stock")
+                    required = (buy_amount // current_price) * current_price
+                    if self._available_funds is not None and self._available_funds < required:
+                        self.log(f"[{code}] 예수금 부족 - 매수 스킵 (예수금: {self._available_funds:,}, 필요: {required:,})", "WARNING")
+                        return
+
+                try:
+                    self.urgent_order_queue.put_nowait({"type": "buy", "code": code, "price": current_price,
+                                                 "buy_signal": buy_signal, "candles": candles})
+                except queue.Full:
+                    pass
 
         except Exception as e:
             self.log(f"[{code}] 매매 조건 확인 오류: {e}", "ERROR")
@@ -437,6 +676,11 @@ class AutoTrader:
         - 체결될 때까지 유지
         """
         try:
+            # ✅ 최신 포지션 재조회 (큐 적재 시점과 실행 시점 사이 상태 변경 반영)
+            position = self.config.get_position(code) or position
+            if position.get("stoploss_triggered", False):
+                return  # 이미 스탑로스 처리됨 — 중복 실행 방지
+
             total_quantity = position.get("quantity", 0)
             if total_quantity <= 0:
                 return
@@ -453,7 +697,9 @@ class AutoTrader:
 
             stock_name = position.get("name", code)
             tick = self._get_tick_size(int(avg_price))
-            self.log(f"[{code} {stock_name}] 스탑로스 발동: 현재가({current_price:,}) <= 평단가+1호가({int(avg_price) + tick:,}) → 평단가({stoploss_price:,})에 지정가 매도", "WARNING")
+            is_nxt = self.is_nxt_trading_hours()
+            market_type = "NXT" if is_nxt else "KRX"
+            self.log(f"[{code} {stock_name}] 스탑로스 발동 ({market_type}): 현재가({current_price:,}) <= 평단가+1호가({int(avg_price) + tick:,}) → 평단가({stoploss_price:,})에 지정가 매도", "WARNING")
 
             # 1) 해당 종목의 모든 미체결 주문 취소 (매수 + 기존 매도)
             try:
@@ -488,19 +734,54 @@ class AutoTrader:
                 "target_name": "스탑로스",
                 "sell_ratio": 100,
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "is_nxt": is_nxt,
                 "persist": True
             })
 
-            # 6) 주문 전송 (지정가)
-            result = self._send_sell_with_retry(code, total_quantity, stoploss_price)
+            # 6) 주문 전송 (지정가) - NXT 큐 기반 / KRX 자동 분기
+            stoploss_info = {
+                "code": code, "quantity": total_quantity, "price": stoploss_price,
+                "market_type": market_type, "is_nxt": is_nxt
+            }
 
-            if result == 0:
-                self.log(f"[{code}] 스탑로스 지정가 매도 주문 전송 성공: {total_quantity}주 @ {stoploss_price:,}원", "SUCCESS")
+            if is_nxt:
+                # ✅ NXT 큐 기반 스탑로스 매도
+                if self._is_nxt_order_blocked(code):
+                    self.log(f"[{code}] NXT 주문 차단 종목 - 스탑로스 KRX 대기 등록", "WARNING")
+                    return
+                self.kiwoom.sell_stock_nxt_queued(
+                    self.account, code, total_quantity, stoploss_price,
+                    callback=lambda result, _, info=stoploss_info: self._on_stoploss_order_result(result, info),
+                    priority=True
+                )
             else:
-                self.log(f"[{code}] 스탑로스 지정가 매도 주문 실패: 에러코드 {result}", "ERROR")
+                # KRX 큐 기반 스탑로스 매도 (비동기, 블로킹 제거)
+                self.kiwoom.sell_stock_queued(
+                    self.account, code, total_quantity, stoploss_price,
+                    callback=lambda result, _, info=stoploss_info: self._on_stoploss_order_result(result, info),
+                    priority=True
+                )
 
         except Exception as e:
             self.log(f"[{code}] 스탑로스 실행 중 오류: {e}", "ERROR")
+
+    def _on_stoploss_order_result(self, result, info):
+        """✅ 스탑로스 주문 결과 처리 (NXT 큐 콜백 / KRX 동기 공용)"""
+        try:
+            code = info["code"]
+            quantity = info["quantity"]
+            price = info["price"]
+            market_type = info["market_type"]
+            is_nxt = info["is_nxt"]
+
+            if result == 0:
+                self.log(f"[{code}] 스탑로스 지정가 매도 주문 전송 성공 ({market_type}): {quantity}주 @ {price:,}원", "SUCCESS")
+            else:
+                if is_nxt:
+                    self._mark_nxt_order_failed(code)
+                self.log(f"[{code}] 스탑로스 지정가 매도 주문 실패 ({market_type}): 에러코드 {result}", "ERROR")
+        except Exception as e:
+            self.log(f"[{info.get('code', '?')}] 스탑로스 결과 처리 오류: {e}", "ERROR")
 
     def _can_buy_new_stock(self):
         """신규 종목 매수 가능 여부 확인 (최대 보유 종목수 체크)"""
@@ -514,11 +795,10 @@ class AutoTrader:
         """
         ✅ 보유 종목에 대해 모든 매도 주문이 걸려있는지 확인하고 없으면 걸기
 
-        요구사항: 매수 체결 시점에 바로 모든 매도 주문(익절1~3 + 20일선)이 걸려있어야 함
-        - 평단가 +2.95%에 30%
-        - 평단가 +4.95%에 30%
-        - 평단가 +6.95%에 30%
-        - 20일선 가격에 나머지 10%
+        요구사항: 매수 체결 시점에 바로 모든 매도 주문이 걸려있어야 함
+
+        자동매수: 익절1~3 (30/30/30) + 20일선 (10%)
+        수동매수: 익절1~3 (30/40/30), 20일선 매도 없음
         """
         if not position or position.get("quantity", 0) <= 0:
             return
@@ -544,13 +824,18 @@ class AutoTrader:
         if initial_qty <= 0:
             initial_qty = current_qty
 
-        # 20일선 가격 계산
-        period = 20
-        ma20 = self.ta.get_ma_from_candles(candles, period)
+        # 수동매수 여부 확인
+        is_manual_buy = position.get("is_manual_buy", False)
+
+        # 20일선 가격 계산 (수동매수는 20일선 매도 없으므로 None)
+        ma20 = None
+        if not is_manual_buy:
+            period = 20
+            ma20 = self.ta.get_ma_from_candles(candles, period)
 
         # 매도 주문 계획 생성
         sell_orders_to_place = self._calculate_sell_orders(
-            avg_price, initial_qty, current_qty, ma20, sold_targets
+            avg_price, initial_qty, current_qty, ma20, sold_targets, is_manual_buy=is_manual_buy
         )
 
         # 주문 걸기 (큐 기반 - 에러코드 -308 방지)
@@ -565,30 +850,39 @@ class AutoTrader:
             if target_name in sold_targets:
                 continue
 
-            # 장 시간 외면 주문 걸지 않음 (저장만)
-            if not self.is_market_open():
+            # 거래 가능 시간 체크 (정규장 또는 장시간외)
+            if not self.is_any_trading_time():
                 self.config.save_pending_order(code, {
                     "order_type": "sell",
                     "quantity": order["quantity"],
                     "price": order["price"],
                     "target_name": target_name,
                     "sell_ratio": order.get("sell_ratio", 0),
-                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "is_nxt": self.is_nxt_trading_hours()
                 })
                 continue
 
-            # 주문 전송 (큐 기반 - 콜백으로 결과 처리)
+            # 주문 전송 (큐 기반 - NXT/KRX 자동 분기)
+            is_nxt = self.is_nxt_trading_hours()
             order_info = {
                 "code": code,
                 "target_name": target_name,
                 "quantity": order["quantity"],
                 "price": order["price"],
-                "sell_ratio": order.get("sell_ratio", 0)
+                "sell_ratio": order.get("sell_ratio", 0),
+                "is_nxt": is_nxt
             }
-            self.kiwoom.sell_stock_queued(
-                self.account, code, order["quantity"], order["price"],
-                callback=lambda result, _, info=order_info: self._on_sell_order_result(result, info)
-            )
+            if is_nxt:
+                self.kiwoom.sell_stock_nxt_queued(
+                    self.account, code, order["quantity"], order["price"],
+                    callback=lambda result, _, info=order_info: self._on_sell_order_result(result, info)
+                )
+            else:
+                self.kiwoom.sell_stock_queued(
+                    self.account, code, order["quantity"], order["price"],
+                    callback=lambda result, _, info=order_info: self._on_sell_order_result(result, info)
+                )
             # 주문 요청 즉시 placed_sell_orders에 등록 (중복 방지)
             self.placed_sell_orders[code][target_name] = True
 
@@ -616,13 +910,17 @@ class AutoTrader:
                 "price": price,
                 "target_name": target_name,
                 "sell_ratio": sell_ratio,
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "is_nxt": order_info.get("is_nxt", False)
             })
         else:
             self.log(f"[{code}] {target_name} 매도 주문 실패: 에러코드 {result}", "ERROR")
             # 실패 시 placed_sell_orders에서 제거 (재시도 가능하도록)
             if code in self.placed_sell_orders:
                 self.placed_sell_orders[code].pop(target_name, None)
+            # ✅ NXT 실패 종목 차단 등록
+            if order_info.get("is_nxt", False):
+                self._mark_nxt_order_failed(code)
 
     def _on_buy_restore_result(self, result, restore_info):
         """
@@ -632,11 +930,25 @@ class AutoTrader:
         buy_count = restore_info["buy_count"]
         quantity = restore_info["quantity"]
         price = restore_info["price"]
+        is_nxt = bool(restore_info.get("is_nxt", False))
 
         if result == 0:
             self.log(f"[{code}] {buy_count}차 매수 주문 복원: {quantity}주 @ {price:,}원", "SUCCESS")
         else:
             self.log(f"[{code}] 매수 주문 복원 실패: 에러코드 {result}", "ERROR")
+            if is_nxt:
+                # ✅ NXT 실패 종목 차단 등록
+                self._mark_nxt_order_failed(code)
+                # NXT 복원 실패 시: pending_orders에서 제거 후 KRX 복원 대상으로 재등록
+                self.config.remove_pending_order(code, order_type="buy", price=price, buy_count=buy_count)
+                self.config.save_pending_order(code, {
+                    "order_type": "buy",
+                    "quantity": quantity,
+                    "price": price,
+                    "buy_count": buy_count,
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "is_nxt": False
+                })
 
     def _on_sell_restore_result(self, result, restore_info):
         """
@@ -646,29 +958,56 @@ class AutoTrader:
         target_name = restore_info["target_name"]
         quantity = restore_info["quantity"]
         price = restore_info["price"]
+        is_nxt = bool(restore_info.get("is_nxt", False))
 
         if result == 0:
             self.log(f"[{code}] {target_name} 매도 주문 복원: {quantity}주 @ {price:,}원", "SUCCESS")
         else:
             self.log(f"[{code}] 매도 주문 복원 실패: 에러코드 {result}", "ERROR")
+            if is_nxt:
+                # ✅ NXT 실패 종목 차단 등록
+                self._mark_nxt_order_failed(code)
+                # NXT 복원 실패 시: pending_orders에서 제거 후 KRX 복원 대상으로 재등록
+                self.config.remove_pending_order(code, order_type="sell", price=price)
+                self.config.save_pending_order(code, {
+                    "order_type": "sell",
+                    "quantity": quantity,
+                    "price": price,
+                    "target_name": target_name,
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "is_nxt": False
+                })
 
-    def _calculate_sell_orders(self, avg_price, initial_qty, current_qty, ma20, sold_targets):
+    def _calculate_sell_orders(self, avg_price, initial_qty, current_qty, ma20, sold_targets, is_manual_buy=False):
         """
         ✅ 매도 주문 계획 계산
 
-        전체물량 기준:
+        자동매수 전체물량 기준:
         - 익절1 (+2.95%): 30%
         - 익절2 (+4.95%): 30%
         - 익절3 (+6.95%): 30%
         - 20일선: 나머지 10%
+
+        수동매수 전체물량 기준:
+        - 익절1 (+2.95%): 30%
+        - 익절2 (+4.95%): 40%
+        - 익절3 (+6.95%): 30%
+        - 20일선: 없음
         """
         orders = []
 
-        # 비중 계산 (초기 수량 기준)
-        q1 = int(initial_qty * 0.30)  # 30%
-        q2 = int(initial_qty * 0.30)  # 30%
-        q3 = int(initial_qty * 0.30)  # 30%
-        q_ma = initial_qty - q1 - q2 - q3  # 나머지 (약 10%)
+        if is_manual_buy:
+            # ✅ 수동매수: [30, 40, 30] 비중, 20일선 매도 없음
+            q1 = int(initial_qty * 0.30)  # 30%
+            q2 = int(initial_qty * 0.40)  # 40%
+            q3 = initial_qty - q1 - q2    # 나머지 (약 30%)
+            ratios = [30, 40, 30]
+        else:
+            # 자동매수: [30, 30, 30] 비중 + 20일선 10%
+            q1 = int(initial_qty * 0.30)  # 30%
+            q2 = int(initial_qty * 0.30)  # 30%
+            q3 = int(initial_qty * 0.30)  # 30%
+            ratios = [30, 30, 30]
 
         # 최소 1주 보장
         if q1 <= 0:
@@ -677,8 +1016,6 @@ class AutoTrader:
             q2 = 1
         if q3 <= 0:
             q3 = 1
-        if q_ma <= 0:
-            q_ma = 1
 
         # 이미 체결된 타겟들의 수량을 현재 수량에서 제외하여 계산
         used_qty = 0
@@ -691,7 +1028,7 @@ class AutoTrader:
                     "target_name": "익절1",
                     "quantity": min(q1, current_qty - used_qty),
                     "price": price1,
-                    "sell_ratio": 30
+                    "sell_ratio": ratios[0]
                 })
                 used_qty += min(q1, current_qty - used_qty)
 
@@ -703,7 +1040,7 @@ class AutoTrader:
                     "target_name": "익절2",
                     "quantity": min(q2, current_qty - used_qty),
                     "price": price2,
-                    "sell_ratio": 30
+                    "sell_ratio": ratios[1]
                 })
                 used_qty += min(q2, current_qty - used_qty)
 
@@ -715,12 +1052,15 @@ class AutoTrader:
                     "target_name": "익절3",
                     "quantity": min(q3, current_qty - used_qty),
                     "price": price3,
-                    "sell_ratio": 30
+                    "sell_ratio": ratios[2]
                 })
                 used_qty += min(q3, current_qty - used_qty)
 
-        # 20일선: 나머지
-        if ma20 and "20일선" not in sold_targets:
+        # 20일선: 나머지 (수동매수는 20일선 매도 없음)
+        if not is_manual_buy and ma20 and "20일선" not in sold_targets:
+            q_ma = initial_qty - int(initial_qty * 0.30) * 3  # 나머지 (약 10%)
+            if q_ma <= 0:
+                q_ma = 1
             remaining = current_qty - used_qty
             if remaining > 0:
                 ma_price = self._ceil_to_tick(ma20)
@@ -813,30 +1153,66 @@ class AutoTrader:
                     self.log(f"[{code}] 이전 매도 이력 존재 - 당일 재매수 차단", "WARNING")
                     return
 
+            # ✅ 이미 1차 매수 포지션이 있으면 중복 매수 차단 (큐 중복 방지)
+            if buy_count == 1 and position and position.get("quantity", 0) > 0:
+                return
+
             buy_amount = self.config.get("buy", "buy_amount_per_stock")
             quantity = buy_amount // buy_price
             if quantity <= 0:
                 self.log(f"[{code}] 매수 수량이 0입니다. (매수금액: {buy_amount:,}, 매수가: {buy_price:,})", "WARNING")
                 return
 
-            stock_name = self.kiwoom.get_master_code_name(code)
-            self.log(f"[{code} {stock_name}] 매수 신호 발생: {reason}")
+            stock_name = self.kiwoom.get_stock_name_from_cache(code)
+            is_nxt = self.is_nxt_trading_hours()
+            market_type = "NXT" if is_nxt else "KRX"
 
-            # 주문 실패 시 재시도 로직
-            retry_count = self.config.get("error_handling", "order_retry_count") or 3
-            retry_interval = (self.config.get("error_handling", "order_retry_interval_ms") or 1000) / 1000.0
+            # ✅ NXT 주문 차단 종목 체크
+            if is_nxt and self._is_nxt_order_blocked(code):
+                self.log(f"[{code}] NXT 주문 차단 종목 - 매수 스킵", "WARNING")
+                return
 
-            result = -1
-            for attempt in range(retry_count):
-                result = self.kiwoom.buy_stock(self.account, code, quantity, buy_price)
-                if result == 0:
-                    break
-                if attempt < retry_count - 1:
-                    self.log(f"[{code}] 매수 주문 재시도 {attempt + 2}/{retry_count}", "WARNING")
-                    time.sleep(retry_interval)
+            self.log(f"[{code} {stock_name}] 매수 신호 발생 ({market_type}): {reason}")
+
+            # 주문 결과 처리용 정보
+            buy_info = {
+                "code": code, "stock_name": stock_name, "buy_count": buy_count,
+                "quantity": quantity, "price": buy_price, "ma20": ma20,
+                "is_nxt": is_nxt, "market_type": market_type
+            }
+
+            if is_nxt:
+                # ✅ NXT 큐 기반 매수 (비동기 콜백)
+                self.kiwoom.buy_stock_nxt_queued(
+                    self.account, code, quantity, buy_price,
+                    callback=lambda result, _, info=buy_info: self._on_auto_buy_result(result, info),
+                    priority=True
+                )
+            else:
+                # KRX 큐 기반 매수 (비동기, 블로킹 제거)
+                self.kiwoom.buy_stock_queued(
+                    self.account, code, quantity, buy_price,
+                    callback=lambda result, _, info=buy_info: self._on_auto_buy_result(result, info),
+                    priority=True
+                )
+
+        except Exception as e:
+            self.log(f"[{code}] 매수 실행 중 오류: {e}", "ERROR")
+
+    def _on_auto_buy_result(self, result, info):
+        """✅ 자동매수 주문 결과 처리 (NXT 큐 콜백 / KRX 동기 공용)"""
+        try:
+            code = info["code"]
+            stock_name = info["stock_name"]
+            buy_count = info["buy_count"]
+            quantity = info["quantity"]
+            buy_price = info["price"]
+            ma20 = info["ma20"]
+            is_nxt = info["is_nxt"]
+            market_type = info["market_type"]
 
             if result == 0:
-                self.log(f"[{code}] {buy_count}차 매수 주문 전송 성공: {quantity}주 @ {buy_price:,}원 (지정가)", "SUCCESS")
+                self.log(f"[{code}] {buy_count}차 매수 주문 전송 성공 ({market_type}): {quantity}주 @ {buy_price:,}원 (지정가)", "SUCCESS")
 
                 # 미체결 매수 주문 추적 (메모리)
                 if code not in self.pending_buy_orders:
@@ -855,7 +1231,8 @@ class AutoTrader:
                     "price": buy_price,
                     "buy_count": buy_count,
                     "ma20": ma20,
-                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "is_nxt": is_nxt
                 })
 
                 # 포지션 정보 기록 (체결 전 임시 기록)
@@ -871,35 +1248,33 @@ class AutoTrader:
                         "buy_count": buy_count,
                         "last_buy_price": buy_price,
                         "target_buy_price": buy_price,
-                        "first_buy_price": buy_price,  # ✅ 1차 매수가 저장 (2차/3차 계산용)
+                        "first_buy_price": buy_price,
                         "ma20": ma20,
                         "sold_targets": [],
                         "sell_occurred": False,
-                        # ✅ 초기 수량 (전체물량 기준 비중 계산용) - 체결 시 업데이트됨
                         "initial_quantity": 0,
-                        # 스탑로스 유지용 상태
                         "stoploss_triggered": False,
                         "stoploss_price": 0,
+                        "is_nxt_order": is_nxt,
+                        "nxt_buy_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S") if is_nxt else "",
                         "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
                     self.config.update_position(code, new_position)
-
-                    # ✅ 1차 매수 시 2차/3차 매수 대상가 및 트리거 가격 설정
-                    # (실시간 가격이 트리거에 도달하면 그때 주문)
                     self._setup_additional_buy_targets(code, buy_price)
-
                 else:
                     position["buy_count"] = buy_count
                     position["last_buy_price"] = buy_price
                     position["target_buy_price"] = buy_price
                     position["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self.config.update_position(code, position)
-
             else:
-                self.log(f"[{code}] 매수 주문 실패 (재시도 {retry_count}회 후): 에러코드 {result}", "ERROR")
-
+                # 주문 실패 시 pending 해제
+                self._clear_pending_key(code, "buy")
+                if is_nxt:
+                    self._mark_nxt_order_failed(code)
+                self.log(f"[{code}] 매수 주문 실패 ({market_type}): 에러코드 {result}", "ERROR")
         except Exception as e:
-            self.log(f"[{code}] 매수 실행 중 오류: {e}", "ERROR")
+            self.log(f"[{info.get('code', '?')}] 매수 결과 처리 오류: {e}", "ERROR")
 
     def _setup_additional_buy_targets(self, code, first_buy_price):
         """
@@ -1027,6 +1402,11 @@ class AutoTrader:
                 self.log(f"[{code}] 스탑로스 발동으로 {buy_count}차 추가 매수 차단", "WARNING")
                 return
 
+            # ✅ 동일 차수 추가 매수 이미 주문 전송됨 → 중복 방지 (큐 중복 방지)
+            if code in self.pending_buy_orders:
+                if any(o.get("buy_count") == buy_count for o in self.pending_buy_orders[code]):
+                    return
+
             buy_amount = self.config.get("buy", "buy_amount_per_stock")
             quantity = buy_amount // target_price
             if quantity <= 0:
@@ -1034,23 +1414,52 @@ class AutoTrader:
                 return
 
             ma20 = position.get("ma20", 0)
+            is_nxt = self.is_nxt_trading_hours()
+            market_type = "NXT" if is_nxt else "KRX"
 
-            # 주문 실행 (재시도 포함)
-            retry_count = self.config.get("error_handling", "order_retry_count") or 3
-            retry_interval = (self.config.get("error_handling", "order_retry_interval_ms") or 1000) / 1000.0
+            # ✅ NXT 주문 차단 종목 체크
+            if is_nxt and self._is_nxt_order_blocked(code):
+                self.log(f"[{code}] NXT 주문 차단 종목 - {buy_count}차 추가 매수 스킵", "WARNING")
+                return
 
-            result = -1
-            for attempt in range(retry_count):
-                result = self.kiwoom.buy_stock(self.account, code, quantity, target_price)
-                if result == 0:
-                    break
-                if attempt < retry_count - 1:
-                    self.log(f"[{code}] {buy_count}차 매수 주문 재시도 {attempt + 2}/{retry_count}", "WARNING")
-                    time.sleep(retry_interval)
+            add_buy_info = {
+                "code": code, "buy_count": buy_count, "quantity": quantity,
+                "price": target_price, "ma20": ma20,
+                "is_nxt": is_nxt, "market_type": market_type
+            }
+
+            if is_nxt:
+                # ✅ NXT 큐 기반 추가 매수 (비동기 콜백)
+                self.kiwoom.buy_stock_nxt_queued(
+                    self.account, code, quantity, target_price,
+                    callback=lambda result, _, info=add_buy_info: self._on_additional_buy_result(result, info),
+                    priority=True
+                )
+            else:
+                # KRX 큐 기반 추가 매수 (비동기, 블로킹 제거)
+                self.kiwoom.buy_stock_queued(
+                    self.account, code, quantity, target_price,
+                    callback=lambda result, _, info=add_buy_info: self._on_additional_buy_result(result, info),
+                    priority=True
+                )
+
+        except Exception as e:
+            self.log(f"[{code}] {buy_count}차 추가 매수 실행 중 오류: {e}", "ERROR")
+
+    def _on_additional_buy_result(self, result, info):
+        """✅ 추가 매수 주문 결과 처리 (NXT 큐 콜백 / KRX 동기 공용)"""
+        try:
+            code = info["code"]
+            buy_count = info["buy_count"]
+            quantity = info["quantity"]
+            target_price = info["price"]
+            ma20 = info["ma20"]
+            is_nxt = info["is_nxt"]
+            market_type = info["market_type"]
 
             if result == 0:
                 self.log(
-                    f"[{code}] {buy_count}차 추가 매수 주문 전송 성공: "
+                    f"[{code}] {buy_count}차 추가 매수 주문 전송 성공 ({market_type}): "
                     f"{quantity}주 @ {target_price:,}원 (지정가, 트리거 도달)",
                     "SUCCESS"
                 )
@@ -1072,7 +1481,8 @@ class AutoTrader:
                     "price": target_price,
                     "buy_count": buy_count,
                     "ma20": ma20,
-                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "is_nxt": is_nxt
                 })
 
                 # 포지션 업데이트 - ordered 플래그 설정
@@ -1088,12 +1498,14 @@ class AutoTrader:
                 position["target_buy_price"] = target_price
                 position["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.config.update_position(code, position)
-
             else:
-                self.log(f"[{code}] {buy_count}차 추가 매수 주문 실패: 에러코드 {result}", "ERROR")
-
+                # 주문 실패 시 pending 해제
+                self._clear_pending_key(code, "additional_buy", buy_count)
+                if is_nxt:
+                    self._mark_nxt_order_failed(code)
+                self.log(f"[{code}] {buy_count}차 추가 매수 주문 실패 ({market_type}): 에러코드 {result}", "ERROR")
         except Exception as e:
-            self.log(f"[{code}] {buy_count}차 추가 매수 실행 중 오류: {e}", "ERROR")
+            self.log(f"[{info.get('code', '?')}] 추가 매수 결과 처리 오류: {e}", "ERROR")
 
     def _floor_to_tick(self, price):
         """호가 단위로 내림"""
@@ -1136,26 +1548,65 @@ class AutoTrader:
                 return
 
             stock_name = position.get("name", code)
-            self.log(f"[{code} {stock_name}] 매도 신호 발생: {reason}")
+            is_nxt = self.is_nxt_trading_hours()
+            market_type = "NXT" if is_nxt else "KRX"
 
-            # 주문 전송
-            result = self._send_sell_with_retry(code, sell_quantity, target_price)
+            # ✅ NXT 주문 차단 종목 체크
+            if is_nxt and self._is_nxt_order_blocked(code):
+                self.log(f"[{code}] NXT 주문 차단 종목 - 매도 스킵", "WARNING")
+                return
+
+            self.log(f"[{code} {stock_name}] 매도 신호 발생 ({market_type}): {reason}")
+
+            sell_info = {
+                "code": code, "target_name": target_name, "quantity": sell_quantity,
+                "price": target_price, "sell_ratio": sell_ratio,
+                "is_nxt": is_nxt, "market_type": market_type,
+                "position": position
+            }
+
+            if is_nxt:
+                # ✅ NXT 큐 기반 매도 (비동기 콜백)
+                self.kiwoom.sell_stock_nxt_queued(
+                    self.account, code, sell_quantity, target_price,
+                    callback=lambda result, _, info=sell_info: self._on_auto_sell_result(result, info)
+                )
+            else:
+                # KRX 큐 기반 매도 (비동기, 블로킹 제거)
+                self.kiwoom.sell_stock_queued(
+                    self.account, code, sell_quantity, target_price,
+                    callback=lambda result, _, info=sell_info: self._on_auto_sell_result(result, info)
+                )
+
+        except Exception as e:
+            self.log(f"[{code}] 매도 실행 중 오류: {e}", "ERROR")
+
+    def _on_auto_sell_result(self, result, info):
+        """✅ 자동매도 주문 결과 처리 (NXT 큐 콜백 / KRX 동기 공용)"""
+        try:
+            code = info["code"]
+            target_name = info["target_name"]
+            sell_quantity = info["quantity"]
+            target_price = info["price"]
+            sell_ratio = info["sell_ratio"]
+            is_nxt = info["is_nxt"]
+            market_type = info["market_type"]
+            position = info["position"]
 
             if result == 0:
                 price_str = f"{target_price:,}원 (지정가)" if target_price > 0 else "시장가"
-                self.log(f"[{code}] {target_name} 매도 주문 전송 성공: {sell_quantity}주 @ {price_str}", "SUCCESS")
+                self.log(f"[{code}] {target_name} 매도 주문 전송 성공 ({market_type}): {sell_quantity}주 @ {price_str}", "SUCCESS")
 
-                # 미체결 매도 주문 저장
                 self.config.save_pending_order(code, {
                     "order_type": "sell",
                     "quantity": sell_quantity,
                     "price": target_price,
                     "target_name": target_name,
                     "sell_ratio": sell_ratio,
-                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "is_nxt": is_nxt
                 })
 
-                # 상태 업데이트
                 sold_targets = position.get("sold_targets", [])
                 if target_name and target_name not in sold_targets:
                     sold_targets.append(target_name)
@@ -1164,31 +1615,68 @@ class AutoTrader:
                 position["sold_targets"] = sold_targets
                 position["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                # ✅ 매도 발생 시 미체결 매수주문 취소
                 self._cancel_pending_buy_orders(code)
-
                 self.config.update_position(code, position)
             else:
-                self.log(f"[{code}] 매도 주문 실패: 에러코드 {result}", "ERROR")
-
+                if is_nxt:
+                    self._mark_nxt_order_failed(code)
+                self.log(f"[{code}] 매도 주문 실패 ({market_type}): 에러코드 {result}", "ERROR")
         except Exception as e:
-            self.log(f"[{code}] 매도 실행 중 오류: {e}", "ERROR")
+            self.log(f"[{info.get('code', '?')}] 매도 결과 처리 오류: {e}", "ERROR")
 
-    def _send_sell_with_retry(self, code, quantity, price):
-        """매도 주문 재시도 공통"""
-        retry_count = self.config.get("error_handling", "order_retry_count") or 3
-        retry_interval = (self.config.get("error_handling", "order_retry_interval_ms") or 1000) / 1000.0
+    # ==================== 스마트 주문 (NXT/KRX 자동 분기) ====================
+    def _send_buy_smart(self, code, quantity, price, force_nxt=None):
+        """
+        스마트 매수 - 시간대에 따라 KRX/NXT 자동 선택
 
-        result = -1
-        for attempt in range(retry_count):
-            result = self.kiwoom.sell_stock(self.account, code, quantity, price)
-            if result == 0:
-                return 0
-            if attempt < retry_count - 1:
-                self.log(f"[{code}] 매도 주문 재시도 {attempt + 2}/{retry_count}", "WARNING")
-                time.sleep(retry_interval)
+        Args:
+            code: 종목코드
+            quantity: 수량
+            price: 가격
+            force_nxt: 강제 NXT 사용 여부 (None이면 자동 판단)
 
-        return result
+        Returns:
+            주문 결과 코드 (0=성공)
+        """
+        use_nxt = force_nxt if force_nxt is not None else self.is_nxt_trading_hours()
+        market_type = "NXT" if use_nxt else "KRX"
+
+        if use_nxt:
+            # NXT 주문: 재시도 없이 1회만 시도
+            result = self.kiwoom.buy_stock_nxt(self.account, code, quantity, price)
+            if result != 0:
+                self.log(f"[{code}] NXT 매수 주문 실패 (재시도 없음): 에러코드 {result}", "ERROR")
+            return result
+        else:
+            # KRX 주문: 1회 시도 (블로킹 재시도 제거)
+            return self.kiwoom.buy_stock(self.account, code, quantity, price)
+
+    def _send_sell_smart(self, code, quantity, price, force_nxt=None):
+        """
+        스마트 매도 - 시간대에 따라 KRX/NXT 자동 선택
+
+        Args:
+            code: 종목코드
+            quantity: 수량
+            price: 가격
+            force_nxt: 강제 NXT 사용 여부 (None이면 자동 판단)
+
+        Returns:
+            주문 결과 코드 (0=성공)
+        """
+        use_nxt = force_nxt if force_nxt is not None else self.is_nxt_trading_hours()
+        market_type = "NXT" if use_nxt else "KRX"
+
+        if use_nxt:
+            # NXT 주문: 재시도 없이 1회만 시도
+            result = self.kiwoom.sell_stock_nxt(self.account, code, quantity, price)
+            if result != 0:
+                self.log(f"[{code}] NXT 매도 주문 실패 (재시도 없음): 에러코드 {result}", "ERROR")
+            return result
+        else:
+            # KRX 주문: 1회 시도 (블로킹 재시도 제거)
+            return self.kiwoom.sell_stock(self.account, code, quantity, price)
+
 
     # ==================== 미체결 매수 취소 ====================
     def _cancel_pending_buy_orders(self, code):
@@ -1238,6 +1726,77 @@ class AutoTrader:
                 executed_qty = data["executed_quantity"]
                 executed_price = data["executed_price"]
                 order_type = data["order_type"]
+                order_no = str(data.get("order_no", "") or "")
+                order_status = str(data.get("status", "") or "")
+                order_price = int(data.get("order_price", 0) or 0)
+                order_quantity = int(data.get("order_quantity", 0) or 0)
+                remaining_quantity = int(data.get("remaining_quantity", 0) or 0)
+
+                # 주문 접수/체결 이벤트에서 order_no를 pending_orders에 반영 (매수/매도 식별 정확도 개선)
+                try:
+                    if order_no:
+                        pending_orders = self.config.get_pending_orders()
+                        orders = pending_orders.get(code, [])
+                        updated = False
+                        is_buy = ("+" in order_type) or ("매수" in order_type)
+                        for o in orders:
+                            if is_buy and o.get("order_type") != "buy":
+                                continue
+                            if (not is_buy) and o.get("order_type") != "sell":
+                                continue
+                            if o.get("order_no"):
+                                continue
+                            if order_price > 0 and int(o.get("price", 0) or 0) == order_price:
+                                if order_quantity and int(o.get("quantity", 0) or 0) == order_quantity:
+                                    o["order_no"] = order_no
+                                    updated = True
+                                    break
+                        if updated:
+                            self.config.set(pending_orders, "pending_orders")
+                except Exception:
+                    pass
+
+                # 미체결 주문 취소/거부 시 pending 해제 (재주문 허용)
+                try:
+                    is_buy = ("+" in order_type) or ("매수" in order_type)
+                    is_cancel = ("취소" in order_status) or ("거부" in order_status)
+                    is_filled_like = ("체결" in order_status) or ("완료" in order_status)
+                    status_known = is_cancel or is_filled_like or ("접수" in order_status) or ("확인" in order_status)
+                    # 부분체결 후 취소 포함: 잔량 0이면 pending 해제
+                    # order_status가 비정상이어도 잔량 0이면 안전하게 pending 해제 (재주문 허용)
+                    if is_buy and remaining_quantity == 0 and (is_cancel or is_filled_like or not status_known):
+                        pending_orders = self.config.get_pending_orders().get(code, [])
+                        matched_buy_count = None
+                        matched_price = None
+                        for order in pending_orders:
+                            if order.get("order_type") != "buy":
+                                continue
+                            if order_no and order.get("order_no") == order_no:
+                                matched_buy_count = int(order.get("buy_count", 1) or 1)
+                                matched_price = int(order.get("price", 0) or 0)
+                                break
+                            if order_price > 0 and int(order.get("price", 0) or 0) == order_price:
+                                if order_quantity and int(order.get("quantity", 0) or 0) == order_quantity:
+                                    matched_buy_count = int(order.get("buy_count", 1) or 1)
+                                    matched_price = int(order.get("price", 0) or 0)
+                                    break
+                        if matched_buy_count is not None:
+                            if matched_buy_count >= 2:
+                                self._clear_pending_key(code, "additional_buy", matched_buy_count)
+                            else:
+                                self._clear_pending_key(code, "buy")
+                            if matched_price is not None:
+                                # 메모리 pending 주문도 정리
+                                if code in self.pending_buy_orders:
+                                    self.pending_buy_orders[code] = [
+                                        o for o in self.pending_buy_orders[code]
+                                        if int(o.get("price", 0) or 0) != matched_price
+                                    ]
+                                    if not self.pending_buy_orders[code]:
+                                        del self.pending_buy_orders[code]
+                                self.config.remove_pending_order(code, order_type="buy", price=matched_price)
+                except Exception:
+                    pass
 
                 if executed_qty > 0:
                     is_buy = ("+" in order_type) or ("매수" in order_type)
@@ -1281,7 +1840,24 @@ class AutoTrader:
 
                             self.config.update_position(code, position)
 
-                        self.config.remove_pending_order(code, order_type="buy", price=executed_price)
+                        # 체결 발생 시 pending 해제 (완전 체결/취소 시점에만)
+                        if remaining_quantity == 0:
+                            order_buy_count = 1
+                            try:
+                                pending_orders = self.config.get_pending_orders().get(code, [])
+                                for order in pending_orders:
+                                    if order.get("order_type") == "buy" and int(order.get("price", 0)) == int(executed_price):
+                                        order_buy_count = int(order.get("buy_count", 1) or 1)
+                                        break
+                            except Exception:
+                                order_buy_count = 1
+
+                            if order_buy_count >= 2:
+                                self._clear_pending_key(code, "additional_buy", order_buy_count)
+                            else:
+                                self._clear_pending_key(code, "buy")
+
+                            self.config.remove_pending_order(code, order_type="buy", price=executed_price)
                         # ✅ 동기 TR 호출을 지연 실행 (콜백 내 QEventLoop 중첩 방지)
                         QTimer.singleShot(0, self._check_and_cancel_excess_orders)
 
@@ -1295,20 +1871,31 @@ class AutoTrader:
                             # 체결된 매도 주문의 target_name 찾기 (자동매도 여부 판단)
                             pending_orders = self.config.get_pending_orders().get(code, [])
                             for order in pending_orders:
-                                if order.get("order_type") == "sell" and int(order.get("price", 0)) == int(executed_price):
-                                    target_name = order.get("target_name", "")
-                                    if target_name:
-                                        is_auto_sell = True  # ✅ 자동매도
-                                        sold_targets = position.get("sold_targets", [])
-                                        if target_name not in sold_targets:
-                                            sold_targets.append(target_name)
-                                            position["sold_targets"] = sold_targets
-                                            position["sell_occurred"] = True
-                                            self.config.update_position(code, position)
-                                            self.log(f"[{code}] {target_name} 매도 체결 완료 (자동)", "SUCCESS")
+                                if order.get("order_type") != "sell":
+                                    continue
 
-                                            # ✅ 매도 발생 시 미체결 매수 주문 취소 (지연 실행)
-                                            QTimer.singleShot(0, partial(self._cancel_pending_buy_orders, code))
+                                # 1) 주문번호로 우선 매칭
+                                if order_no and order.get("order_no") == order_no:
+                                    target_name = order.get("target_name", "")
+                                # 2) 주문가/수량으로 매칭 (시장가/수동매도 오인 방지)
+                                elif order_price > 0 and int(order.get("price", 0) or 0) == order_price:
+                                    if order_quantity and int(order.get("quantity", 0) or 0) == order_quantity:
+                                        target_name = order.get("target_name", "")
+                                else:
+                                    target_name = ""
+
+                                if target_name:
+                                    is_auto_sell = True  # ✅ 자동매도
+                                    sold_targets = position.get("sold_targets", [])
+                                    if target_name not in sold_targets:
+                                        sold_targets.append(target_name)
+                                        position["sold_targets"] = sold_targets
+                                        position["sell_occurred"] = True
+                                        self.config.update_position(code, position)
+                                        self.log(f"[{code}] {target_name} 매도 체결 완료 (자동)", "SUCCESS")
+
+                                        # ✅ 매도 발생 시 미체결 매수 주문 취소 (지연 실행)
+                                        QTimer.singleShot(0, partial(self._cancel_pending_buy_orders, code))
                                     break
 
                             # placed_sell_orders에서 해당 타겟 제거
@@ -1366,6 +1953,11 @@ class AutoTrader:
                         position["initial_quantity"] = quantity
                         log_type = "초기" if not is_additional_buy else "갱신"
                         self.log(f"[{code}] {log_type} 수량 설정: {quantity}주", "INFO")
+
+                        # ✅ 수동매수 플래그 설정 (매도 비중 [30, 40, 30] 적용)
+                        if code in self._manual_buy_codes:
+                            position["is_manual_buy"] = True
+                            self.log(f"[{code}] 수동매수 종목 - 매도 비중 [30, 40, 30] 적용", "INFO")
 
                         # ✅ 매수 체결 후 매도 주문 설정 (새 수량 기준) - 지연 실행
                         # position은 dict이므로 copy하여 전달
@@ -1550,67 +2142,137 @@ class AutoTrader:
 
     # ==================== 수동 주문 ====================
     def manual_sell(self, code, quantity, price=0):
-        """수동 매도"""
+        """수동 매도 - NXT 큐 기반 장시간외 지원"""
         if not self.kiwoom or not self.kiwoom.is_connected():
             self.log("키움 API에 연결되어 있지 않습니다.", "ERROR")
             return False
         if not self.account:
             self.log("계좌가 설정되지 않았습니다.", "ERROR")
             return False
-        # ✅ 장 시간 체크
-        if not self.is_market_open():
-            self.log("장 시간이 아닙니다. 수동 매도 불가", "ERROR")
+        if not self.is_any_trading_time():
+            self.log("거래 가능 시간이 아닙니다. 수동 매도 불가", "ERROR")
             return False
         try:
-            stock_name = self.kiwoom.get_master_code_name(code)
+            stock_name = self.kiwoom.get_stock_name_from_cache(code)
+            is_nxt = self.is_nxt_trading_hours()
+            market_type = "NXT" if is_nxt else "KRX"
+
+            # ✅ NXT 주문 차단 종목 체크
+            if is_nxt and self._is_nxt_order_blocked(code):
+                self.log(f"[{code}] NXT 주문 차단 종목 - 수동 매도 불가", "ERROR")
+                return False
+
             price_str = f"{price:,}원" if price > 0 else "시장가"
-            self.log(f"[{code} {stock_name}] 수동 매도 주문: {quantity}주 @ {price_str}")
-            result = self.kiwoom.sell_stock(self.account, code, quantity, price)
-            if result == 0:
-                self.log(f"[{code}] 수동 매도 주문 전송 성공", "SUCCESS")
-                return True
-            self.log(f"[{code}] 수동 매도 주문 실패: 에러코드 {result}", "ERROR")
-            return False
+            self.log(f"[{code} {stock_name}] 수동 매도 주문 ({market_type}): {quantity}주 @ {price_str}")
+
+            if is_nxt:
+                # ✅ NXT 큐 기반 매도
+                manual_info = {"code": code, "market_type": market_type, "is_nxt": True, "action": "수동 매도"}
+                self.kiwoom.sell_stock_nxt_queued(
+                    self.account, code, quantity, price,
+                    callback=lambda result, _, info=manual_info: self._on_manual_order_result(result, info),
+                    priority=True
+                )
+                self.log(f"[{code}] 수동 매도 주문 큐 등록 완료 ({market_type})", "INFO")
+                return True  # 큐에 등록 성공
+            else:
+                result = self.kiwoom.sell_stock(self.account, code, quantity, price)
+                if result == 0:
+                    self.log(f"[{code}] 수동 매도 주문 전송 성공 ({market_type})", "SUCCESS")
+                    return True
+                self.log(f"[{code}] 수동 매도 주문 실패: 에러코드 {result}", "ERROR")
+                return False
         except Exception as e:
             self.log(f"수동 매도 중 오류: {e}", "ERROR")
             return False
 
     def manual_buy(self, code, quantity, price=0):
-        """수동 매수"""
+        """수동 매수 - NXT 큐 기반 장시간외 지원"""
         if not self.kiwoom or not self.kiwoom.is_connected():
             self.log("키움 API에 연결되어 있지 않습니다.", "ERROR")
             return False
         if not self.account:
             self.log("계좌가 설정되지 않았습니다.", "ERROR")
             return False
-        # ✅ 장 시간 체크
-        if not self.is_market_open():
-            self.log("장 시간이 아닙니다. 수동 매수 불가", "ERROR")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        market_type = self.get_current_market_type()
+        is_any = self.is_any_trading_time()
+        self.log(f"[DBG] 수동매수 시간 체크: now={now_str} market_type={market_type} is_any_trading_time={is_any}", "INFO")
+        if not self.is_any_trading_time():
+            self.log("거래 가능 시간이 아닙니다. 수동 매수 불가", "ERROR")
             return False
         try:
-            stock_name = self.kiwoom.get_master_code_name(code)
+            stock_name = self.kiwoom.get_stock_name_from_cache(code)
+            is_nxt = self.is_nxt_trading_hours()
+            market_type = "NXT" if is_nxt else "KRX"
+
+            # ✅ NXT 주문 차단 종목 체크
+            if is_nxt and self._is_nxt_order_blocked(code):
+                self.log(f"[{code}] NXT 주문 차단 종목 - 수동 매수 불가", "ERROR")
+                return False
+
+            # ✅ 수동매수 종목 등록 (매도 비중 [30, 40, 30] 적용용)
+            self._manual_buy_codes.add(code)
+
             price_str = f"{price:,}원" if price > 0 else "시장가"
-            self.log(f"[{code} {stock_name}] 수동 매수 주문: {quantity}주 @ {price_str}")
-            result = self.kiwoom.buy_stock(self.account, code, quantity, price)
-            if result == 0:
-                self.log(f"[{code}] 수동 매수 주문 전송 성공", "SUCCESS")
-                return True
-            self.log(f"[{code}] 수동 매수 주문 실패: 에러코드 {result}", "ERROR")
-            return False
+            self.log(f"[{code} {stock_name}] 수동 매수 주문 ({market_type}): {quantity}주 @ {price_str}")
+
+            if is_nxt:
+                # ✅ NXT 큐 기반 매수
+                manual_info = {"code": code, "market_type": market_type, "is_nxt": True, "action": "수동 매수"}
+                self.kiwoom.buy_stock_nxt_queued(
+                    self.account, code, quantity, price,
+                    callback=lambda result, _, info=manual_info: self._on_manual_order_result(result, info),
+                    priority=True
+                )
+                self.log(f"[{code}] 수동 매수 주문 큐 등록 완료 ({market_type})", "INFO")
+                return True  # 큐에 등록 성공
+            else:
+                result = self.kiwoom.buy_stock(self.account, code, quantity, price)
+                if result == 0:
+                    self.log(f"[{code}] 수동 매수 주문 전송 성공 ({market_type})", "SUCCESS")
+                    return True
+                self.log(f"[{code}] 수동 매수 주문 실패: 에러코드 {result}", "ERROR")
+                return False
         except Exception as e:
             self.log(f"수동 매수 중 오류: {e}", "ERROR")
             return False
 
+    def _on_manual_order_result(self, result, info):
+        """✅ 수동 주문 (NXT 큐) 결과 콜백"""
+        try:
+            code = info["code"]
+            market_type = info["market_type"]
+            is_nxt = info["is_nxt"]
+            action = info["action"]
+
+            if result == 0:
+                self.log(f"[{code}] {action} 주문 전송 성공 ({market_type})", "SUCCESS")
+            else:
+                if is_nxt:
+                    self._mark_nxt_order_failed(code)
+                self.log(f"[{code}] {action} 주문 실패 ({market_type}): 에러코드 {result}", "ERROR")
+        except Exception as e:
+            self.log(f"수동 주문 결과 처리 오류: {e}", "ERROR")
+
     # ==================== 분석 ====================
     def get_stock_analysis(self, code):
-        """종목 분석 정보 조회"""
+        """종목 분석 정보 조회 (캐시 우선, 캐시 미스 시에만 TR 호출)"""
         try:
-            candles = self.kiwoom.get_daily_candles(code, 30)
+            # 캐시 우선 사용 (TR 호출 최소화)
+            candles = None
+            if self.event_engine:
+                candles = self.event_engine.get_candles(code)
+            if not candles:
+                candles = self.kiwoom.get_daily_candles(code, 30)
             if not candles:
                 return None
 
-            stock_info = self.kiwoom.get_stock_info(code)
-            current_price = stock_info.get("price", 0)
+            current_price = candles[0]["close"] if candles else 0
+            stock_info = {"code": code, "name": self.kiwoom.get_stock_name_from_cache(code), "price": current_price}
+            if current_price == 0:
+                stock_info = self.kiwoom.get_stock_info(code)
+                current_price = stock_info.get("price", 0)
 
             envelope = self.ta.get_envelope_levels(candles, 20, 20)
             position = self.config.get_position(code)
@@ -1812,6 +2474,68 @@ class AutoTrader:
         except Exception as e:
             self.log(f"포지션 정리 오류: {e}", "ERROR")
 
+    # ==================== NXT → KRX 전환 ====================
+    def convert_nxt_positions_to_krx(self):
+        """
+        정규장 시작 시 NXT로 매수한 종목들을 KRX로 전환
+
+        NXT에서 매수한 종목은 정규장에서 KRX 시장으로 자동 전환되어
+        자동매수/자동매도가 KRX로 동작하도록 함
+        """
+        try:
+            if not self.is_regular_trading_hours():
+                self.log("정규장 시간이 아닙니다. KRX 전환 대기", "INFO")
+                return 0
+
+            positions = self.config.get("positions") or {}
+            converted_count = 0
+
+            for code, position in positions.items():
+                if position.get("is_nxt_order", False) and position.get("quantity", 0) > 0:
+                    # NXT 플래그 제거 (정규장에서는 KRX로 동작)
+                    position["is_nxt_order"] = False
+                    position["krx_converted_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self.config.update_position(code, position)
+
+                    stock_name = position.get("name", code)
+                    self.log(
+                        f"[{code} {stock_name}] NXT → KRX 전환 완료 "
+                        f"(보유: {position.get('quantity')}주)",
+                        "INFO"
+                    )
+                    converted_count += 1
+
+            if converted_count > 0:
+                self.log(f"총 {converted_count}개 종목 NXT → KRX 전환 완료", "SUCCESS")
+
+            return converted_count
+
+        except Exception as e:
+            self.log(f"KRX 전환 중 오류: {e}", "ERROR")
+            return 0
+
+    def check_and_convert_to_krx(self):
+        """
+        정규장 시작 체크 및 KRX 전환 (주기적 호출용)
+
+        프로그램 시작 시 또는 09:00 직후 호출되어
+        NXT 매수 종목을 KRX로 전환
+        """
+        market_type = self.get_current_market_type()
+
+        if market_type == "REGULAR":
+            # 오늘 아직 전환하지 않았다면 전환 실행
+            today = datetime.now().strftime("%Y%m%d")
+            session = self.config.get("session") or {}
+
+            if session.get("last_krx_convert_date") != today:
+                converted = self.convert_nxt_positions_to_krx()
+                if converted >= 0:
+                    # 세션 정보 업데이트
+                    session["last_krx_convert_date"] = today
+                    self.config.set(session, "session")
+                    self.config.save_config()
+
     def full_state_sync_on_startup(self):
         """프로그램 시작 시 전체 상태 동기화 + 스탑로스 유지 주문 보정"""
         self.log("프로그램 시작 - 전체 상태 동기화 시작...")
@@ -1821,13 +2545,18 @@ class AutoTrader:
 
         if last_date != today_str:
             self.config.reset_session_for_new_day(today_str)
+            # ✅ 새 거래일: NXT 실패 종목 목록 초기화
+            self._nxt_failed_codes.clear()
             self.log(f"새로운 거래일: {today_str}")
 
         self.sync_state_from_executions()
         self.clear_stale_pending_orders()
 
+        # ✅ 정규장이면 NXT 매수 종목을 KRX로 전환
+        self.check_and_convert_to_krx()
+
         # 장이 열려 있다면(또는 장 시작 시점) 스탑로스 유지 주문을 보정
-        if self.is_market_open():
+        if self.is_market_open() or self.is_nxt_trading_hours():
             self.ensure_all_stoploss_orders()
 
         self.log("전체 상태 동기화 완료")
@@ -1842,8 +2571,14 @@ class AutoTrader:
         if not self.kiwoom or not self.account:
             return
 
+        if not self.is_any_trading_time():
+            return
+
         positions = self.config.get("positions") or {}
+        is_nxt_time = self.is_nxt_trading_hours()
         for code, pos in positions.items():
+            if is_nxt_time and pos and not pos.get("is_nxt_order", False):
+                continue
             self._ensure_stoploss_order_if_needed(code, pos)
 
     def _ensure_stoploss_order_if_needed(self, code, position):
@@ -1865,8 +2600,24 @@ class AutoTrader:
             if qty <= 0 or price <= 0:
                 return
 
-            # 장 시간 외면 재주문하지 않음 (장 시작 시 ensure_all_stoploss_orders에서 걸림)
-            if not self.is_market_open():
+            # 장 시간 외면 재주문하지 않음
+            if not self.is_any_trading_time():
+                return
+
+            now = time.time()
+            # 스탑로스 점검 과도 호출 방지 (TR 부하/렉 감소)
+            last_check = self._stoploss_last_check.get(code, 0.0)
+            if now - last_check < self._stoploss_check_min_interval:
+                return
+            self._stoploss_last_check[code] = now
+
+            # TR 처리 중이면 스탑로스 미체결 확인을 스킵
+            if self.kiwoom and (self.kiwoom.is_tr_busy() or self.kiwoom.is_tr_cooldown() or self.kiwoom.is_tr_queue_busy()):
+                return
+
+            # 재주문 쿨다운 중이면 스킵
+            last_reorder = self._stoploss_last_reorder.get(code, 0.0)
+            if code in self._stoploss_reorder_pending or (now - last_reorder) < self._stoploss_reorder_cooldown:
                 return
 
             # API 미체결에 이미 스탑로스 주문이 있는지 확인
@@ -1901,17 +2652,64 @@ class AutoTrader:
                 "target_name": "스탑로스",
                 "sell_ratio": 100,
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "is_nxt": self.is_nxt_trading_hours(),
                 "persist": True
             })
 
-            result = self._send_sell_with_retry(code, qty, price)
-            if result == 0:
-                self.log(f"[{code}] 스탑로스 유지 재주문 성공: {qty}주 @ {price:,}원", "SUCCESS")
+            is_nxt = self.is_nxt_trading_hours()
+            market_type = "NXT" if is_nxt else "KRX"
+            stoploss_reorder_info = {
+                "code": code, "quantity": qty, "price": price,
+                "market_type": market_type, "is_nxt": is_nxt
+            }
+
+            if is_nxt:
+                # ✅ NXT 큐 기반 스탑로스 유지 재주문
+                if self._is_nxt_order_blocked(code):
+                    self.log(f"[{code}] NXT 주문 차단 종목 - 스탑로스 재주문 대기", "WARNING")
+                    return
+                self._stoploss_reorder_pending.add(code)
+                self._stoploss_last_reorder[code] = now
+                self.kiwoom.sell_stock_nxt_queued(
+                    self.account, code, qty, price,
+                    callback=lambda result, _, info=stoploss_reorder_info: self._on_stoploss_reorder_result(result, info),
+                    priority=True
+                )
             else:
-                self.log(f"[{code}] 스탑로스 유지 재주문 실패: 에러코드 {result}", "ERROR")
+                # KRX 큐 기반 스탑로스 재주문 (비동기, 블로킹 제거)
+                self._stoploss_reorder_pending.add(code)
+                self._stoploss_last_reorder[code] = now
+                self.kiwoom.sell_stock_queued(
+                    self.account, code, qty, price,
+                    callback=lambda result, _, info=stoploss_reorder_info: self._on_stoploss_reorder_result(result, info),
+                    priority=True
+                )
 
         except Exception as e:
             self.log(f"[{code}] 스탑로스 유지 보정 오류: {e}", "ERROR")
+
+    def _on_stoploss_reorder_result(self, result, info):
+        """✅ 스탑로스 유지 재주문 결과 콜백"""
+        try:
+            code = info["code"]
+            self._stoploss_reorder_pending.discard(code)
+            qty = info["quantity"]
+            price = info["price"]
+            is_nxt = info["is_nxt"]
+            market_type = info["market_type"]
+
+            if result == 0:
+                self.log(f"[{code}] 스탑로스 유지 재주문 성공 ({market_type}): {qty}주 @ {price:,}원", "SUCCESS")
+                # 성공 시 재확인 간격을 늘려 반복 재주문 방지
+                now = time.time()
+                self._stoploss_last_reorder[code] = now
+                self._stoploss_last_check[code] = now
+            else:
+                if is_nxt:
+                    self._mark_nxt_order_failed(code)
+                self.log(f"[{code}] 스탑로스 유지 재주문 실패 ({market_type}): 에러코드 {result}", "ERROR")
+        except Exception as e:
+            self.log(f"스탑로스 재주문 결과 처리 오류: {e}", "ERROR")
 
     # ==================== 주문 복원 ====================
     def check_and_restore_orders(self):
@@ -1932,7 +2730,11 @@ class AutoTrader:
             self.log("주문 복원 불가: API 또는 계좌 미설정", "WARNING")
             return
 
-        if not self.is_market_open():
+        market_type = self.get_current_market_type()
+        restore_nxt = market_type in ("NXT_PREMARKET", "NXT_AFTERMARKET")
+        restore_krx = market_type == "REGULAR"
+
+        if not (restore_nxt or restore_krx):
             self.log("주문 복원 대기: 장 시간 외", "INFO")
             return
 
@@ -1942,6 +2744,8 @@ class AutoTrader:
         if last_date != today_str:
             self.config.reset_session_for_new_day(today_str)
             self.orders_restored = False
+            # ✅ 새 거래일: NXT 실패 종목 목록 초기화
+            self._nxt_failed_codes.clear()
             self.log(f"새로운 거래일 시작: {today_str}")
 
         if self.config.is_orders_restored():
@@ -1958,7 +2762,8 @@ class AutoTrader:
             self.config.set_orders_restored(True)
             return
 
-        self.log(f"미체결 주문 복원 시작: {len(pending_orders)}개 종목")
+        restore_market = "NXT" if restore_nxt else "KRX"
+        self.log(f"미체결 주문 복원 시작 ({restore_market}): {len(pending_orders)}개 종목")
 
         api_pending_orders = self.kiwoom.get_open_orders(self.account)
         api_pending_set = set()
@@ -1982,6 +2787,22 @@ class AutoTrader:
                 buy_count = order.get("buy_count")
                 target_name = order.get("target_name")
 
+                order_is_nxt = order.get("is_nxt")
+                if order_is_nxt is None:
+                    if restore_nxt:
+                        order_is_nxt = True  # NXT 시간대: 일단 시도
+                    else:
+                        order_is_nxt = bool(position.get("is_nxt_order", False)) if position else False
+
+                if restore_nxt and not order_is_nxt:
+                    self.log(f"[{code}] 주문 복원 스킵 (KRX 주문, NXT 시간대)", "INFO")
+                    skipped_count += 1
+                    continue
+                if restore_krx and order_is_nxt:
+                    # ✅ 정규장 시간: NXT 미체결 주문을 KRX로 변환하여 복원
+                    self.log(f"[{code}] NXT 주문 → KRX로 변환하여 복원", "INFO")
+                    order_is_nxt = False
+
                 if (code, order_type, price) in api_pending_set:
                     self.log(f"[{code}] 주문 복원 스킵 (이미 미체결 주문 존재)", "INFO")
                     duplicate_count += 1
@@ -2003,11 +2824,23 @@ class AutoTrader:
                         continue
 
                     # 큐 기반 매수 복원 (에러코드 -308 방지)
-                    restore_info = {"code": code, "buy_count": buy_count, "quantity": quantity, "price": price}
-                    self.kiwoom.buy_stock_queued(
-                        self.account, code, quantity, price,
-                        callback=lambda result, _, info=restore_info: self._on_buy_restore_result(result, info)
-                    )
+                    restore_info = {
+                        "code": code,
+                        "buy_count": buy_count,
+                        "quantity": quantity,
+                        "price": price,
+                        "is_nxt": order_is_nxt
+                    }
+                    if restore_nxt:
+                        self.kiwoom.buy_stock_nxt_queued(
+                            self.account, code, quantity, price,
+                            callback=lambda result, _, info=restore_info: self._on_buy_restore_result(result, info)
+                        )
+                    else:
+                        self.kiwoom.buy_stock_queued(
+                            self.account, code, quantity, price,
+                            callback=lambda result, _, info=restore_info: self._on_buy_restore_result(result, info)
+                        )
                     restored_count += 1  # 요청 카운트
 
                 elif order_type == "sell":
@@ -2024,24 +2857,36 @@ class AutoTrader:
                         quantity = holding_qty
 
                     # 큐 기반 매도 복원 (에러코드 -308 방지)
-                    restore_info = {"code": code, "target_name": target_name, "quantity": quantity, "price": price}
-                    self.kiwoom.sell_stock_queued(
-                        self.account, code, quantity, price,
-                        callback=lambda result, _, info=restore_info: self._on_sell_restore_result(result, info)
-                    )
+                    restore_info = {
+                        "code": code,
+                        "target_name": target_name,
+                        "quantity": quantity,
+                        "price": price,
+                        "is_nxt": order_is_nxt
+                    }
+                    if restore_nxt:
+                        self.kiwoom.sell_stock_nxt_queued(
+                            self.account, code, quantity, price,
+                            callback=lambda result, _, info=restore_info: self._on_sell_restore_result(result, info)
+                        )
+                    else:
+                        self.kiwoom.sell_stock_queued(
+                            self.account, code, quantity, price,
+                            callback=lambda result, _, info=restore_info: self._on_sell_restore_result(result, info)
+                        )
                     restored_count += 1  # 요청 카운트
 
         # 복원 후 스탑로스 유지 주문 강제 점검
         self.ensure_all_stoploss_orders()
 
         # ✅ 보유 종목에 대해 모든 매도 주문이 걸려있는지 확인/보정
-        self._restore_all_sell_orders_for_holdings()
+        self._restore_all_sell_orders_for_holdings(restore_nxt=restore_nxt)
 
         self.log(f"주문 복원 완료: 성공 {restored_count}건, 스킵 {skipped_count}건, 중복 {duplicate_count}건")
         self.config.set_orders_restored(True)
         self.orders_restored = True
 
-    def _restore_all_sell_orders_for_holdings(self):
+    def _restore_all_sell_orders_for_holdings(self, restore_nxt=False):
         """
         ✅ 장 시작 시 모든 보유 종목에 대해 매도 주문이 걸려있는지 확인/보정
 
@@ -2050,13 +2895,15 @@ class AutoTrader:
         if not self.kiwoom or not self.account:
             return
 
-        if not self.is_market_open():
+        if not self.is_any_trading_time():
             return
 
         positions = self.config.get("positions") or {}
 
         for code, position in positions.items():
             if position.get("quantity", 0) <= 0:
+                continue
+            if restore_nxt and not position.get("is_nxt_order", False):
                 continue
 
             # 스탑로스 발동 종목은 스탑로스 주문만 유지
@@ -2132,18 +2979,18 @@ class AutoTrader:
 
     # ==================== 기타 ====================
     def check_and_trade(self, code):
-        """타이머 기반 매매 호출용"""
+        """타이머 기반 매매 호출용 (캐시 전용 - TR 호출 안 함)"""
         if not self.is_running:
             return
         try:
             if self.event_engine:
-                candles = self.event_engine.get_candles(code)
+                # cache_only=True: 배치 스케줄러가 캐시를 채울 때까지 대기 (TR 호출 방지)
+                candles = self.event_engine.get_candles(code, cache_only=True)
             else:
                 candles = self.kiwoom.get_daily_candles(code, 30)
 
             if not candles:
-                self.log(f"[{code}] 일봉 데이터를 가져올 수 없습니다.", "WARNING")
-                return
+                return  # 캐시 없으면 조용히 스킵 (배치 스케줄러가 나중에 채움)
 
             current_price = candles[0]["close"] if candles else 0
             if current_price == 0:
@@ -2167,7 +3014,7 @@ class AutoTrader:
         for code, orders in pending_orders.items():
             stock_name = ""
             if self.kiwoom:
-                stock_name = self.kiwoom.get_master_code_name(code)
+                stock_name = self.kiwoom.get_stock_name_from_cache(code)
 
             for order in orders:
                 order_type = order.get("order_type")

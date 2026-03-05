@@ -5,10 +5,97 @@
 import sys
 import time
 from collections import deque
+from datetime import datetime, time as dt_time
 from threading import Lock
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QObject, pyqtSignal, QTimer
 from PyQt5.QtWidgets import QApplication
+
+
+# ==================== NXT 시간대 상수 ====================
+NXT_PREMARKET_START = dt_time(8, 0, 0)    # 프리마켓 시작
+NXT_PREMARKET_END = dt_time(8, 50, 0)     # 프리마켓 종료
+NXT_AFTERMARKET_START = dt_time(15, 40, 0)  # 애프터마켓 시작
+NXT_AFTERMARKET_END = dt_time(20, 0, 0)    # 애프터마켓 종료
+REGULAR_MARKET_START = dt_time(9, 0, 0)   # 정규장 시작
+REGULAR_MARKET_END = dt_time(15, 30, 0)   # 정규장 종료
+
+
+# ==================== NXT 시간대 판단 함수 ====================
+def is_premarket():
+    """프리마켓 시간인지 확인 (08:00 ~ 08:50)"""
+    now = datetime.now().time()
+    return NXT_PREMARKET_START <= now <= NXT_PREMARKET_END
+
+
+def is_aftermarket():
+    """애프터마켓 시간인지 확인 (15:40 ~ 20:00)"""
+    now = datetime.now().time()
+    return NXT_AFTERMARKET_START <= now <= NXT_AFTERMARKET_END
+
+
+def is_extended_hours():
+    """장시간외(프리마켓 또는 애프터마켓)인지 확인"""
+    return is_premarket() or is_aftermarket()
+
+
+def is_regular_market():
+    """정규장 시간인지 확인 (09:00 ~ 15:30)"""
+    now = datetime.now().time()
+    return REGULAR_MARKET_START <= now <= REGULAR_MARKET_END
+
+
+def get_market_type():
+    """
+    현재 시장 타입 반환
+
+    Returns:
+        "NXT_PREMARKET" | "REGULAR" | "NXT_AFTERMARKET" | "CLOSED"
+    """
+    if is_premarket():
+        return "NXT_PREMARKET"
+    elif is_regular_market():
+        return "REGULAR"
+    elif is_aftermarket():
+        return "NXT_AFTERMARKET"
+    else:
+        return "CLOSED"
+
+
+# ==================== NXT 코드 변환 함수 ====================
+def to_nxt_code(code: str) -> str:
+    """
+    KRX 종목코드를 NXT 종목코드로 변환
+
+    Args:
+        code: KRX 종목코드 (예: "039490")
+
+    Returns:
+        NXT 종목코드 (예: "039490_NX")
+    """
+    if code.endswith("_NX"):
+        return code  # 이미 NXT 코드
+    return f"{code}_NX"
+
+
+def from_nxt_code(nxt_code: str) -> str:
+    """
+    NXT 종목코드를 KRX 종목코드로 변환
+
+    Args:
+        nxt_code: NXT 종목코드 (예: "039490_NX")
+
+    Returns:
+        KRX 종목코드 (예: "039490")
+    """
+    if nxt_code.endswith("_NX"):
+        return nxt_code[:-3]
+    return nxt_code
+
+
+def is_nxt_code(code: str) -> bool:
+    """NXT 종목코드인지 확인"""
+    return code.endswith("_NX")
 
 
 class AccountSignalEmitter(QObject):
@@ -24,41 +111,54 @@ class AccountSignalEmitter(QObject):
 
 
 class RateLimiter:
-    """TR 호출 제한 관리 클래스 (초당 5회 제한)"""
+    """TR 호출 제한 관리 클래스 (초당 5회 + 분당 60회 제한)"""
 
-    def __init__(self, max_calls=5, period=1.0):
+    def __init__(self, max_calls=5, period=1.0, max_calls_per_min=60):
         """
         Args:
-            max_calls: 기간 내 최대 호출 횟수
-            period: 기간 (초)
+            max_calls: 초당 최대 호출 횟수
+            period: 초당 기간 (초)
+            max_calls_per_min: 분당 최대 호출 횟수
         """
         self.max_calls = max_calls
         self.period = period
-        self.calls = deque()
+        self.max_calls_per_min = max_calls_per_min
+        self.calls = deque()          # 초당 제한용
+        self.calls_minute = deque()   # 분당 제한용
         self.lock = Lock()
 
     def wait_if_needed(self):
-        """필요시 대기하여 호출 제한 준수"""
+        """필요시 대기하여 호출 제한 준수 (초당 + 분당)"""
         with self.lock:
             now = time.time()
 
-            # 기간이 지난 호출 기록 제거
+            # === 초당 제한 ===
             while self.calls and self.calls[0] < now - self.period:
                 self.calls.popleft()
 
-            # 제한에 도달했으면 대기
             if len(self.calls) >= self.max_calls:
-                sleep_time = self.calls[0] + self.period - now + 0.05  # 50ms 여유
+                sleep_time = self.calls[0] + self.period - now + 0.05
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-
-                # 다시 정리
                 now = time.time()
                 while self.calls and self.calls[0] < now - self.period:
                     self.calls.popleft()
 
+            # === 분당 제한 ===
+            while self.calls_minute and self.calls_minute[0] < now - 60.0:
+                self.calls_minute.popleft()
+
+            if len(self.calls_minute) >= self.max_calls_per_min:
+                sleep_time = self.calls_minute[0] + 60.0 - now + 0.1
+                if sleep_time > 0:
+                    time.sleep(min(sleep_time, 5.0))  # 최대 5초 대기
+                now = time.time()
+                while self.calls_minute and self.calls_minute[0] < now - 60.0:
+                    self.calls_minute.popleft()
+
             # 현재 호출 기록
             self.calls.append(time.time())
+            self.calls_minute.append(time.time())
 
 
 class OrderQueue:
@@ -66,15 +166,17 @@ class OrderQueue:
 
     def __init__(self, kiwoom_api):
         self.kiwoom = kiwoom_api
+        # 우선순위(긴급)와 일반 주문을 분리해 처리
+        self._high_queue = deque()  # (order_func, args, kwargs, callback)
         self._queue = deque()  # (order_func, args, kwargs, callback) 튜플
         self._is_processing = False
         self._process_timer = QTimer()
         self._process_timer.setSingleShot(True)
         self._process_timer.timeout.connect(self._process_next)
         # 주문 간 최소 간격 (키움 API 초당 주문 제한: 1초에 5건 미만 권장)
-        self._min_interval_ms = 300  # 300ms 간격 = 초당 약 3건
+        self._min_interval_ms = 200  # 200ms 간격 = 초당 5건
 
-    def enqueue(self, order_func, callback=None, *args, **kwargs):
+    def enqueue(self, order_func, callback=None, *args, priority=False, **kwargs):
         """
         주문 호출을 큐에 추가
 
@@ -83,8 +185,11 @@ class OrderQueue:
             callback: 결과를 받을 콜백 함수 (선택) - (result, args) 전달
             *args, **kwargs: 주문 함수에 전달할 인자
         """
-        self._queue.append((order_func, args, kwargs, callback))
-        self._debug(f"[주문큐] 추가됨: {order_func.__name__} (대기: {len(self._queue)}개)")
+        if priority:
+            self._high_queue.append((order_func, args, kwargs, callback))
+        else:
+            self._queue.append((order_func, args, kwargs, callback))
+        self._debug(f"[주문큐] 추가됨: {order_func.__name__} (긴급:{len(self._high_queue)} 일반:{len(self._queue)})")
 
         # 처리 중이 아니면 시작
         if not self._is_processing:
@@ -96,17 +201,20 @@ class OrderQueue:
             return
         self._is_processing = True
         # 즉시 시작하지 않고 약간의 지연 후 시작 (이벤트 루프 안정화)
-        self._process_timer.start(50)
+        self._process_timer.start(10)
 
     def _process_next(self):
         """큐에서 다음 주문 처리"""
-        if not self._queue:
+        if not self._high_queue and not self._queue:
             self._is_processing = False
             self._debug("[주문큐] 큐 비어있음 - 처리 완료")
             return
 
-        order_func, args, kwargs, callback = self._queue.popleft()
-        self._debug(f"[주문큐] 처리 시작: {order_func.__name__} args={args[:3] if len(args) > 3 else args} (남은 대기: {len(self._queue)}개)")
+        if self._high_queue:
+            order_func, args, kwargs, callback = self._high_queue.popleft()
+        else:
+            order_func, args, kwargs, callback = self._queue.popleft()
+        self._debug(f"[주문큐] 처리 시작: {order_func.__name__} args={args[:3] if len(args) > 3 else args} (남은 대기: 긴급:{len(self._high_queue)} 일반:{len(self._queue)})")
 
         try:
             result = order_func(*args, **kwargs)
@@ -125,7 +233,7 @@ class OrderQueue:
                     pass
 
         # 다음 주문 처리 (간격 유지)
-        if self._queue:
+        if self._high_queue or self._queue:
             self._process_timer.start(self._min_interval_ms)
         else:
             self._is_processing = False
@@ -133,17 +241,18 @@ class OrderQueue:
 
     def clear(self):
         """큐 비우기"""
+        self._high_queue.clear()
         self._queue.clear()
         self._is_processing = False
         self._debug("[주문큐] 큐 초기화됨")
 
     def is_empty(self):
         """큐가 비어있는지 확인"""
-        return len(self._queue) == 0
+        return len(self._high_queue) == 0 and len(self._queue) == 0
 
     def pending_count(self):
         """대기 중인 주문 개수"""
-        return len(self._queue)
+        return len(self._high_queue) + len(self._queue)
 
     def _debug(self, message):
         if self.kiwoom.debug:
@@ -266,8 +375,11 @@ class KiwoomAPI:
         self._tr_timeout_ms = 0
         self._tr_record_overrides = {}
 
-        # TR 호출 제한 (초당 5회)
-        self.rate_limiter = RateLimiter(max_calls=5, period=1.0)
+        # TR 호출 제한 (초당 5회 + 분당 60회)
+        self.rate_limiter = RateLimiter(max_calls=5, period=1.0, max_calls_per_min=60)
+
+        # ✅ -209 에러 감지 시 TR 쿨다운 (일시적 TR 호출 차단)
+        self._tr_cooldown_until = 0  # 쿨다운 해제 시각 (timestamp)
 
         # ✅ 계좌 데이터 시그널 발신기
         self.account_signals = AccountSignalEmitter()
@@ -310,6 +422,15 @@ class KiwoomAPI:
     def is_tr_busy(self):
         """TR 요청 처리 중 여부 확인 (재진입 방지용)"""
         return self._tr_busy
+
+    def is_tr_cooldown(self):
+        """TR 쿨다운 중인지 확인 (-209 에러 후 일시적 차단)"""
+        return time.time() < self._tr_cooldown_until
+
+    def _activate_tr_cooldown(self, duration_sec=30):
+        """TR 쿨다운 활성화 (-209 에러 감지 시 호출)"""
+        self._tr_cooldown_until = time.time() + duration_sec
+        print(f"[TR쿨다운] {duration_sec}초간 TR 호출 차단 (-209 에러 감지)")
 
     def is_tr_queue_busy(self):
         """TR 큐가 처리 중인지 확인"""
@@ -444,10 +565,15 @@ class KiwoomAPI:
         self.ocx.dynamicCall("SetInputValue(QString, QString)", id, value)
 
     def comm_rq_data(self, rqname, trcode, next, screen_no):
-        """TR 요청 (Rate Limiting + 재진입 방지 적용)"""
+        """TR 요청 (Rate Limiting + 재진입 방지 + 쿨다운 적용)"""
         # ✅ 재진입 방지: 이미 TR 처리 중이면 경고 후 스킵
         if self._tr_busy:
             self._debug(f"[TR] BLOCKED (busy) rqname={rqname} trcode={trcode}")
+            return
+
+        # ✅ 쿨다운 중이면 TR 요청 스킵 (-209 에러 방지)
+        if self.is_tr_cooldown():
+            self._debug(f"[TR] BLOCKED (cooldown) rqname={rqname} trcode={trcode}")
             return
 
         # TR 호출 제한 대기
@@ -856,8 +982,8 @@ class KiwoomAPI:
         profit_rate_str = single_data.get("profit_rate_str", "")
 
         try:
-            # 키움 API는 수익률을 100배한 값으로 반환 (예: -11.58% → -1158)
-            profit_rate = float(profit_rate_str) / 100.0 if profit_rate_str else 0.0
+            # 키움 API는 수익률을 퍼센트 값 그대로 반환 (예: -4.97% → "-4.97")
+            profit_rate = float(profit_rate_str) if profit_rate_str else 0.0
         except ValueError:
             profit_rate = 0.0
 
@@ -915,8 +1041,8 @@ class KiwoomAPI:
             if not profit_rate_str or profit_rate_str.strip() == "":
                 profit_rate_str = raw.get("profit_rate_str2", "")
             try:
-                # 키움 API는 수익률을 100배한 값으로 반환 (예: -11.58% → -1158)
-                item_profit_rate = float(profit_rate_str) / 100.0 if profit_rate_str else 0.0
+                # 키움 API는 수익률을 퍼센트 값 그대로 반환 (예: -4.97% → "-4.97")
+                item_profit_rate = float(profit_rate_str) if profit_rate_str else 0.0
             except ValueError:
                 item_profit_rate = 0.0
             if item_profit_rate == 0.0 and avg_price > 0:
@@ -1016,6 +1142,11 @@ class KiwoomAPI:
         order_type: 1=신규매수, 2=신규매도, 3=매수취소, 4=매도취소, 5=매수정정, 6=매도정정
         hoga: 00=지정가, 03=시장가
         """
+        self._debug(
+            f"[SendOrder] rqname={rqname} screen_no={screen_no} account={account} "
+            f"order_type={order_type} code={code} quantity={quantity} price={price} "
+            f"hoga={hoga} org_order_no={org_order_no}"
+        )
         result = self.ocx.dynamicCall(
             "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
             [rqname, screen_no, account, order_type, code, quantity, price, hoga, org_order_no]
@@ -1038,8 +1169,45 @@ class KiwoomAPI:
         hoga = "03" if price == 0 else "00"
         return self.send_order("매도주문", "0202", account, 2, code, quantity, price, hoga)
 
+    # ==================== NXT 주문 (장시간외) ====================
+    def buy_stock_nxt(self, account, code, quantity, price=0):
+        """
+        NXT 매수 주문 (장시간외 전용)
+
+        Args:
+            account: 계좌번호
+            code: KRX 종목코드 (자동으로 NXT 코드로 변환됨)
+            quantity: 수량
+            price: 가격 (0이면 시장가)
+
+        Returns:
+            주문 결과 코드 (0=성공)
+        """
+        # SendOrder는 KRX 코드 형식을 요구하므로 _NX 변환 금지
+        nxt_code = code
+        hoga = "03" if price == 0 else "00"
+        return self.send_order("NXT매수주문", "0211", account, 1, nxt_code, quantity, price, hoga)
+
+    def sell_stock_nxt(self, account, code, quantity, price=0):
+        """
+        NXT 매도 주문 (장시간외 전용)
+
+        Args:
+            account: 계좌번호
+            code: KRX 종목코드 (자동으로 NXT 코드로 변환됨)
+            quantity: 수량
+            price: 가격 (0이면 시장가)
+
+        Returns:
+            주문 결과 코드 (0=성공)
+        """
+        # SendOrder는 KRX 코드 형식을 요구하므로 _NX 변환 금지
+        nxt_code = code
+        hoga = "03" if price == 0 else "00"
+        return self.send_order("NXT매도주문", "0212", account, 2, nxt_code, quantity, price, hoga)
+
     # ==================== 큐 기반 주문 (에러코드 -308 방지) ====================
-    def send_order_queued(self, rqname, screen_no, account, order_type, code, quantity, price, hoga, callback=None, org_order_no=""):
+    def send_order_queued(self, rqname, screen_no, account, order_type, code, quantity, price, hoga, callback=None, org_order_no="", priority=False):
         """
         주문 전송 (큐 기반 - 초당 주문 제한 준수)
 
@@ -1049,10 +1217,11 @@ class KiwoomAPI:
         self.order_queue.enqueue(
             self.send_order,
             callback,
-            rqname, screen_no, account, order_type, code, quantity, price, hoga, org_order_no
+            rqname, screen_no, account, order_type, code, quantity, price, hoga, org_order_no,
+            priority=priority
         )
 
-    def buy_stock_queued(self, account, code, quantity, price=0, callback=None):
+    def buy_stock_queued(self, account, code, quantity, price=0, callback=None, priority=False):
         """
         매수 주문 (큐 기반)
         price=0이면 시장가
@@ -1061,10 +1230,11 @@ class KiwoomAPI:
         self.order_queue.enqueue(
             self.send_order,
             callback,
-            "매수주문", "0201", account, 1, code, quantity, price, hoga, ""
+            "매수주문", "0201", account, 1, code, quantity, price, hoga, "",
+            priority=priority
         )
 
-    def sell_stock_queued(self, account, code, quantity, price=0, callback=None):
+    def sell_stock_queued(self, account, code, quantity, price=0, callback=None, priority=False):
         """
         매도 주문 (큐 기반)
         price=0이면 시장가
@@ -1073,7 +1243,51 @@ class KiwoomAPI:
         self.order_queue.enqueue(
             self.send_order,
             callback,
-            "매도주문", "0202", account, 2, code, quantity, price, hoga, ""
+            "매도주문", "0202", account, 2, code, quantity, price, hoga, "",
+            priority=priority
+        )
+
+    # ==================== NXT 큐 기반 주문 ====================
+    def buy_stock_nxt_queued(self, account, code, quantity, price=0, callback=None, priority=False):
+        """
+        NXT 매수 주문 (큐 기반, 장시간외 전용)
+
+        Args:
+            account: 계좌번호
+            code: KRX 종목코드 (자동으로 NXT 코드로 변환됨)
+            quantity: 수량
+            price: 가격 (0이면 시장가)
+            callback: 결과 콜백 함수
+        """
+        # SendOrder는 KRX 코드 형식을 요구하므로 _NX 변환 금지
+        nxt_code = code
+        hoga = "03" if price == 0 else "00"
+        self.order_queue.enqueue(
+            self.send_order,
+            callback,
+            "NXT매수주문", "0211", account, 1, nxt_code, quantity, price, hoga, "",
+            priority=priority
+        )
+
+    def sell_stock_nxt_queued(self, account, code, quantity, price=0, callback=None, priority=False):
+        """
+        NXT 매도 주문 (큐 기반, 장시간외 전용)
+
+        Args:
+            account: 계좌번호
+            code: KRX 종목코드 (자동으로 NXT 코드로 변환됨)
+            quantity: 수량
+            price: 가격 (0이면 시장가)
+            callback: 결과 콜백 함수
+        """
+        # SendOrder는 KRX 코드 형식을 요구하므로 _NX 변환 금지
+        nxt_code = code
+        hoga = "03" if price == 0 else "00"
+        self.order_queue.enqueue(
+            self.send_order,
+            callback,
+            "NXT매도주문", "0212", account, 2, nxt_code, quantity, price, hoga, "",
+            priority=priority
         )
 
     def cancel_order(self, account, code, order_no, quantity):
@@ -1334,12 +1548,15 @@ class KiwoomAPI:
             price = abs(int(self.get_comm_real_data(code, 10)))  # 현재가
             volume = int(self.get_comm_real_data(code, 15))  # 거래량
 
+            # NXT 코드(_NX) → base code 변환 (하위 시스템은 KRX 코드 기준으로 동작)
+            base_code = from_nxt_code(code) if is_nxt_code(code) else code
+
             # 이벤트 엔진으로 전달 (디바운스 적용됨)
             if self.event_engine:
-                self.event_engine.push_event("price", code, {"price": price, "volume": volume})
+                self.event_engine.push_event("price", base_code, {"price": price, "volume": volume})
 
             if self.on_real_data_callback:
-                self.on_real_data_callback(code, price, volume)
+                self.on_real_data_callback(base_code, price, volume)
 
     def get_comm_real_data(self, code, fid):
         """실시간 데이터 가져오기"""
@@ -1358,15 +1575,30 @@ class KiwoomAPI:
             executed_quantity = int(self.get_chejan_data(911) or 0)  # 체결수량
             executed_price = int(self.get_chejan_data(910) or 0)  # 체결가격
             order_type = self.get_chejan_data(905)  # 주문구분 (+매수, -매도)
+            order_no = self.get_chejan_data(9203).strip()  # 주문번호
+            remaining_quantity = int(self.get_chejan_data(902) or 0)  # 미체결수량
+            order_price = int(self.get_chejan_data(901) or 0)  # 주문가격
+
+            if self.debug:
+                self._debug(
+                    "[Chejan:Order] "
+                    f"code={code} order_no={order_no} status={order_status} "
+                    f"type={order_type} order_qty={order_quantity} "
+                    f"filled_qty={executed_quantity} remaining_qty={remaining_quantity} "
+                    f"order_price={order_price} exec_price={executed_price}"
+                )
 
             if self.on_chejan_callback:
                 self.on_chejan_callback({
                     "type": "order",
                     "code": code,
+                    "order_no": order_no,
                     "status": order_status,
                     "order_quantity": order_quantity,
                     "executed_quantity": executed_quantity,
                     "executed_price": executed_price,
+                    "remaining_quantity": remaining_quantity,
+                    "order_price": order_price,
                     "order_type": order_type
                 })
 
@@ -1397,6 +1629,11 @@ class KiwoomAPI:
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):
         """메시지 수신 이벤트"""
         print(f"[메시지] {msg}")
+
+        # ✅ -209 에러 감지: 과도한 조회요청 → TR 쿨다운 활성화
+        if "-209" in msg or "과도한 조회" in msg:
+            self._activate_tr_cooldown(30)  # 30초 쿨다운
+
         if self.on_message_callback:
             self.on_message_callback(screen_no, rqname, trcode, msg)
 

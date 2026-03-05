@@ -3,6 +3,7 @@
 키움증권 자동매매 시스템 - 메인 GUI
 """
 import sys
+import datetime
 from collections import deque
 import time  # ✅ 추가: 로그 스팸/쓰로틀용
 
@@ -99,9 +100,13 @@ class MainWindow(QMainWindow):
         # ✅ 워치리스트 헤더를 설정값으로 반영 (권장)
         self._update_watchlist_header()
 
-        # 자동 갱신 타이머
+        # 자동 갱신 타이머 (잔고 갱신: 60초)
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_data)
+
+        # 감시 종목 갱신 타이머 (5분 주기 - TR 호출 최소화)
+        self.watchlist_refresh_timer = QTimer()
+        self.watchlist_refresh_timer.timeout.connect(self.refresh_watchlist)
 
         # 자동매매 체크 타이머
         self.trading_timer = QTimer()
@@ -110,6 +115,7 @@ class MainWindow(QMainWindow):
         # ✅ 장 열림 감지 타이머 (주문 복원 자동 호출용)
         self._orders_restored_today = False
         self._last_market_open_check_date = None
+        self._restore_retry_scheduled = False
         self.market_open_timer = QTimer()
         self.market_open_timer.timeout.connect(self._check_market_open_and_restore)
         self.market_open_timer.start(60000)  # 1분마다 체크
@@ -117,6 +123,8 @@ class MainWindow(QMainWindow):
         # ✅ 실시간 UI 업데이트용 행 매핑 (code → row)
         self._holdings_code_to_row = {}
         self._watchlist_code_to_row = {}
+        self._watchlist_rt_screens = ["2000", "2001"]
+        self._watchlist_rt_registered = False
 
         # ✅ 잔고 변경 디바운스 타이머 (과도한 TR 호출 방지)
         self._balance_changed_timer = QTimer()
@@ -579,9 +587,7 @@ class MainWindow(QMainWindow):
             return
         if not self.trader or not getattr(self.trader, "is_running", False):
             return
-        # ✅ TR 재진입 방지: TR 또는 TR 큐 처리 중이면 스킵
-        if self.kiwoom and self.kiwoom.is_tr_queue_busy():
-            return
+        # ✅ 주문은 TR 처리와 독립적으로 전송 가능
         try:
             self.trader.process_order_queue()
         except Exception as e:
@@ -658,7 +664,7 @@ class MainWindow(QMainWindow):
                 self.kiwoom.account_signals.holdings_updated.connect(self._on_holdings_updated)
 
                 # ✅ 실시간 시세 콜백 등록 (보유종목/감시종목 UI 실시간 갱신)
-                self.kiwoom.set_real_data_callback(self._on_realtime_price)
+                self.kiwoom.set_real_data_callback(self._on_realtime_price_dispatch)
 
                 # ✅ 종목 캐시 로드 (UI 프리징 방지 - 백그라운드 스레드에서 실행)
                 self._start_stock_cache_loading()
@@ -692,6 +698,7 @@ class MainWindow(QMainWindow):
 
                 self.refresh_timer.start(60000)
                 self.refresh_data()
+                self.refresh_watchlist()  # 초기 감시 종목 표시
 
                 self.trader.full_state_sync_on_startup()
                 self._check_pending_orders_on_startup()
@@ -735,7 +742,8 @@ class MainWindow(QMainWindow):
             # ✅ 1) 먼저 타이머를 멈춰 재진입/교착 가능성 최소화
             self._is_stopping = True
             self.trading_timer.stop()
-            self.refresh_timer.stop()  # (권장) stop 중 갱신도 멈춰서 UI 프리징/경합 줄임
+            self.refresh_timer.stop()
+            self.watchlist_refresh_timer.stop()
             # ✅ 주문 큐 타이머도 정지
             try:
                 self.order_timer.stop()
@@ -776,12 +784,13 @@ class MainWindow(QMainWindow):
 
             # ✅ 주문 큐 타이머 시작 (주문은 메인 스레드에서만)
             try:
-                self.order_timer.start(100)
+                self.order_timer.start(20)
             except Exception:
                 pass
 
-            self.trading_timer.start(30000)
-            self.refresh_timer.start(60000)  # 혹시 꺼져있었으면 다시 켬
+            self.trading_timer.start(20000)
+            self.refresh_timer.start(60000)  # 잔고 갱신 60초
+            self.watchlist_refresh_timer.start(180000)  # 감시 종목 갱신 3분
         else:
             self.log("[시스템] 자동매매 시작 실패 (AutoTrader.start()가 False 반환)")
             QMessageBox.warning(self, "시작 실패", "자동매매 시작에 실패했습니다. 로그를 확인해주세요.")
@@ -791,25 +800,34 @@ class MainWindow(QMainWindow):
         if self._is_stopping or not self.trader or not self.trader.is_running:
             return
 
+        # TR 처리 중이면 복원 지연 후 재시도
+        if self.kiwoom and self.kiwoom.is_tr_queue_busy():
+            if not self._restore_retry_scheduled:
+                self._restore_retry_scheduled = True
+                QTimer.singleShot(1500, self._restore_orders_async)
+            return
+
         try:
             self.trader.clear_stale_pending_orders()
         except Exception as e:
             self.log(f"[시스템] 미체결 주문 정리 오류: {e}")
 
         # 주문 복원은 별도 타이머로 처리 (UI 프리징 방지)
-        QTimer.singleShot(500, self._restore_orders_async)
+        # 자동매매 시작 직후 1~2초 지연 후 복원
+        QTimer.singleShot(1500, self._restore_orders_async)
 
     def _restore_orders_async(self):
         """주문 복원을 비동기로 처리"""
         if self._is_stopping or not self.trader or not self.trader.is_running:
             return
 
-        # ✅ 장이 열렸을 때만 복원 실행 (장 전이면 장 열림 타이머가 처리)
-        if not self.trader.is_market_open():
-            self.log("[시스템] 장 시간이 아니어서 주문 복원 대기 - 장 열림 시 자동 복원됨")
+        # ✅ 거래 가능 시간에만 복원 실행 (정규장 또는 NXT 프리/애프터)
+        if not self.trader.is_any_trading_time():
+            self.log("[시스템] 거래 가능 시간이 아니어서 주문 복원 대기 - 장 열림 시 자동 복원됨")
             return
 
         try:
+            self._restore_retry_scheduled = False
             self.trader.check_and_restore_orders()
             self._orders_restored_today = True  # ✅ 복원 완료 표시
         except Exception as e:
@@ -836,16 +854,15 @@ class MainWindow(QMainWindow):
         if not self.trader or not self.trader.is_running:
             return
 
-        # 정규장 시간 체크 (09:00 ~ 15:30)
-        current_time = now.time()
-        market_open = dt_time(9, 0)
-        market_close = dt_time(15, 30)
-
-        if not (market_open <= current_time <= market_close):
+        # 거래 가능 시간(정규장 또는 NXT 프리/애프터) 체크
+        if not self.trader.is_any_trading_time():
             return
 
         # ✅ TR 재진입 방지: TR 또는 TR 큐 처리 중이면 스킵
         if self.kiwoom and self.kiwoom.is_tr_queue_busy():
+            if not self._restore_retry_scheduled:
+                self._restore_retry_scheduled = True
+                QTimer.singleShot(1500, self._restore_orders_async)
             return
 
         # ✅ 이미 복원했어도 미체결 주문이 없으면 다시 복원 시도
@@ -867,8 +884,10 @@ class MainWindow(QMainWindow):
                 return
 
         # 주문 복원 실행
-        self.log("[시스템] 정규장 시간 - 주문 복원 자동 실행")
+        market_type = self.trader.get_current_market_type()
+        self.log(f"[시스템] 거래 가능 시간({market_type}) - 주문 복원 자동 실행")
         try:
+            self._restore_retry_scheduled = False
             self.trader.check_and_restore_orders()
             self._orders_restored_today = True
         except Exception as e:
@@ -960,6 +979,8 @@ class MainWindow(QMainWindow):
             self.balance_label.setText(f"예수금: {deposit:,}원")
         except Exception:
             pass
+        if self.trader:
+            self.trader.update_available_funds(deposit)
 
     def _on_balance_changed(self, _code, _quantity, _avg_price):
         """잔고 변경 시그널 처리 (개별 종목) - 디바운스 적용으로 과도한 TR 호출 방지"""
@@ -1008,6 +1029,27 @@ class MainWindow(QMainWindow):
     # =========================
     # 실시간 시세 UI 반영
     # =========================
+    def _on_realtime_price_dispatch(self, code, price, volume):
+        """
+        실시간 시세 수신 통합 디스패치:
+        - UI 갱신
+        - (event_engine가 kiwoom에 연결되지 않은 경우) AutoTrader 트리거로 전달
+        """
+        try:
+            self._on_realtime_price(code, price, volume)
+        except Exception:
+            pass
+
+        # event_engine가 직접 kiwoom에 연결되어 있지 않다면 동일 스트림을 전달
+        try:
+            if (self.trader and self.trader.event_engine and
+                    self.kiwoom and self.kiwoom.event_engine is None):
+                self.trader.event_engine.push_event(
+                    "price", code, {"price": price, "volume": volume}
+                )
+        except Exception:
+            pass
+
     def _on_realtime_price(self, code, price, volume):
         """실시간 시세 콜백 → 보유종목/감시종목 테이블 즉시 갱신"""
         try:
@@ -1059,19 +1101,26 @@ class MainWindow(QMainWindow):
         """감시종목 테이블에서 해당 종목의 현재가 실시간 갱신"""
         row = self._watchlist_code_to_row.get(code)
         if row is None or row >= self.watchlist_table.rowCount():
-            return
+            # 매핑이 없으면 테이블을 스캔해 보정
+            for r in range(self.watchlist_table.rowCount()):
+                item = self.watchlist_table.item(r, 0)
+                if item and item.text() == code:
+                    row = r
+                    self._watchlist_code_to_row[code] = r
+                    break
+            if row is None or row >= self.watchlist_table.rowCount():
+                return
         self.watchlist_table.setItem(row, 2, QTableWidgetItem(f"{price:,}"))
 
     # =========================
     # 데이터 갱신
     # =========================
     def refresh_data(self):
-        """데이터 갱신 (TR 큐 기반으로 순차 처리됨)"""
+        """잔고 갱신 (TR 큐 기반, 60초 주기)"""
         if self._is_stopping:
             return
-        # ✅ TR 큐가 순차 처리하므로 별도 지연 없이 요청 추가
+        # ✅ 잔고만 갱신 (감시 종목은 별도 타이머로 5분 주기)
         self.refresh_holdings()
-        self.refresh_watchlist()
 
     def refresh_holdings(self):
         """보유 종목 갱신 (큐 기반 비동기)"""
@@ -1104,6 +1153,8 @@ class MainWindow(QMainWindow):
                 self.log(f"[잔고조회] opw00018 예수금=0, opw00001로 재조회 요청...")
                 self.kiwoom.get_deposit_async(account, self._on_deposit_received)
             else:
+                if self.trader:
+                    self.trader.update_available_funds(deposit)
                 self._update_holdings_ui(balance, deposit)
 
         except Exception as e:
@@ -1134,6 +1185,8 @@ class MainWindow(QMainWindow):
                 self.log("  4. 프로그램 재시작 후 다시 시도")
 
             self.balance_label.setText(f"예수금: {deposit:,}원")
+            if self.trader:
+                self.trader.update_available_funds(deposit)
 
         except Exception as e:
             self.log(f"[잔고조회] 예수금 처리 오류: {e}")
@@ -1231,8 +1284,8 @@ class MainWindow(QMainWindow):
                             self.watchlist_table.setItem(row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price)))
                             self.watchlist_table.setItem(row, 3, QTableWidgetItem(self._fmt_int_or_dash(envelope.get("ma"))))
                             self.watchlist_table.setItem(row, 4, QTableWidgetItem(self._fmt_int_or_dash(envelope.get("lower"))))
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            self.log(f"[시스템] 감시 종목 지표 갱신 실패: {code} ({e})")
 
             self.watchlist_table.viewport().update()
 
@@ -1261,6 +1314,8 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log(f"[시스템] 감시 종목 갱신 오류: {e}")
             self._is_refreshing_watchlist = False
+
+        self._refresh_watchlist_realtime_registration()
 
     def _refresh_watchlist_next(self):
         """비동기로 감시 종목 정보를 하나씩 갱신 (TR 큐 기반)"""
@@ -1365,6 +1420,53 @@ class MainWindow(QMainWindow):
     # =========================
     # 워치리스트 관리
     # =========================
+    def _unregister_watchlist_realtime(self):
+        """감시종목 실시간 등록 해제"""
+        if not self.kiwoom:
+            return
+        for screen_no in self._watchlist_rt_screens:
+            try:
+                self.kiwoom.set_real_remove(screen_no, "ALL")
+            except Exception:
+                pass
+        self._watchlist_rt_registered = False
+
+    def _register_watchlist_realtime(self):
+        """감시종목 실시간 등록 (200개 이하일 때만 전부 등록)"""
+        if not self.kiwoom or not self.kiwoom.is_connected():
+            return
+
+        watchlist = self.config.get_watchlist()
+        codes = [item.get("code", "").strip() for item in watchlist if item.get("code")]
+        codes = [c for c in codes if c]
+
+        if len(codes) > 200:
+            # 제한 초과 시 실시간 등록 유지하지 않음
+            self._unregister_watchlist_realtime()
+            return
+
+        # 기존 등록 해제 후 재등록
+        self._unregister_watchlist_realtime()
+
+        # 화면번호당 최대 100종목씩 등록
+        chunks = [codes[i:i + 100] for i in range(0, len(codes), 100)]
+        for idx, screen_no in enumerate(self._watchlist_rt_screens):
+            if idx >= len(chunks):
+                break
+            codes_str = ";".join(chunks[idx])
+            try:
+                self.kiwoom.set_real_reg(screen_no, codes_str, "10;15;20", "0")
+            except Exception:
+                pass
+
+        self._watchlist_rt_registered = True
+
+    def _refresh_watchlist_realtime_registration(self):
+        """감시종목 실시간 등록 상태 갱신"""
+        if not self.kiwoom or not self.kiwoom.is_connected():
+            return
+        self._register_watchlist_realtime()
+
     def add_to_watchlist(self):
         """감시 종목 추가 (종목코드 또는 종목명으로 검색)"""
         input_text = self.add_code_input.text().strip()
@@ -1796,12 +1898,34 @@ class MainWindow(QMainWindow):
 
         self.refresh_timer.stop()
         self.trading_timer.stop()
+        self.watchlist_refresh_timer.stop()
         event.accept()
 
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # 사용 기간 체크
+    today = datetime.date.today()
+    expiry_date = datetime.date(2026, 12, 31)
+
+    if today > expiry_date:
+        QMessageBox.critical(None, "사용 기간 만료",
+            "프로그램 사용 기간이 만료되었습니다.\n관리자에게 문의해 주세요.\n"
+            f"kanu:010-8646-8906")
+        sys.exit(0)
+
+    if today.year == 2026 and today.month == 12:
+        remaining = (expiry_date - today).days
+        QMessageBox.warning(None, "사용 기간 안내",
+            f"프로그램 사용 기간이 {remaining}일 남았습니다.\n"
+            f"만료일: 2026년 12월 31일\n\n"
+            f"계속 사용하시려면 관리자에게 문의해 주세요.\n"
+            f"kanu:010-8646-8906")
+
+    QMessageBox.information(None, "안내",
+        "검증이 되지 않은 테스트 버전입니다. 사용에 유의 바랍니다.")
 
     window = MainWindow()
     window.show()

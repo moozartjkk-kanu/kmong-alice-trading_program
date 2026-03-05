@@ -9,6 +9,8 @@ from collections import defaultdict
 from datetime import datetime
 from PyQt5.QtCore import QTimer, QObject, pyqtSignal
 
+from kiwoom_api import is_extended_hours, to_nxt_code, is_nxt_code
+
 
 class Debouncer:
     """디바운스 처리 클래스 - 동일 종목의 연속 이벤트 병합"""
@@ -71,7 +73,7 @@ class BatchScheduler:
 
         # 캐시된 봉데이터 {code: {"candles": [...], "updated_at": timestamp}}
         self.candle_cache = {}
-        self.cache_ttl = 60  # 캐시 유효 시간 (초)
+        self.cache_ttl = 300  # 캐시 유효 시간 (5분) - TR 호출 최소화
 
     def set_stocks(self, stock_codes):
         """관리할 종목 설정"""
@@ -241,8 +243,11 @@ class EventEngine(QObject):
     """
 
     # 배치 처리 타이밍 상수
-    BATCH_INTERVAL_MS = 3000  # 배치 간격 (3초)
-    STOCK_INTERVAL_MS = 350   # 종목 간 간격 (350ms)
+    BATCH_INTERVAL_MS = 5000  # 배치 간격 (5초)
+    STOCK_INTERVAL_MS = 1000  # 종목 간 간격 (1초) - TR 호출 제한 준수
+
+    # NXT 실시간 전용 화면번호
+    NXT_SCREEN_NO = "1002"
 
     def __init__(self, kiwoom_api, config, log_callback=None):
         """
@@ -259,12 +264,12 @@ class EventEngine(QObject):
         # 이벤트 큐
         self.event_queue = Queue()
 
-        # 디바운서 (200ms)
-        self.debouncer = Debouncer(delay_ms=200)
+        # 디바운서 (10ms - 매수 신호 지연 최소화)
+        self.debouncer = Debouncer(delay_ms=10)
 
-        # 배치 스케줄러 (10종목씩, 60초 주기로 전체 갱신)
-        # 200종목 기준: 10종목/3초 = 200종목/60초
-        self.batch_scheduler = BatchScheduler(batch_size=10, interval_seconds=60)
+        # 배치 스케줄러 (5종목씩, 300초 주기로 전체 갱신)
+        # TR 호출 제한 준수: 5종목/5초 = 60종목/분 (키움 제한 이내)
+        self.batch_scheduler = BatchScheduler(batch_size=5, interval_seconds=300)
 
         # 실시간 관리자
         self.realtime_manager = RealTimeManager()
@@ -284,6 +289,9 @@ class EventEngine(QObject):
 
         self.batch_index = 0  # 현재 배치 내 처리 중인 인덱스
         self.current_batch = []  # 현재 배치 종목 리스트
+
+        # NXT 실시간 등록 상태
+        self._nxt_realtime_active = False
 
         # 콜백
         self.on_price_update = None  # (code, price) 콜백
@@ -347,6 +355,9 @@ class EventEngine(QObject):
         if self.kiwoom:
             for screen_no in self.realtime_manager.get_screen_numbers():
                 self.kiwoom.set_real_remove(screen_no, "ALL")
+            # NXT 실시간 화면도 해제
+            self.kiwoom.set_real_remove(self.NXT_SCREEN_NO, "ALL")
+            self._nxt_realtime_active = False
             self.kiwoom.set_event_engine(None)
 
         self.log("이벤트 엔진 중지")
@@ -358,6 +369,7 @@ class EventEngine(QObject):
         키움 OpenAPI+ 규칙:
         - 한 화면번호당 최대 100종목
         - 200종목은 화면번호 2개로 분배 (1000, 1001)
+        - NXT 시간대에는 NXT 코드(_NX)를 별도 화면(1002)에 추가 등록
         """
         result = self.realtime_manager.calculate_registrations(watchlist_codes)
         screen_registrations = result["screen_registrations"]
@@ -391,19 +403,91 @@ class EventEngine(QObject):
         if unregistered:
             self.log(f"순환 조회 대상: {len(unregistered)}종목 (200종목 초과분)")
 
+        # NXT 시간대이면 NXT 코드 추가 등록
+        if is_extended_hours():
+            self._setup_nxt_realtime(watchlist_codes)
+        else:
+            self._remove_nxt_realtime()
+
+    def _setup_nxt_realtime(self, watchlist_codes):
+        """
+        NXT 실시간 등록 (NXT 전용 화면번호 1002 사용)
+
+        NXT 시간대(프리마켓/애프터마켓)에 _NX 접미사 코드로 실시간 등록하여
+        NXT 시세를 수신. NXT 데이터를 받지 못하는 종목은 KRX 시세 그대로 유지.
+        """
+        if not self.kiwoom or not watchlist_codes:
+            return
+
+        # 기존 NXT 등록 해제 후 재등록
+        self.kiwoom.set_real_remove(self.NXT_SCREEN_NO, "ALL")
+
+        # KRX 코드 → NXT 코드 변환
+        nxt_codes = [to_nxt_code(code) for code in watchlist_codes if not is_nxt_code(code)]
+        if not nxt_codes:
+            return
+
+        # 최대 100종목 제한 (화면번호 1개)
+        nxt_codes = nxt_codes[:100]
+        codes_str = ";".join(nxt_codes)
+        self.kiwoom.set_real_reg(self.NXT_SCREEN_NO, codes_str, "10;15;20", "0")
+
+        self._nxt_realtime_active = True
+        self.log(f"NXT 실시간 등록: {len(nxt_codes)}종목 (화면 {self.NXT_SCREEN_NO})")
+
+    def _remove_nxt_realtime(self):
+        """NXT 실시간 등록 해제"""
+        if not self._nxt_realtime_active:
+            return
+
+        if self.kiwoom:
+            self.kiwoom.set_real_remove(self.NXT_SCREEN_NO, "ALL")
+
+        self._nxt_realtime_active = False
+        self.log("NXT 실시간 등록 해제")
+
+    def refresh_realtime(self, watchlist_codes, priority_codes=None):
+        """
+        실시간 등록 갱신 (시장 전환 시 호출)
+
+        NXT 시간대 진입 시 NXT 코드 등록, 종료 시 해제.
+        KRX 등록은 유지.
+        """
+        if not self.is_running or not self.kiwoom:
+            return
+
+        if priority_codes:
+            self.realtime_manager.set_priority_stocks(priority_codes)
+
+        if is_extended_hours():
+            if not self._nxt_realtime_active:
+                self._setup_nxt_realtime(watchlist_codes)
+        else:
+            self._remove_nxt_realtime()
+
     def push_event(self, event_type, code, data):
         """
-        이벤트 큐에 추가 (디바운스 적용)
+        이벤트 처리 (디바운스 적용)
+
+        price 이벤트: 디바운스 후 직접 콜백 호출 (event_queue 바이패스로 지연 최소화)
+        trade/batch 이벤트: 기존대로 event_queue 경유
 
         Args:
             event_type: 이벤트 타입 ('price', 'trade', 'batch')
             code: 종목 코드
             data: 이벤트 데이터
         """
-        # 가격 이벤트는 디바운스 적용
         if event_type == "price":
+            # 디바운스 적용
             if not self.debouncer.should_process(code, data):
-                return  # 디바운스로 스킵
+                return
+            # 직접 콜백 호출 (event_queue/worker 스레드 홉 제거)
+            if self.on_price_update:
+                try:
+                    self.on_price_update(code, data.get("price", 0))
+                except Exception:
+                    pass
+            return
 
         self.event_queue.put({
             "type": event_type,
@@ -459,6 +543,10 @@ class EventEngine(QObject):
         if self.kiwoom.is_tr_busy():
             return
 
+        # ✅ TR 쿨다운 중이면 배치 스킵 (-209 에러 방지)
+        if self.kiwoom.is_tr_cooldown():
+            return
+
         # 다음 배치 종목 가져오기
         self.current_batch = self.batch_scheduler.get_next_batch()
         if not self.current_batch:
@@ -494,6 +582,11 @@ class EventEngine(QObject):
             self.stock_timer.start(self.STOCK_INTERVAL_MS)
             return
 
+        # ✅ TR 쿨다운 중이면 현재 배치 중단 (-209 에러 방지)
+        if self.kiwoom.is_tr_cooldown():
+            self.stock_timer.stop()
+            return
+
         code = self.current_batch[self.batch_index]
         self.batch_index += 1
 
@@ -512,13 +605,14 @@ class EventEngine(QObject):
         if self.batch_index < len(self.current_batch):
             self.stock_timer.start(self.STOCK_INTERVAL_MS)
 
-    def get_candles(self, code, force_refresh=False):
+    def get_candles(self, code, force_refresh=False, cache_only=False):
         """
         봉데이터 가져오기 (캐시 우선)
 
         Args:
             code: 종목 코드
             force_refresh: 강제 새로고침 여부
+            cache_only: True이면 캐시만 사용 (TR 호출 안 함, -209 방지)
 
         Returns:
             봉데이터 리스트
@@ -528,8 +622,16 @@ class EventEngine(QObject):
             if cached:
                 return cached
 
+        # 캐시 전용 모드: TR 호출 없이 캐시만 사용
+        if cache_only:
+            return None
+
         # ✅ TR 재진입 방지: busy이면 캐시 없음으로 반환
         if self.kiwoom.is_tr_busy():
+            return None
+
+        # ✅ TR 쿨다운 중이면 TR 호출 스킵
+        if self.kiwoom.is_tr_cooldown():
             return None
 
         # 캐시 없으면 직접 조회
