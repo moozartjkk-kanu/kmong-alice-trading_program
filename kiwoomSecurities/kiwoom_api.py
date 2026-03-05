@@ -7,6 +7,7 @@ import time
 from collections import deque
 from datetime import datetime, time as dt_time
 from threading import Lock
+from log_utils import DailyFileLogger
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QObject, pyqtSignal, QTimer
 from PyQt5.QtWidgets import QApplication
@@ -410,6 +411,8 @@ class KiwoomAPI:
         self.event_engine = None
         # 디버그 로그
         self.debug = False
+        # [TR] received rqname 로그 파일 저장
+        self._tr_logger = DailyFileLogger("tr_received")
 
     def set_debug(self, enabled=True):
         """디버그 로그 토글"""
@@ -418,6 +421,9 @@ class KiwoomAPI:
     def _debug(self, message):
         if self.debug:
             print(message)
+        if "[TR] received rqname" in message:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self._tr_logger.write(f"[{timestamp}] {message}")
 
     def is_tr_busy(self):
         """TR 요청 처리 중 여부 확인 (재진입 방지용)"""

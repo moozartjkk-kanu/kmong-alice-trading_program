@@ -6,6 +6,7 @@ import sys
 import datetime
 from collections import deque
 import time  # ✅ 추가: 로그 스팸/쓰로틀용
+from log_utils import DailyFileLogger
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -69,6 +70,9 @@ class MainWindow(QMainWindow):
         self.ta = TechnicalAnalysis()
 
         self.init_ui()
+
+        # 잔고조회 예수금 로그 파일 저장
+        self._deposit_logger = DailyFileLogger("deposit")
 
         # ✅ 로그 버퍼링 (UI 프리징 방지)
         self._log_buffer = deque(maxlen=5000)
@@ -559,12 +563,15 @@ class MainWindow(QMainWindow):
 
     def log(self, message):
         """로그 출력(버퍼링)"""
+        msg = str(message)
         try:
-            self._log_buffer.append(str(message))
+            self._log_buffer.append(msg)
         except Exception:
             if hasattr(self, 'log_text') and self.log_text is not None:
-                self.log_text.append(str(message))
+                self.log_text.append(msg)
                 self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+        if "[잔고조회]" in msg and "예수금" in msg:
+            self._deposit_logger.write(msg)
 
     
     def _flush_log_buffer(self):
