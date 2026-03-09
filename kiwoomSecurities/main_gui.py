@@ -149,7 +149,7 @@ class MainWindow(QMainWindow):
         except Exception:
             percent = 19
 
-        headers = ["종목코드", "종목명", "현재가", "메인 기준", f"main condition하단(-{percent}%)"]
+        headers = ["종목코드", "종목명", "현재가", "메인 기준", f"main condition"]
         if hasattr(self, "watchlist_table") and self.watchlist_table is not None:
             self.watchlist_table.setHorizontalHeaderLabels(headers)
 
@@ -279,7 +279,7 @@ class MainWindow(QMainWindow):
 
         self.analysis_code_label = QLabel("종목: -")
         self.analysis_ma20_label = QLabel("메인 기준: -")
-        self.analysis_main_condition_label = QLabel("main condition 하한: -")
+        self.analysis_main_condition_label = QLabel("main condition: -")
         self.analysis_buy_signal_label = QLabel("매수 신호: -")
         self.analysis_position_label = QLabel("포지션: -")
 
@@ -399,7 +399,7 @@ class MainWindow(QMainWindow):
         self.watchlist_table = QTableWidget()
         self.watchlist_table.setColumnCount(5)
         self.watchlist_table.setHorizontalHeaderLabels([
-            "종목코드", "종목명", "현재가", "메인 기준", "main condition하단(-19%)"
+            "종목코드", "종목명", "현재가", "메인 기준", "main condition"
         ])
         self.watchlist_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.watchlist_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1651,7 +1651,7 @@ class MainWindow(QMainWindow):
 
         self.analysis_code_label.setText(f"종목: {code} {name} (현재가: {price_txt}원)")
         self.analysis_ma20_label.setText(f"메인 기준: {ma_txt}원")
-        self.analysis_main_condition_label.setText(f"main condition 하한: {lower_txt}원")
+        self.analysis_main_condition_label.setText(f"main condition: {lower_txt}원")
 
         signal_text = buy_signal.get("reason", "-")
         if buy_signal.get("signal"):
