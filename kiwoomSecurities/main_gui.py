@@ -1908,24 +1908,24 @@ def main():
 
     # 사용 기간 체크
     today = datetime.date.today()
-    expiry_date = datetime.date(2026, 12, 31)
+    expiry_date = datetime.date(2026, 4, 4)
 
     if today > expiry_date:
         QMessageBox.critical(None, "사용 기간 만료",
             "프로그램 사용 기간이 만료되었습니다.\n관리자에게 문의해 주세요.\n"
-            f"kanu:010-8646-8906")
+            f"kanu:moozartjkk@gmail.com")
         sys.exit(0)
 
-    if today.year == 2026 and today.month == 12:
+    if today.year == 2026 and today.month == 3:
         remaining = (expiry_date - today).days
         QMessageBox.warning(None, "사용 기간 안내",
             f"프로그램 사용 기간이 {remaining}일 남았습니다.\n"
-            f"만료일: 2026년 12월 31일\n\n"
+            f"만료일: 2026년 4월 4일\n\n"
             f"계속 사용하시려면 관리자에게 문의해 주세요.\n"
-            f"kanu:010-8646-8906")
+            f"kanu:moozartjkk@gmail.com")
 
     QMessageBox.information(None, "안내",
-        "검증이 되지 않은 테스트 버전입니다. 사용에 유의 바랍니다.")
+        "무료 체험판 버전입니다.")
 
     window = MainWindow()
     window.show()
