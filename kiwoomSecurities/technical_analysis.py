@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-기술적 분석 모듈 - 이동평균선, 엔벨로프 계산
+기술적 분석 모듈 - 이동평균선, main condition 계산
 
 ✅ 매수(요약)
-- 트리거: 20일선(MA) 기준 -19% 도달 시
-- 주문가: 일봉 엔벨로프(period=20, percent=20) 하단선(지지선) + 1호가에 지정가 매수
+- 트리거: 메인 기준(MA) 기준 -19% 도달 시
+- 주문가: 일봉 main condition(period=20, percent=20) 하단선(지지선) + 1호가에 지정가 매수
 
 ✅ 매도(요구사항 반영)
 1) 스탑로스 발생 시: 잔여 물량 100%를 "지정가" 매도
    - 트리거: (기존 로직 유지) 한 번이라도 매도 후, 현재가 <= 평단가
    - 주문가: 현재가를 호가단위로 내림한 가격(지정가)
 
-2) 익절/20일선 매도는 "항상" 걸려 있어야 함
+2) 익절/메인 기준 매도는 "항상" 걸려 있어야 함
    - 평단가 대비 +2.95%에 30%
    - +4.95%에 30%
    - +6.95%에 30%
-   - 20일선(MA) 가격에 나머지 10%
+   - 메인 기준(MA) 가격에 나머지 10%
    => check_sell_signals()는 "현재가 돌파 여부"가 아니라
       "지금 포지션 기준으로 걸어둬야 하는 지정가 매도 주문들"을 반환하도록 구성.
 """
@@ -33,7 +33,7 @@ class TechnicalAnalysis:
             return None
 
     @staticmethod
-    def calculate_envelope(ma_price, percent):
+    def calculate_main_condition(ma_price, percent):
         if ma_price is None:
             return None, None
         try:
@@ -64,12 +64,12 @@ class TechnicalAnalysis:
         return float(sum(close_prices) / period)
 
     @staticmethod
-    def get_envelope_levels(candles, period=20, percent=20):
+    def get_main_condition_levels(candles, period=20, percent=20):
         ma = TechnicalAnalysis.get_ma_from_candles(candles, period)
         if ma is None:
             return {"ma": None, "upper": None, "lower": None}
 
-        upper, lower = TechnicalAnalysis.calculate_envelope(ma, percent)
+        upper, lower = TechnicalAnalysis.calculate_main_condition(ma, percent)
         return {"ma": ma, "upper": upper, "lower": lower}
 
 
@@ -153,12 +153,12 @@ class TradingSignal:
     def check_buy_signal(self, code, current_price, candles, position=None):
         """
         ✅ 요구사항 반영(이전 요청):
-        - 20일선(MA) 기준 -19% 값에 도달하면 트리거
-        - 트리거 발생 시: 엔벨로프(period=20, percent=20) 하단선(지지선) + 1호가에 지정가 매수
+        - 메인 기준(MA) 기준 -19% 값에 도달하면 트리거
+        - 트리거 발생 시: main condition(period=20, percent=20) 하단선(지지선) + 1호가에 지정가 매수
         """
-        period = self._get_cfg_int("buy", "envelope_period", 20)
-        trigger_percent = self._get_cfg_int("buy", "envelope_percent", 19)      # 트리거(-19%)
-        buy_percent = self._get_cfg_int("buy", "envelope_buy_percent", 20)      # 지지선(-20%)
+        period = self._get_cfg_int("buy", "main_condition_period", 20)
+        trigger_percent = self._get_cfg_int("buy", "main_condition_percent", 19)      # 트리거(-19%)
+        buy_percent = self._get_cfg_int("buy", "main_condition_buy_percent", 20)      # 지지선(-20%)
 
         ma = self.ta.get_ma_from_candles(candles, period)
         if ma is None:
@@ -166,10 +166,10 @@ class TradingSignal:
 
         trigger_price = ma * (1 - trigger_percent / 100.0)
 
-        env_buy = self.ta.get_envelope_levels(candles, period, buy_percent)
+        env_buy = self.ta.get_main_condition_levels(candles, period, buy_percent)
         support_lower = env_buy.get("lower")
         if support_lower is None:
-            return {"signal": False, "reason": "데이터 부족(엔벨로프)"}
+            return {"signal": False, "reason": "데이터 부족(main condition)"}
 
         max_buy_count = self._get_cfg_int("buy", "max_buy_count", 3)
         drop_percent = self._get_cfg_int("buy", "additional_buy_drop_percent", 10)
@@ -193,7 +193,7 @@ class TradingSignal:
                         f"지지선(-{buy_percent}%): {int(support_lower):,} → 지정가: {limit_buy_price:,}"
                     ),
                     "target_price": limit_buy_price,
-                    "envelope_lower": int(support_lower),
+                    "main_condition_lower": int(support_lower),
                     "ma20": int(ma),  # 기존 키 호환 (의미: period선)
                     "order_type": self.ORDER_TYPE_LIMIT
                 }
@@ -248,7 +248,7 @@ class TradingSignal:
     def check_sell_signals(self, code, current_price, candles, position):
         """
         ✅ 요구사항 반영:
-        - 익절 3구간 + MA(20일선) 1구간의 지정가 매도 주문이 "항상" 걸려있도록
+        - 익절 3구간 + MA(메인 기준) 1구간의 지정가 매도 주문이 "항상" 걸려있도록
           '현재가 돌파 시'가 아니라 '걸어둘 주문 리스트'를 반환.
 
         - 스탑로스는 (한 번이라도 매도 후) 현재가 <= 평단가면
@@ -264,8 +264,8 @@ class TradingSignal:
         if avg_price <= 0 or current_qty <= 0:
             return []
 
-        # ✅ MA(20일선) 계산
-        period = self._get_cfg_int("buy", "envelope_period", 20)
+        # ✅ MA(메인 기준) 계산
+        period = self._get_cfg_int("buy", "main_condition_period", 20)
         ma = self.ta.get_ma_from_candles(candles, period)
         ma_target_name = f"{period}일선"
 
@@ -368,7 +368,7 @@ class TradingSignal:
             f"익절3 지정가 매도: 평단가({int(avg_price):,}) 대비 +{target_rates[2]}% → {int(p3):,}원, 비중 30%"
         )
 
-        # 20일선 나머지 10% (지정가)
+        # 메인 기준 나머지 10% (지정가)
         if ma is not None:
             ma_price = self._ceil_to_tick(ma) or int(ma)
             # 마지막은 "나머지"가 이상적이므로, q_ma 대신 남은 잔량을 전부 걸어버리는 방식이 안정적
@@ -412,12 +412,12 @@ class TradingSignal:
         quantity = int(position.get("quantity", 0) or 0)
         buy_count = int(position.get("buy_count", 0) or 0)
 
-        period = self._get_cfg_int("buy", "envelope_period", 20)
-        trigger_percent = self._get_cfg_int("buy", "envelope_percent", 19)
-        buy_percent = self._get_cfg_int("buy", "envelope_buy_percent", 20)
+        period = self._get_cfg_int("buy", "main_condition_period", 20)
+        trigger_percent = self._get_cfg_int("buy", "main_condition_percent", 19)
+        buy_percent = self._get_cfg_int("buy", "main_condition_buy_percent", 20)
 
         ma = self.ta.get_ma_from_candles(candles, period)
-        env_buy = self.ta.get_envelope_levels(candles, period, buy_percent)
+        env_buy = self.ta.get_main_condition_levels(candles, period, buy_percent)
 
         trigger_price = int(ma * (1 - trigger_percent / 100.0)) if ma is not None else None
 
@@ -442,7 +442,7 @@ class TradingSignal:
 
             if ma is not None:
                 ma_price = self._ceil_to_tick(ma) or int(ma)
-                sell_targets.append({"name": f"{period}일선", "price": int(ma_price)})
+                sell_targets.append({"name": f"최종 매도 목표가", "price": int(ma_price)})
 
         return {
             "avg_price": int(avg_price) if avg_price else 0,
@@ -454,7 +454,7 @@ class TradingSignal:
             "eval_amount": current_price * quantity,
             "ma20": int(ma) if ma is not None else None,
             "trigger_price_ma_minus_percent": trigger_price,
-            "envelope_lower": int(env_buy["lower"]) if env_buy.get("lower") is not None else None,
+            "main_condition_lower": int(env_buy["lower"]) if env_buy.get("lower") is not None else None,
             "sell_targets": sell_targets,
             "sold_targets": position.get("sold_targets", []) or []
         }

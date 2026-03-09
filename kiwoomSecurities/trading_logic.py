@@ -1,17 +1,17 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 자동매매 로직 모듈 (StopLoss 평단가 지정가 100% 매도 + 익일 재주문 유지)
 
 ✅ 요구사항 반영:
-1. 20일선 기준 -19% 도달 시 엔벨로프(period20, percent20) 하단선+1호가에 지정가 매수
+1. 메인 기준 기준 -19% 도달 시 main condition(period20, percent20) 하단선+1호가에 지정가 매수
 2. 스탑로스: 첫 매도 후 잔여수량 존재 시, 현재가가 평단가+1호가에 도달하면
    → 평단가에 지정가 매도 주문(100%)을 걸고 체결될 때까지 유지
 3. 매도 주문은 매수 체결 직후 즉시 모두 걸어둠:
-   - 평단가 +2.95%에 30%, +4.95%에 30%, +6.95%에 30%, 20일선에 10%
+   - 평단가 +2.95%에 30%, +4.95%에 30%, +6.95%에 30%, 메인 기준에 10%
 4. 스탑로스 발동 시: 미체결 매수 취소, 100% 매도까지 스탑로스 유지, 익일 재주문
 5. 프로그램 재시작 시 상태 복원
 6. 장 종료 후 미체결 주문 저장 및 다음 장 시작 시 복원
-7. 매수/매도 상태 완전 추적 (1차/2차/3차, 익절1/2/3/20일선)
+7. 매수/매도 상태 완전 추적 (1차/2차/3차, 익절1/2/3/메인 기준)
 """
 
 from datetime import datetime, time as dt_time
@@ -47,7 +47,7 @@ class AutoTrader:
     # 매도 목표 설정 (고정)
     PROFIT_TARGETS = [2.95, 4.95, 6.95]  # 익절 목표 수익률 (%)
     PROFIT_RATIOS = [30, 30, 30]         # 익절 비중 (%)
-    MA_SELL_RATIO = 10                    # 20일선 매도 비중 (%)
+    MA_SELL_RATIO = 10                    # 메인 기준 매도 비중 (%)
 
     def __init__(self, kiwoom_api, config):
         """
@@ -797,8 +797,8 @@ class AutoTrader:
 
         요구사항: 매수 체결 시점에 바로 모든 매도 주문이 걸려있어야 함
 
-        자동매수: 익절1~3 (30/30/30) + 20일선 (10%)
-        수동매수: 익절1~3 (30/40/30), 20일선 매도 없음
+        자동매수: 익절1~3 (30/30/30) + 메인 기준 (10%)
+        수동매수: 익절1~3 (30/40/30), 메인 기준 매도 없음
         """
         if not position or position.get("quantity", 0) <= 0:
             return
@@ -827,7 +827,7 @@ class AutoTrader:
         # 수동매수 여부 확인
         is_manual_buy = position.get("is_manual_buy", False)
 
-        # 20일선 가격 계산 (수동매수는 20일선 매도 없으므로 None)
+        # 메인 기준 가격 계산 (수동매수는 메인 기준 매도 없으므로 None)
         ma20 = None
         if not is_manual_buy:
             period = 20
@@ -986,24 +986,24 @@ class AutoTrader:
         - 익절1 (+2.95%): 30%
         - 익절2 (+4.95%): 30%
         - 익절3 (+6.95%): 30%
-        - 20일선: 나머지 10%
+        - 메인 기준: 나머지 10%
 
         수동매수 전체물량 기준:
         - 익절1 (+2.95%): 30%
         - 익절2 (+4.95%): 40%
         - 익절3 (+6.95%): 30%
-        - 20일선: 없음
+        - 메인 기준: 없음
         """
         orders = []
 
         if is_manual_buy:
-            # ✅ 수동매수: [30, 40, 30] 비중, 20일선 매도 없음
+            # ✅ 수동매수: [30, 40, 30] 비중, 메인 기준 매도 없음
             q1 = int(initial_qty * 0.30)  # 30%
             q2 = int(initial_qty * 0.40)  # 40%
             q3 = initial_qty - q1 - q2    # 나머지 (약 30%)
             ratios = [30, 40, 30]
         else:
-            # 자동매수: [30, 30, 30] 비중 + 20일선 10%
+            # 자동매수: [30, 30, 30] 비중 + 메인 기준 10%
             q1 = int(initial_qty * 0.30)  # 30%
             q2 = int(initial_qty * 0.30)  # 30%
             q3 = int(initial_qty * 0.30)  # 30%
@@ -1056,8 +1056,8 @@ class AutoTrader:
                 })
                 used_qty += min(q3, current_qty - used_qty)
 
-        # 20일선: 나머지 (수동매수는 20일선 매도 없음)
-        if not is_manual_buy and ma20 and "20일선" not in sold_targets:
+        # 메인 기준: 나머지 (수동매수는 메인 기준 매도 없음)
+        if not is_manual_buy and ma20 and "메인 기준" not in sold_targets:
             q_ma = initial_qty - int(initial_qty * 0.30) * 3  # 나머지 (약 10%)
             if q_ma <= 0:
                 q_ma = 1
@@ -1066,7 +1066,7 @@ class AutoTrader:
                 ma_price = self._ceil_to_tick(ma20)
                 if ma_price:
                     orders.append({
-                        "target_name": "20일선",
+                        "target_name": "메인 기준",
                         "quantity": remaining,
                         "price": ma_price,
                         "sell_ratio": 10
@@ -1118,7 +1118,7 @@ class AutoTrader:
     # ==================== 매수 ====================
     def _execute_buy(self, code, current_price, signal, candles):
         """
-        ✅ 매수 실행 (지정가 매수: 엔벨로프 하한선 + 1호가)
+        ✅ 매수 실행 (지정가 매수: main condition 하한선 + 1호가)
 
         요구사항 반영:
         - 스탑로스 발동 이력 종목은 재매수 차단
@@ -1524,7 +1524,7 @@ class AutoTrader:
         ✅ 일반 매도 실행 (스탑로스는 _execute_stoploss에서 처리)
 
         이 메서드는 수동 매도 또는 기타 매도 신호에 사용됨
-        주요 매도 주문(익절1~3, 20일선)은 _ensure_sell_orders_placed에서 선제적으로 처리
+        주요 매도 주문(익절1~3, 메인 기준)은 _ensure_sell_orders_placed에서 선제적으로 처리
         """
         try:
             target_name = signal.get("target_name", "")
@@ -2274,7 +2274,7 @@ class AutoTrader:
                 stock_info = self.kiwoom.get_stock_info(code)
                 current_price = stock_info.get("price", 0)
 
-            envelope = self.ta.get_envelope_levels(candles, 20, 20)
+            main_condition = self.ta.get_main_condition_levels(candles, 20, 20)
             position = self.config.get_position(code)
 
             buy_signal = self.signal.check_buy_signal(code, current_price, candles, position)
@@ -2287,7 +2287,7 @@ class AutoTrader:
 
             return {
                 "stock_info": stock_info,
-                "envelope": envelope,
+                "main_condition": main_condition,
                 "buy_signal": buy_signal,
                 "sell_signals": sell_signals,
                 "position": position,
@@ -2431,9 +2431,9 @@ class AutoTrader:
                                 self.log(f"[{code}] 매도 목표 확인: {target_name} (수익률: {profit_rate:.2f}%)", "INFO")
                                 break
 
-                        if "20일선" not in sold_targets and 0 < profit_rate < profit_targets[0]:
-                            sold_targets.append("20일선")
-                            self.log(f"[{code}] 20일선 매도 확인 (수익률: {profit_rate:.2f}%)", "INFO")
+                        if "메인 기준" not in sold_targets and 0 < profit_rate < profit_targets[0]:
+                            sold_targets.append("메인 기준")
+                            self.log(f"[{code}] 메인 기준 매도 확인 (수익률: {profit_rate:.2f}%)", "INFO")
 
                         if "손절" not in sold_targets and profit_rate < 0:
                             sold_targets.append("손절")
@@ -2890,7 +2890,7 @@ class AutoTrader:
         """
         ✅ 장 시작 시 모든 보유 종목에 대해 매도 주문이 걸려있는지 확인/보정
 
-        요구사항: 매도 주문은 항상 걸려있어야 함 (익절1~3 + 20일선)
+        요구사항: 매도 주문은 항상 걸려있어야 함 (익절1~3 + 메인 기준)
         """
         if not self.kiwoom or not self.account:
             return

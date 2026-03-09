@@ -58,9 +58,9 @@ DEFAULT_CONFIG = {
 
     # 매수 설정
     "buy": {
-        "envelope_period": 20,  # 엔벨로프 이동평균 기간
-        "envelope_percent": 19,  # 엔벨로프 하단 % - 매수 트리거 조건 (20일선 대비 -19%)
-        "envelope_buy_percent": 20,  # 실제 지정가 매수 주문 가격 % (20일선 대비 -20% + 1호가)
+        "main_condition_period": 20,  # main condition 이동평균 기간
+        "main_condition_percent": 19,  # main condition 하단 % - 매수 트리거 조건 (메인 기준 대비 -19%)
+        "main_condition_buy_percent": 20,  # 실제 지정가 매수 주문 가격 % (메인 기준 대비 -20% + 1호가)
         "max_buy_count": 3,  # 최대 매수 횟수 (3차 매수까지)
         "additional_buy_drop_percent": 10,  # 추가 매수 조건 (-10%)
         "buy_amount_per_stock": 1000000,  # 종목당 1회 매수 금액 (원)
@@ -73,7 +73,7 @@ DEFAULT_CONFIG = {
     "sell": {
         "profit_targets": [2.95, 4.95, 6.95],  # 목표 수익률 (%)
         "profit_sell_ratios": [30, 30, 30],  # 각 목표에서 매도 비중 (%)
-        "ma20_sell_ratio": 10,  # 20일선 도달시 매도 비중 (%)
+        "ma20_sell_ratio": 10,  # 메인 기준 도달시 매도 비중 (%)
         "stoploss_use_market_order": True,  # 스탑로스 시 시장가 사용 여부
     },
 

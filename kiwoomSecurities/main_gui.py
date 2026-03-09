@@ -143,13 +143,13 @@ class MainWindow(QMainWindow):
     # 공용 유틸
     # =========================
     def _update_watchlist_header(self):
-        """워치리스트 테이블 헤더에 현재 엔벨로프 설정값 반영 (권장)"""
+        """워치리스트 테이블 헤더에 현재 main condition 설정값 반영 (권장)"""
         try:
-            percent = self.config.get("buy", "envelope_percent") or 19
+            percent = self.config.get("buy", "main_condition_percent") or 19
         except Exception:
             percent = 19
 
-        headers = ["종목코드", "종목명", "현재가", "20일선", f"엔벨로프하단(-{percent}%)"]
+        headers = ["종목코드", "종목명", "현재가", "메인 기준", f"main condition하단(-{percent}%)"]
         if hasattr(self, "watchlist_table") and self.watchlist_table is not None:
             self.watchlist_table.setHorizontalHeaderLabels(headers)
 
@@ -183,7 +183,7 @@ class MainWindow(QMainWindow):
 
     def init_ui(self):
         """UI 초기화"""
-        self.setWindowTitle("키움증권 자동매매 시스템 - 엔벨로프 전략")
+        self.setWindowTitle("키움증권 자동매매 시스템 - main condition 전략")
         self.setGeometry(100, 100, 1400, 900)
 
         main_widget = QWidget()
@@ -278,14 +278,14 @@ class MainWindow(QMainWindow):
         analysis_layout = QGridLayout(analysis_group)
 
         self.analysis_code_label = QLabel("종목: -")
-        self.analysis_ma20_label = QLabel("20일선: -")
-        self.analysis_envelope_label = QLabel("엔벨로프 하한: -")
+        self.analysis_ma20_label = QLabel("메인 기준: -")
+        self.analysis_main_condition_label = QLabel("main condition 하한: -")
         self.analysis_buy_signal_label = QLabel("매수 신호: -")
         self.analysis_position_label = QLabel("포지션: -")
 
         analysis_layout.addWidget(self.analysis_code_label, 0, 0, 1, 2)
         analysis_layout.addWidget(self.analysis_ma20_label, 1, 0)
-        analysis_layout.addWidget(self.analysis_envelope_label, 1, 1)
+        analysis_layout.addWidget(self.analysis_main_condition_label, 1, 1)
         analysis_layout.addWidget(self.analysis_buy_signal_label, 2, 0, 1, 2)
         analysis_layout.addWidget(self.analysis_position_label, 3, 0, 1, 2)
 
@@ -399,7 +399,7 @@ class MainWindow(QMainWindow):
         self.watchlist_table = QTableWidget()
         self.watchlist_table.setColumnCount(5)
         self.watchlist_table.setHorizontalHeaderLabels([
-            "종목코드", "종목명", "현재가", "20일선", "엔벨로프하단(-19%)"
+            "종목코드", "종목명", "현재가", "메인 기준", "main condition하단(-19%)"
         ])
         self.watchlist_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.watchlist_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -435,25 +435,25 @@ class MainWindow(QMainWindow):
         buy_group = QGroupBox("매수 설정")
         buy_layout = QGridLayout(buy_group)
 
-        buy_layout.addWidget(QLabel("엔벨로프 기간:"), 0, 0)
-        self.setting_envelope_period = QSpinBox()
-        self.setting_envelope_period.setRange(5, 60)
-        self.setting_envelope_period.setValue(self.config.get("buy", "envelope_period"))
-        buy_layout.addWidget(self.setting_envelope_period, 0, 1)
+        buy_layout.addWidget(QLabel("main condition 기간:"), 0, 0)
+        self.setting_main_condition_period = QSpinBox()
+        self.setting_main_condition_period.setRange(5, 60)
+        self.setting_main_condition_period.setValue(self.config.get("buy", "main_condition_period"))
+        buy_layout.addWidget(self.setting_main_condition_period, 0, 1)
 
         buy_layout.addWidget(QLabel("트리거 % (하단):"), 0, 2)
-        self.setting_envelope_percent = QSpinBox()
-        self.setting_envelope_percent.setRange(5, 50)
-        self.setting_envelope_percent.setValue(self.config.get("buy", "envelope_percent") or 19)
-        self.setting_envelope_percent.setToolTip("매수 신호 트리거 조건 (예: 19% = MA 대비 -19%에서 트리거)")
-        buy_layout.addWidget(self.setting_envelope_percent, 0, 3)
+        self.setting_main_condition_percent = QSpinBox()
+        self.setting_main_condition_percent.setRange(5, 50)
+        self.setting_main_condition_percent.setValue(self.config.get("buy", "main_condition_percent") or 19)
+        self.setting_main_condition_percent.setToolTip("매수 신호 트리거 조건 (예: 19% = MA 대비 -19%에서 트리거)")
+        buy_layout.addWidget(self.setting_main_condition_percent, 0, 3)
 
         buy_layout.addWidget(QLabel("매수가 % (하단):"), 1, 0)
-        self.setting_envelope_buy_percent = QSpinBox()
-        self.setting_envelope_buy_percent.setRange(5, 50)
-        self.setting_envelope_buy_percent.setValue(self.config.get("buy", "envelope_buy_percent") or 20)
-        self.setting_envelope_buy_percent.setToolTip("실제 지정가 매수 주문 가격 (예: 20% = MA × 0.80 + 1호가)")
-        buy_layout.addWidget(self.setting_envelope_buy_percent, 1, 1)
+        self.setting_main_condition_buy_percent = QSpinBox()
+        self.setting_main_condition_buy_percent.setRange(5, 50)
+        self.setting_main_condition_buy_percent.setValue(self.config.get("buy", "main_condition_buy_percent") or 20)
+        self.setting_main_condition_buy_percent.setToolTip("실제 지정가 매수 주문 가격 (예: 20% = MA × 0.80 + 1호가)")
+        buy_layout.addWidget(self.setting_main_condition_buy_percent, 1, 1)
 
         buy_layout.addWidget(QLabel("추가매수 하락률 %:"), 1, 2)
         self.setting_add_drop = QSpinBox()
@@ -522,7 +522,7 @@ class MainWindow(QMainWindow):
         self.setting_ratio3.setValue(self.config.get("sell", "profit_sell_ratios")[2])
         sell_layout.addWidget(self.setting_ratio3, 2, 3)
 
-        sell_layout.addWidget(QLabel("20일선 도달시 매도 비중 %:"), 3, 0, 1, 2)
+        sell_layout.addWidget(QLabel("메인 기준 도달시 매도 비중 %:"), 3, 0, 1, 2)
         self.setting_ma20_ratio = QSpinBox()
         self.setting_ma20_ratio.setRange(1, 100)
         self.setting_ma20_ratio.setValue(self.config.get("sell", "ma20_sell_ratio"))
@@ -1249,8 +1249,8 @@ class MainWindow(QMainWindow):
             if current_row_count != len(watchlist):
                 self.watchlist_table.setRowCount(len(watchlist))
 
-            period = self.config.get("buy", "envelope_period") or 20
-            percent = self.config.get("buy", "envelope_percent") or 19
+            period = self.config.get("buy", "main_condition_period") or 20
+            percent = self.config.get("buy", "main_condition_percent") or 19
 
             # ✅ 코드/이름 매핑 갱신 + 기본 정보 설정 (기존 값 유지)
             self._watchlist_code_to_row = {}
@@ -1280,10 +1280,10 @@ class MainWindow(QMainWindow):
                     if cached_candles:
                         try:
                             current_price = cached_candles[0].get("close")
-                            envelope = self.ta.get_envelope_levels(cached_candles, period, percent)
+                            main_condition = self.ta.get_main_condition_levels(cached_candles, period, percent)
                             self.watchlist_table.setItem(row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price)))
-                            self.watchlist_table.setItem(row, 3, QTableWidgetItem(self._fmt_int_or_dash(envelope.get("ma"))))
-                            self.watchlist_table.setItem(row, 4, QTableWidgetItem(self._fmt_int_or_dash(envelope.get("lower"))))
+                            self.watchlist_table.setItem(row, 3, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("ma"))))
+                            self.watchlist_table.setItem(row, 4, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("lower"))))
                         except Exception as e:
                             self.log(f"[시스템] 감시 종목 지표 갱신 실패: {code} ({e})")
 
@@ -1361,12 +1361,12 @@ class MainWindow(QMainWindow):
 
             if candles and len(candles) > 0:
                 current_price = candles[0].get("close", 0)
-                envelope = self.ta.get_envelope_levels(candles, self._watchlist_refresh_period, self._watchlist_refresh_percent)
+                main_condition = self.ta.get_main_condition_levels(candles, self._watchlist_refresh_period, self._watchlist_refresh_percent)
 
                 # UI 업데이트
                 self.watchlist_table.setItem(row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price)))
-                self.watchlist_table.setItem(row, 3, QTableWidgetItem(self._fmt_int_or_dash(envelope.get("ma"))))
-                self.watchlist_table.setItem(row, 4, QTableWidgetItem(self._fmt_int_or_dash(envelope.get("lower"))))
+                self.watchlist_table.setItem(row, 3, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("ma"))))
+                self.watchlist_table.setItem(row, 4, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("lower"))))
 
                 # 캐시 업데이트 (이벤트 엔진이 있으면)
                 if self.trader and self.trader.event_engine:
@@ -1641,17 +1641,17 @@ class MainWindow(QMainWindow):
     def update_analysis_display(self, code, name, analysis):
         """종목 분석 정보 표시"""
         stock_info = analysis.get("stock_info", {}) or {}
-        envelope = analysis.get("envelope", {}) or {}
+        main_condition = analysis.get("main_condition", {}) or {}
         buy_signal = analysis.get("buy_signal", {}) or {}
         position_summary = analysis.get("position_summary")
 
         price_txt = self._fmt_int_or_dash(stock_info.get("price"))
-        ma_txt = self._fmt_int_or_dash(envelope.get("ma"))
-        lower_txt = self._fmt_int_or_dash(envelope.get("lower"))
+        ma_txt = self._fmt_int_or_dash(main_condition.get("ma"))
+        lower_txt = self._fmt_int_or_dash(main_condition.get("lower"))
 
         self.analysis_code_label.setText(f"종목: {code} {name} (현재가: {price_txt}원)")
-        self.analysis_ma20_label.setText(f"20일선: {ma_txt}원")
-        self.analysis_envelope_label.setText(f"엔벨로프 하한: {lower_txt}원")
+        self.analysis_ma20_label.setText(f"메인 기준: {ma_txt}원")
+        self.analysis_main_condition_label.setText(f"main condition 하한: {lower_txt}원")
 
         signal_text = buy_signal.get("reason", "-")
         if buy_signal.get("signal"):
@@ -1827,9 +1827,9 @@ class MainWindow(QMainWindow):
     # =========================
     def save_settings(self):
         """설정 저장"""
-        self.config.set(self.setting_envelope_period.value(), "buy", "envelope_period")
-        self.config.set(self.setting_envelope_percent.value(), "buy", "envelope_percent")
-        self.config.set(self.setting_envelope_buy_percent.value(), "buy", "envelope_buy_percent")
+        self.config.set(self.setting_main_condition_period.value(), "buy", "main_condition_period")
+        self.config.set(self.setting_main_condition_percent.value(), "buy", "main_condition_percent")
+        self.config.set(self.setting_main_condition_buy_percent.value(), "buy", "main_condition_buy_percent")
         self.config.set(self.setting_add_drop.value(), "buy", "additional_buy_drop_percent")
         self.config.set(self.setting_buy_amount.value(), "buy", "buy_amount_per_stock")
         self.config.set(self.setting_max_holding.value(), "buy", "max_holding_stocks")
