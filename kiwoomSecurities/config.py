@@ -4,9 +4,48 @@
 """
 import json
 import os
+import hashlib
+import base64
+import uuid
 
-# 설정 파일 경로
-CONFIG_FILE = "trading_config.json"
+try:
+    from cryptography.fernet import Fernet
+    _CRYPTO_AVAILABLE = True
+except ImportError:
+    _CRYPTO_AVAILABLE = False
+
+# 설정 파일 경로 (암호화 파일은 .dat 사용)
+CONFIG_FILE = "trading_config.dat"
+_LEGACY_JSON_FILE = "trading_config.json"
+
+# 내부 시크릿 (소스코드 없이는 복호화 불가)
+_SECRET = "kiwoom_nxt_alice_4419_secure_cfg"
+
+
+def _derive_key() -> bytes:
+    """머신 고유 ID + 내부 시크릿으로 Fernet 키 파생"""
+    machine_id = str(uuid.getnode())  # 네트워크 어댑터 MAC 기반 정수
+    raw = f"{_SECRET}:{machine_id}".encode("utf-8")
+    digest = hashlib.sha256(raw).digest()  # 32바이트
+    return base64.urlsafe_b64encode(digest)  # Fernet 키 형식
+
+
+def _encrypt(data: dict) -> bytes:
+    """딕셔너리 → 암호화된 bytes"""
+    if not _CRYPTO_AVAILABLE:
+        return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    fernet = Fernet(_derive_key())
+    plain = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return fernet.encrypt(plain)
+
+
+def _decrypt(raw: bytes) -> dict:
+    """암호화된 bytes → 딕셔너리"""
+    if not _CRYPTO_AVAILABLE:
+        return json.loads(raw.decode("utf-8"))
+    fernet = Fernet(_derive_key())
+    plain = fernet.decrypt(raw)
+    return json.loads(plain.decode("utf-8"))
 
 # 기본 설정값
 DEFAULT_CONFIG = {
@@ -115,18 +154,35 @@ class Config:
         self.config = self.load_config()
 
     def load_config(self):
-        """설정 파일 로드"""
+        """설정 파일 로드 (암호화 .dat 우선, 레거시 .json 자동 마이그레이션)"""
+        # 암호화된 .dat 파일 로드 시도
         if os.path.exists(CONFIG_FILE):
             try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    saved_config = json.load(f)
-                    # 기본 설정과 병합
-                    merged = DEFAULT_CONFIG.copy()
-                    self._deep_update(merged, saved_config)
-                    return merged
+                with open(CONFIG_FILE, 'rb') as f:
+                    raw = f.read()
+                saved_config = _decrypt(raw)
+                merged = DEFAULT_CONFIG.copy()
+                self._deep_update(merged, saved_config)
+                return merged
             except Exception as e:
                 print(f"설정 파일 로드 실패: {e}")
-                return DEFAULT_CONFIG.copy()
+
+        # 레거시 평문 JSON이 있으면 읽어서 암호화 파일로 마이그레이션
+        if os.path.exists(_LEGACY_JSON_FILE):
+            try:
+                with open(_LEGACY_JSON_FILE, 'r', encoding='utf-8') as f:
+                    saved_config = json.load(f)
+                merged = DEFAULT_CONFIG.copy()
+                self._deep_update(merged, saved_config)
+                encrypted = _encrypt(merged)
+                with open(CONFIG_FILE, 'wb') as f:
+                    f.write(encrypted)
+                os.remove(_LEGACY_JSON_FILE)
+                print("설정 파일을 암호화 형식으로 마이그레이션했습니다.")
+                return merged
+            except Exception as e:
+                print(f"레거시 설정 파일 마이그레이션 실패: {e}")
+
         return DEFAULT_CONFIG.copy()
 
     def _deep_update(self, base_dict, update_dict):
@@ -138,10 +194,11 @@ class Config:
                 base_dict[key] = value
 
     def save_config(self):
-        """설정 파일 저장"""
+        """설정 파일 저장 (암호화)"""
         try:
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=2)
+            encrypted = _encrypt(self.config)
+            with open(CONFIG_FILE, 'wb') as f:
+                f.write(encrypted)
             return True
         except Exception as e:
             print(f"설정 파일 저장 실패: {e}")
