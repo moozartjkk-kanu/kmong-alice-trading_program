@@ -18,7 +18,7 @@ from PyQt5.QtGui import QFont, QColor
 
 
 class DisclaimerDialog(QDialog):
-    """이용 약관 동의 다이얼로그 (체크박스 동의 필수)"""
+    """이용 약관 동의 다이얼로그 (스크롤 끝까지 내려야 체크박스 활성화)"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("중요 안내 사항")
@@ -29,9 +29,9 @@ class DisclaimerDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
 
-        text = QTextEdit()
-        text.setReadOnly(True)
-        text.setPlainText(
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setPlainText(
             "*프로그램 이용 시 필독사항*\n\n"
             "본 프로그램은 투자 도구로 제공되는 소프트웨어이며\n"
             "특정 종목에 대한 매수 또는 매도를 권유하거나\n"
@@ -49,8 +49,13 @@ class DisclaimerDialog(QDialog):
             "매도가 한번도 진행되지 않은 종목은 추가매수만 있으며, 하락 혹은 급락장에서의 매도(손절) 설정은 없으므로 주의바랍니다.\n\n"
             "**프로그램 이용은 위 내용을 충분히 이해하고 동의한 것으로 간주됩니다.**"
         )
-        text.setMinimumHeight(260)
-        layout.addWidget(text)
+        self.text.setMinimumHeight(260)
+        self.text.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
+        layout.addWidget(self.text)
+
+        self.scroll_hint_label = QLabel("↓ 내용을 끝까지 스크롤해야 동의할 수 있습니다.")
+        self.scroll_hint_label.setStyleSheet("color: #e65100; font-size: 9pt;")
+        layout.addWidget(self.scroll_hint_label)
 
         from PyQt5.QtWidgets import QCheckBox
         self.agree_checkbox = QCheckBox("위 내용을 모두 읽었으며 동의합니다.")
@@ -58,6 +63,7 @@ class DisclaimerDialog(QDialog):
         font.setBold(True)
         font.setPointSize(10)
         self.agree_checkbox.setFont(font)
+        self.agree_checkbox.setEnabled(False)
         self.agree_checkbox.stateChanged.connect(self._on_checkbox_changed)
         layout.addWidget(self.agree_checkbox)
 
@@ -79,6 +85,14 @@ class DisclaimerDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
         btn_layout.addWidget(self.ok_btn)
         layout.addLayout(btn_layout)
+
+    def _on_scroll_changed(self, value):
+        """스크롤이 끝(최대값)에 도달하면 체크박스 활성화"""
+        scrollbar = self.text.verticalScrollBar()
+        if value >= scrollbar.maximum():
+            self.agree_checkbox.setEnabled(True)
+            self.scroll_hint_label.setText("✔ 내용을 모두 확인했습니다. 아래에 동의해 주세요.")
+            self.scroll_hint_label.setStyleSheet("color: #2e7d32; font-size: 9pt;")
 
     def _on_checkbox_changed(self, state):
         self.ok_btn.setEnabled(state == Qt.Checked)
