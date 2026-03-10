@@ -442,7 +442,7 @@ class TradingSignal:
 
             if ma is not None:
                 ma_price = self._ceil_to_tick(ma) or int(ma)
-                sell_targets.append({"name": f"최종 매도 목표가", "price": int(ma_price)})
+                sell_targets.append({"name": f"추가 매도 목표가", "price": int(ma_price)})
 
         return {
             "avg_price": int(avg_price) if avg_price else 0,
