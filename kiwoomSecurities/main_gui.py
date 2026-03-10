@@ -1358,6 +1358,77 @@ class MainWindow(QMainWindow):
 
         self._refresh_watchlist_realtime_registration()
 
+    def _refresh_watchlist_for_codes(self, codes, show_loading=False):
+        """선택 종목만 부분 갱신 (일봉 TR은 필요한 종목만 큐에 추가)"""
+        if self._is_stopping:
+            return
+
+        if not codes:
+            return
+
+        period = self.config.get("buy", "main_condition_period") or 20
+        percent = self.config.get("buy", "main_condition_percent") or 19
+
+        to_queue = []
+
+        # 캐시가 있으면 즉시 반영, 없으면 TR 큐에 추가
+        for code in codes:
+            row = self._watchlist_code_to_row.get(code)
+            if row is None:
+                continue
+
+            has_cache = False
+            if self.trader and self.trader.event_engine:
+                batch_scheduler = self.trader.event_engine.batch_scheduler
+                cached_candles = batch_scheduler.get_cached_candles(code)
+                if cached_candles:
+                    try:
+                        current_price = cached_candles[0].get("close")
+                        main_condition = self.ta.get_main_condition_levels(
+                            cached_candles, period, percent
+                        )
+                        self.watchlist_table.setItem(
+                            row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price))
+                        )
+                        self.watchlist_table.setItem(
+                            row, 3, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("ma")))
+                        )
+                        self.watchlist_table.setItem(
+                            row, 4, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("lower")))
+                        )
+                        has_cache = True
+                    except Exception as e:
+                        self.log(f"[시스템] 감시 종목 캐시 갱신 실패: {code} ({e})")
+                else:
+                    has_cache = batch_scheduler.is_cache_valid(code)
+
+            if not has_cache:
+                already_queued = any(code == s["code"] for _, s in self._watchlist_refresh_queue)
+                if not already_queued:
+                    to_queue.append((row, {"code": code, "name": ""}))
+
+        if not to_queue:
+            return
+
+        self._watchlist_refresh_period = period
+        self._watchlist_refresh_percent = percent
+
+        if not self._is_refreshing_watchlist:
+            self._watchlist_refresh_queue = to_queue
+            self._watchlist_refresh_total = len(to_queue)
+            self._watchlist_refresh_done = 0
+            self._is_refreshing_watchlist = True
+
+            if self.kiwoom and self.kiwoom.is_connected():
+                if show_loading:
+                    self._show_watchlist_loading_dialog()
+                QTimer.singleShot(100, self._refresh_watchlist_next)
+            else:
+                self._is_refreshing_watchlist = False
+        else:
+            self._watchlist_refresh_queue.extend(to_queue)
+            self._watchlist_refresh_total += len(to_queue)
+
     def _refresh_watchlist_next(self):
         """비동기로 감시 종목 정보를 하나씩 갱신 (TR 큐 기반)"""
         if self._is_stopping:
@@ -1601,7 +1672,19 @@ class MainWindow(QMainWindow):
         if success:
             self.log(f"[시스템] 감시 종목 추가: {code} {name}")
             self.add_code_input.clear()
-            self.refresh_watchlist()
+            # 부분 갱신: 추가된 종목만 TR 큐에 넣고 전체 갱신은 타이머 유지
+            row = self.watchlist_table.rowCount()
+            self.watchlist_table.setRowCount(row + 1)
+            self._watchlist_code_to_row[code] = row
+            self.watchlist_table.setItem(row, 0, QTableWidgetItem(code))
+            self.watchlist_table.setItem(row, 1, QTableWidgetItem(name))
+            self.watchlist_table.setItem(row, 2, QTableWidgetItem("-"))
+            self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
+            self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
+            self.watchlist_table.viewport().update()
+
+            self._refresh_watchlist_for_codes([code])
+            self._refresh_watchlist_realtime_registration()
         else:
             QMessageBox.warning(self, "오류", message)
 
