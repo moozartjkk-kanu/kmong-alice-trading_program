@@ -17,6 +17,74 @@ from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
 
 
+class DisclaimerDialog(QDialog):
+    """이용 약관 동의 다이얼로그 (체크박스 동의 필수)"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("중요 안내 사항")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.CustomizeWindowHint)
+        self.setModal(True)
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(
+            "*프로그램 이용 시 필독사항*\n\n"
+            "본 프로그램은 투자 도구로 제공되는 소프트웨어이며\n"
+            "특정 종목에 대한 매수 또는 매도를 권유하거나\n"
+            "투자 자문을 제공하지 않습니다.\n\n"
+            "본 프로그램은 사용자가 선택한 종목에 대해\n"
+            "사전에 설정된 기술적 조건에 따라 자동 주문 기능을 수행합니다.\n\n"
+            "투자에 대한 최종 판단과 책임은 전적으로 사용자 본인에게 있습니다.\n\n"
+            "본 프로그램은 수익을 보장하지 않으며\n"
+            "투자 결과에 따라 손실이 발생할 수 있습니다.\n\n"
+            "프로그램 사용으로 발생하는 모든 투자 결과 및 손익에 대한 책임은\n"
+            "사용자 본인에게 있으며 프로그램 제공자는 이에 대해 어떠한 책임도 부담하지 않습니다.\n\n"
+            "종목 선택 및 투자 금액 설정은 사용자 본인이 직접 수행해야 합니다.\n\n"
+            "**프로그램 이용은 위 내용을 충분히 이해하고 동의한 것으로 간주됩니다.**"
+        )
+        text.setMinimumHeight(260)
+        layout.addWidget(text)
+
+        from PyQt5.QtWidgets import QCheckBox
+        self.agree_checkbox = QCheckBox("위 내용을 모두 읽었으며 동의합니다.")
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(10)
+        self.agree_checkbox.setFont(font)
+        self.agree_checkbox.stateChanged.connect(self._on_checkbox_changed)
+        layout.addWidget(self.agree_checkbox)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        self.ok_btn = QPushButton("확인")
+        self.ok_btn.setEnabled(False)
+        self.ok_btn.setMinimumWidth(100)
+        self.ok_btn.setStyleSheet(
+            "QPushButton:enabled { background-color: #4CAF50; color: white; font-weight: bold; }"
+            "QPushButton:disabled { background-color: #cccccc; color: #888888; }"
+        )
+        self.ok_btn.clicked.connect(self.accept)
+
+        cancel_btn = QPushButton("취소 (종료)")
+        cancel_btn.setMinimumWidth(100)
+        cancel_btn.clicked.connect(self.reject)
+
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(self.ok_btn)
+        layout.addLayout(btn_layout)
+
+    def _on_checkbox_changed(self, state):
+        self.ok_btn.setEnabled(state == Qt.Checked)
+
+    def closeEvent(self, event):
+        self.reject()
+        event.accept()
+
+
 class WatchlistLoadingDialog(QDialog):
     """감시 종목 데이터 불러오는 중 알림창 (사용자 조작 차단)"""
     def __init__(self, parent=None):
@@ -828,7 +896,7 @@ class MainWindow(QMainWindow):
 
             self.trading_timer.start(20000)
             self.refresh_timer.start(60000)  # 잔고 갱신 60초
-            self.watchlist_refresh_timer.start(180000)  # 감시 종목 갱신 3분
+            self.watchlist_refresh_timer.start(300000)  # 감시 종목 갱신 5분
         else:
             self.log("[시스템] 자동매매 시작 실패 (AutoTrader.start()가 False 반환)")
             QMessageBox.warning(self, "시작 실패", "자동매매 시작에 실패했습니다. 로그를 확인해주세요.")
@@ -2070,27 +2138,9 @@ def main():
             f"계속 사용하시려면 관리자에게 문의해 주세요.\n"
             f"kanu: moozartjkk@gmail.com")
 
-    QMessageBox.information(None, "중요 안내 사항",
-        """*프로그램 이용 시 필독사항*
-
-본 프로그램은 투자 도구로 제공되는 소프트웨어이며
-특정 종목에 대한 매수 또는 매도를 권유하거나
-투자 자문을 제공하지 않습니다.
-
-본 프로그램은 사용자가 선택한 종목에 대해
-사전에 설정된 기술적 조건에 따라 자동 주문 기능을 수행합니다.
-
-투자에 대한 최종 판단과 책임은 전적으로 사용자 본인에게 있습니다.
-
-본 프로그램은 수익을 보장하지 않으며
-투자 결과에 따라 손실이 발생할 수 있습니다.
-
-프로그램 사용으로 발생하는 모든 투자 결과 및 손익에 대한 책임은
-사용자 본인에게 있으며 프로그램 제공자는 이에 대해 어떠한 책임도 부담하지 않습니다.
-
-종목 선택 및 투자 금액 설정은 사용자 본인이 직접 수행해야 합니다.
-
-**프로그램 이용은 위 내용을 충분히 이해하고 동의한 것으로 간주됩니다.**""")
+    dlg = DisclaimerDialog()
+    if dlg.exec_() != QDialog.Accepted:
+        sys.exit(0)
 
     window = MainWindow()
     window.show()
