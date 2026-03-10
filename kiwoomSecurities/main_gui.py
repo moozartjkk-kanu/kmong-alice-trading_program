@@ -207,7 +207,7 @@ class MainWindow(QMainWindow):
 
     def init_ui(self):
         """UI 초기화"""
-        self.setWindowTitle("키움증권 자동매매 시스템 - main condition 전략")
+        self.setWindowTitle("매매 보조 도구 시스템")
         self.setGeometry(100, 100, 1400, 900)
 
         main_widget = QWidget()
