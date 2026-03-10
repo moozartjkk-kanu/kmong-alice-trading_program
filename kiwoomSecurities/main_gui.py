@@ -436,6 +436,7 @@ class MainWindow(QMainWindow):
 
         add_btn = QPushButton("종목 추가")
         add_btn.clicked.connect(self.add_to_watchlist)
+        self.add_code_input.returnPressed.connect(self.add_to_watchlist)
         add_layout.addWidget(add_btn)
 
         remove_btn = QPushButton("선택 삭제")
