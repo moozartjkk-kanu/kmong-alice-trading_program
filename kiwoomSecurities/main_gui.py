@@ -47,7 +47,8 @@ class DisclaimerDialog(QDialog):
             "**하락 혹은 급락장에는 손절이(매도 설정) 없으므로 유의해야합니다.**\n"
             "=>익절 혹은 자동 매도를 한번이라도 진행한 종목에 대해서는 손절이 로직이 존재하지만\n"
             "매도가 한번도 진행되지 않은 종목은 추가매수만 있으며, 하락 혹은 급락장에서의 매도(손절) 설정은 없으므로 주의바랍니다.\n\n"
-            "**프로그램 이용은 위 내용을 충분히 이해하고 동의한 것으로 간주됩니다.**"
+            "**정규장 이외의 시간이면서 NXT거래소 거래 가능 시간대에는 NXT거래소로 주문이 걸립니다.**\n\n"
+            "***프로그램 이용은 위 내용을 충분히 이해하고 동의한 것으로 간주됩니다.***"
         )
         self.text.setMinimumHeight(260)
         self.text.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
