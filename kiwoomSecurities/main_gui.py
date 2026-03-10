@@ -11,10 +11,31 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTabWidget,
-    QMessageBox, QHeaderView, QFrame, QGridLayout, QInputDialog
+    QMessageBox, QHeaderView, QFrame, QGridLayout, QInputDialog, QDialog
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
+
+
+class WatchlistLoadingDialog(QDialog):
+    """감시 종목 데이터 불러오는 중 알림창 (사용자 조작 차단)"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("불러오는 중")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.CustomizeWindowHint)
+        self.setModal(True)
+        self.setFixedSize(320, 80)
+        layout = QVBoxLayout()
+        label = QLabel("감시 종목 리스트 불러오는 중...", self)
+        label.setAlignment(Qt.AlignCenter)
+        font = QFont()
+        font.setPointSize(12)
+        label.setFont(font)
+        layout.addWidget(label)
+        self.setLayout(layout)
+
+    def closeEvent(self, event):
+        event.ignore()  # 사용자가 닫기 버튼으로 닫지 못하도록
 
 
 class StockSearchWorker(QThread):
@@ -96,6 +117,9 @@ class MainWindow(QMainWindow):
         self._watchlist_refresh_queue = []
         self._watchlist_refresh_period = 20
         self._watchlist_refresh_percent = 19
+        self._watchlist_refresh_total = 0
+        self._watchlist_refresh_done = 0
+        self._watchlist_loading_dialog = None
 
         # ✅ 워치리스트 헤더를 설정값으로 반영 (권장)
         self._update_watchlist_header()
@@ -711,7 +735,7 @@ class MainWindow(QMainWindow):
 
                 self.refresh_timer.start(60000)
                 self.refresh_data()
-                self.refresh_watchlist()  # 초기 감시 종목 표시
+                self.refresh_watchlist(show_loading=True)  # 초기 감시 종목 표시
 
                 self.trader.full_state_sync_on_startup()
                 self._check_pending_orders_on_startup()
@@ -1238,7 +1262,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log(f"[시스템] 보유종목 UI 업데이트 오류: {e}")
 
-    def refresh_watchlist(self):
+    def refresh_watchlist(self, show_loading=False):
         """감시 종목 갱신 (비동기 방식으로 UI 프리징 방지)"""
         if self._is_stopping:
             return
@@ -1317,7 +1341,11 @@ class MainWindow(QMainWindow):
 
             # 큐가 있으면 비동기 갱신 시작
             if self._watchlist_refresh_queue and self.kiwoom and self.kiwoom.is_connected():
-                self.log(f"[시스템] 종목 정보 조회 시작: {len(self._watchlist_refresh_queue)}개 종목")
+                self._watchlist_refresh_total = len(self._watchlist_refresh_queue)
+                self._watchlist_refresh_done = 0
+                self.log(f"[시스템] 종목 정보 조회 시작: {self._watchlist_refresh_total}개 종목")
+                if show_loading:
+                    self._show_watchlist_loading_dialog()
                 QTimer.singleShot(100, self._refresh_watchlist_next)
             else:
                 self._is_refreshing_watchlist = False
@@ -1422,13 +1450,34 @@ class MainWindow(QMainWindow):
 
     def _continue_watchlist_refresh(self):
         """감시종목 갱신 계속 진행"""
+        self._watchlist_refresh_done += 1
+
+        # 85% 이상 불러왔으면 알림창 닫기
+        if self._watchlist_refresh_total > 0:
+            progress = self._watchlist_refresh_done / self._watchlist_refresh_total * 100
+            if progress >= 85:
+                self._hide_watchlist_loading_dialog()
+
         if self._watchlist_refresh_queue:
             # 다음 종목은 TR 큐가 알아서 순차 처리하므로 바로 호출
             QTimer.singleShot(50, self._refresh_watchlist_next)
         else:
+            self._hide_watchlist_loading_dialog()
             self._is_refreshing_watchlist = False
             self.watchlist_table.viewport().update()
             self.watchlist_table.viewport().update()
+
+    def _show_watchlist_loading_dialog(self):
+        """감시 종목 로딩 알림창 표시"""
+        if self._watchlist_loading_dialog is None:
+            self._watchlist_loading_dialog = WatchlistLoadingDialog(self)
+        self._watchlist_loading_dialog.show()
+        QApplication.processEvents()
+
+    def _hide_watchlist_loading_dialog(self):
+        """감시 종목 로딩 알림창 닫기"""
+        if self._watchlist_loading_dialog:
+            self._watchlist_loading_dialog.hide()
 
     # =========================
     # 워치리스트 관리
