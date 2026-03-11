@@ -753,28 +753,23 @@ class MainWindow(QMainWindow):
 
                 self.log(f"[시스템] 로그인 성공! (서버: {server_gubun})")
 
-                # ✅ 서버 구분에 따라 UI 색상 및 텍스트 변경
+                # ✅ 실서버 접속 시 즉시 종료 (모의투자만 허용)
                 if is_real:
-                    self.status_label.setText(f"연결 상태: 연결됨 (실서버)")
-                    self.status_label.setStyleSheet("color: green; font-weight: bold;")
-                else:
-                    self.status_label.setText(f"연결 상태: 연결됨 (모의투자)")
-                    self.status_label.setStyleSheet("color: orange; font-weight: bold;")
-                    # 모의투자 연결 시 경고 메시지
-                    self.log("[경고] 모의투자 서버에 연결되었습니다!")
-                    self.log("[안내] 실계좌 연결 방법:")
-                    self.log("  1. 영웅문HTS 자동로그인을 해제하세요.")
-                    self.log("  2. KOA Studio를 재실행하고 로그인 창에서 '모의투자' 체크 해제")
-                    self.log("  3. 계좌 비밀번호를 KOA Studio에서 다시 등록하세요.")
+                    self.log("[경고] 실서버(실계좌) 접속이 감지되었습니다. 프로그램을 종료합니다.")
                     QMessageBox.warning(
                         self,
-                        "모의투자 서버 연결",
-                        "현재 모의투자 서버에 연결되었습니다.\n\n"
-                        "실계좌를 사용하려면:\n"
-                        "1. 영웅문HTS 자동로그인을 해제\n"
-                        "2. KOA Studio 재실행 후 로그인 시 '모의투자' 체크 해제\n"
-                        "3. 계좌 비밀번호 다시 등록"
+                        "실서버 접속 감지",
+                        "실서버(실계좌) 접속이 감지되었습니다.\n"
+                        "모의투자 전용 모드이므로 프로그램을 종료합니다."
                     )
+                    QApplication.instance().quit()
+                    return
+
+                # ✅ 모의투자 접속 시 UI 표시
+                self.status_label.setText("연결 상태: 연결됨 (모의투자)")
+                self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+                # 모의투자 연결 안내 메시지
+                self.log("[안내] 모의투자 서버에 연결되었습니다.")
 
                 self.login_btn.setEnabled(False)
 
