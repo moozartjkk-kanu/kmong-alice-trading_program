@@ -2135,7 +2135,7 @@ def main():
 
     # 사용 기간 체크
     today = datetime.date.today()
-    expiry_date = datetime.date(2026, 4, 8)
+    expiry_date = datetime.date(2026, 4, 30)
 
     if today > expiry_date:
         QMessageBox.critical(None, "사용 기간 만료",
@@ -2147,7 +2147,7 @@ def main():
         remaining = (expiry_date - today).days
         QMessageBox.warning(None, "사용 기간 안내",
             f"프로그램 사용 기간이 {remaining}일 남았습니다.\n"
-            f"만료일: 2026년 4월 8일\n\n"
+            f"만료일: 2026년 4월 30일\n\n"
             f"계속 사용하시려면 관리자에게 문의해 주세요.\n"
             f"kanu: moozartjkk@gmail.com")
 
