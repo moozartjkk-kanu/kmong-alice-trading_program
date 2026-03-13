@@ -1,0 +1,25 @@
+{
+  "kiwoom": {
+    "account_number": "8120938711",
+    "use_mock_trading": false
+  },
+  "scan": {
+    "market": "kospi",
+    "condition_mode": "AND",
+    "top_n": 50,
+    "rsi_enabled": false,
+    "rsi_period": 14,
+    "rsi_min": 0.0,
+    "rsi_max": 30.0,
+    "ma_enabled": true,
+    "ma_period": 20,
+    "ma_condition": "above",
+    "ma_short_period": 5,
+    "ma_long_period": 20,
+    "volume_enabled": false,
+    "volume_avg_days": 20,
+    "volume_ratio": 2.0,
+    "breakout_enabled": false,
+    "breakout_days": 20
+  }
+}
