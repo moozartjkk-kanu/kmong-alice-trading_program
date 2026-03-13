@@ -557,6 +557,8 @@ class MainWindow(QMainWindow):
         }
         if self.config.save_scan(scan):
             self.log("[설정] 저장 완료")
+            if self.scanner and self.scanner.is_running():
+                self.scanner.apply_new_conditions()
             QMessageBox.information(self, "설정 저장", "설정이 저장되었습니다.")
         else:
             QMessageBox.warning(self, "저장 실패", "설정 저장에 실패했습니다.")

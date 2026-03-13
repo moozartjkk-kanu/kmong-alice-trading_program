@@ -4,21 +4,21 @@
     "use_mock_trading": false
   },
   "scan": {
-    "market": "kospi",
+    "market": "both",
     "condition_mode": "AND",
-    "top_n": 300,
+    "top_n": 500,
     "rsi_enabled": false,
     "rsi_period": 14,
     "rsi_min": 0.0,
     "rsi_max": 30.0,
-    "ma_enabled": false,
+    "ma_enabled": true,
     "ma_period": 20,
-    "ma_condition": "above",
+    "ma_condition": "below",
     "ma_short_period": 5,
     "ma_long_period": 20,
-    "volume_enabled": false,
+    "volume_enabled": true,
     "volume_avg_days": 20,
-    "volume_ratio": 2.0,
+    "volume_ratio": 1.4,
     "breakout_enabled": false,
     "breakout_days": 20
   }

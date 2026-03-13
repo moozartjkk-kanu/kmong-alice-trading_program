@@ -230,7 +230,7 @@ class Scanner:
         self._is_running = True
         self._cancelled = False
 
-        self._log("[Phase1] 수동 시작 요청 -> 서버 1차 선별 강제 재실행")
+        self._log("[Phase1] 수동 시작 요청 -> 서버 1차 선별 재실행")
         self._run_phase1()
         self._refresh_timer.start(self.AUTO_REFRESH_MS)
 
@@ -443,6 +443,15 @@ class Scanner:
         self._log(f"[평가] 조건 만족 {len(results)}개 / {len(self._top_codes)}개")
         if self._result_cb:
             self._result_cb(results)
+
+    def apply_new_conditions(self):
+        """설정 저장 후 호출 — TR 재조회 없이 캐시 데이터로 조건 재평가."""
+        if not self._is_running or self._is_scanning:
+            return
+        self._log("[설정] 변경된 조건으로 캐시 데이터 재평가")
+        self._evaluate_and_emit()
+        if self._done_cb:
+            self._done_cb()
 
     # ── 15분 자동 갱신 ─────────────────────────────────────────────────────────
     def _on_auto_refresh(self):
