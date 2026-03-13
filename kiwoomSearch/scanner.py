@@ -219,6 +219,21 @@ class Scanner:
 
         self._refresh_timer.start(self.AUTO_REFRESH_MS)
 
+    def start(self):
+        """자동탐색 시작.
+
+        수동 시작은 저장된 top_codes 캐시를 재사용하지 않고,
+        매번 서버에서 1차 선별을 다시 수행한다.
+        """
+        if self._is_running:
+            return
+        self._is_running = True
+        self._cancelled = False
+
+        self._log("[Phase1] 수동 시작 요청 -> 서버 1차 선별 강제 재실행")
+        self._run_phase1()
+        self._refresh_timer.start(self.AUTO_REFRESH_MS)
+
     def stop(self):
         """자동탐색 중지."""
         self._is_running  = False

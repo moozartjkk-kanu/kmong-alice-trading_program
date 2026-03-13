@@ -127,6 +127,19 @@ class RateLimiter:
         self.calls_minute = deque()   # 분당 제한용
         self.lock = Lock()
 
+    @staticmethod
+    def _sleep_responsive(sleep_time: float):
+        """메인 스레드 대기 중에도 UI 이벤트는 계속 처리한다."""
+        end_time = time.time() + max(0.0, sleep_time)
+        app = QApplication.instance()
+        while True:
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                break
+            if app is not None:
+                app.processEvents()
+            time.sleep(min(0.1, remaining))
+
     def wait_if_needed(self):
         """필요시 대기하여 호출 제한 준수 (초당 + 분당)"""
         with self.lock:
@@ -139,7 +152,7 @@ class RateLimiter:
             if len(self.calls) >= self.max_calls:
                 sleep_time = self.calls[0] + self.period - now + 0.05
                 if sleep_time > 0:
-                    time.sleep(sleep_time)
+                    self._sleep_responsive(sleep_time)
                 now = time.time()
                 while self.calls and self.calls[0] < now - self.period:
                     self.calls.popleft()
@@ -151,7 +164,7 @@ class RateLimiter:
             if len(self.calls_minute) >= self.max_calls_per_min:
                 sleep_time = self.calls_minute[0] + 60.0 - now + 0.1
                 if sleep_time > 0:
-                    time.sleep(min(sleep_time, 5.0))  # 최대 5초 대기
+                    self._sleep_responsive(min(sleep_time, 5.0))  # 최대 5초 대기
                 now = time.time()
                 while self.calls_minute and self.calls_minute[0] < now - 60.0:
                     self.calls_minute.popleft()
@@ -269,7 +282,8 @@ class TRQueue:
         self._process_timer = QTimer()
         self._process_timer.setSingleShot(True)
         self._process_timer.timeout.connect(self._process_next)
-        self._min_interval_ms = 250  # TR 호출 간 최소 간격
+        # 분당 60건 제한을 넘지 않도록 여유를 둔 고정 간격으로 처리한다.
+        self._min_interval_ms = 1100
 
     def enqueue(self, tr_func, callback=None, *args, **kwargs):
         """
