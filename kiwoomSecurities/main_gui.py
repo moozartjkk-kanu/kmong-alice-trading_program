@@ -235,7 +235,7 @@ class MainWindow(QMainWindow):
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_data)
 
-        # 감시 종목 갱신 타이머 (5분 주기 - TR 호출 최소화)
+        # 감시 종목 갱신 타이머 (10분 주기 - TR 호출 최소화)
         self.watchlist_refresh_timer = QTimer()
         self.watchlist_refresh_timer.timeout.connect(self.refresh_watchlist)
 
@@ -935,7 +935,7 @@ class MainWindow(QMainWindow):
 
             self.trading_timer.start(20000)
             self.refresh_timer.start(60000)  # 잔고 갱신 60초
-            self.watchlist_refresh_timer.start(300000)  # 감시 종목 갱신 5분
+            self.watchlist_refresh_timer.start(600000)  # 감시 종목 갱신 10분
         else:
             self.log("[시스템] 자동매매 시작 실패 (AutoTrader.start()가 False 반환)")
             QMessageBox.warning(self, "시작 실패", "자동매매 시작에 실패했습니다. 로그를 확인해주세요.")
@@ -1264,7 +1264,7 @@ class MainWindow(QMainWindow):
         """잔고 갱신 (TR 큐 기반, 60초 주기)"""
         if self._is_stopping:
             return
-        # ✅ 잔고만 갱신 (감시 종목은 별도 타이머로 5분 주기)
+        # ✅ 잔고만 갱신 (감시 종목은 별도 타이머로 10분 주기)
         self.refresh_holdings()
 
     def refresh_holdings(self):
