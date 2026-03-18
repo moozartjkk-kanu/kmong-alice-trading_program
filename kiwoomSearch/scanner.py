@@ -28,19 +28,25 @@ from PyQt5.QtCore import QTimer
 from technical_analysis import TechnicalAnalysis
 
 # ── 상수 ─────────────────────────────────────────────────────────────────────
-_SCREEN_BASE      = 3000              # 실시간 등록 화면번호 시작
-_MAX_PER_SCREEN   = 100               # 화면당 최대 등록 종목
-_CANDLE_COUNT     = 70                # 일봉 요청 개수 (RSI14 + MA60 여유)
-_CANDLE_TTL       = 900               # 메모리 캐시 유효 시간 (초, 15분)
-_CANDLE_FILE_TTL  = 86400             # 파일 캐시 유효 시간 (초, 24시간)
-_RT_FIDS          = "10;13"           # 현재가(10); 누적거래량(13)
-_TOP_CODES_FILE   = "top_codes_cache.json"
+_SCREEN_BASE       = 3000              # 실시간 등록 화면번호 시작
+_MAX_PER_SCREEN    = 100               # 화면당 최대 등록 종목
+_CANDLE_COUNT      = 70                # 일봉 요청 개수 (RSI14 + MA60 여유)
+_CANDLE_TTL        = 900               # 메모리 캐시 유효 시간 (초, 15분)
+_CANDLE_FILE_TTL   = 86400             # 파일 캐시 유효 시간 (초, 24시간)
+_INVESTOR_TTL      = 900               # 수급 메모리 캐시 유효 시간 (초, 15분)
+_INVESTOR_FILE_TTL = 86400             # 수급 파일 캐시 유효 시간 (초, 24시간)
+_INVESTOR_COUNT    = 20                # 수급 조회 일수
+_RT_FIDS           = "10;13"           # 현재가(10); 누적거래량(13)
+_TOP_CODES_FILE    = "top_codes_cache.json"
 _CANDLE_CACHE_FILE = "candle_cache.json"
+_INVESTOR_CACHE_FILE = "investor_cache.json"
 
 # ── 모듈 레벨 공유 캐시 ───────────────────────────────────────────────────────
-CANDLE_CACHE: dict = {}   # code → {"data": list, "ts": float}
-RT_CACHE:     dict = {}   # code → (price: int, cum_vol: int)
-_candle_file_loaded = False   # 파일 캐시 1회 로드 여부
+CANDLE_CACHE:   dict = {}   # code → {"data": list, "ts": float}
+INVESTOR_CACHE: dict = {}   # code → {"data": list, "ts": float}
+RT_CACHE:       dict = {}   # code → (price: int, cum_vol: int)
+_candle_file_loaded   = False   # 파일 캐시 1회 로드 여부
+_investor_file_loaded = False
 
 
 # ── 캔들 캐시 파일 I/O ─────────────────────────────────────────────────────────
@@ -79,6 +85,43 @@ def _save_candle_cache_to_file(top_codes: list):
         print(f"[캔들캐시] 파일 저장 실패: {e}")
 
 
+# ── 수급 캐시 파일 I/O ─────────────────────────────────────────────────────────
+def _load_investor_cache_from_file():
+    """프로그램 시작 시 파일에서 수급 캐시를 메모리로 로드."""
+    global INVESTOR_CACHE, _investor_file_loaded
+    try:
+        if not os.path.exists(_INVESTOR_CACHE_FILE):
+            return
+        with open(_INVESTOR_CACHE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        now = time.time()
+        loaded = 0
+        for code, entry in raw.items():
+            if now - entry.get("ts", 0) < _INVESTOR_FILE_TTL:
+                INVESTOR_CACHE[code] = entry
+                loaded += 1
+        print(f"[수급캐시] 파일에서 {loaded}개 로드 ({len(raw) - loaded}개 만료 제거)")
+    except Exception as e:
+        print(f"[수급캐시] 파일 로드 실패: {e}")
+    finally:
+        _investor_file_loaded = True
+
+
+def _save_investor_cache_to_file(top_codes: list):
+    """상위 N 종목의 수급 데이터만 파일로 저장."""
+    try:
+        to_save = {
+            code: INVESTOR_CACHE[code]
+            for code in top_codes
+            if code in INVESTOR_CACHE
+        }
+        with open(_INVESTOR_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(to_save, f, ensure_ascii=False)
+        print(f"[수급캐시] {len(to_save)}개 파일 저장 완료")
+    except Exception as e:
+        print(f"[수급캐시] 파일 저장 실패: {e}")
+
+
 # ── 조건 지문 (fingerprint) ────────────────────────────────────────────────────
 def _get_fingerprint(conditions: dict) -> str:
     """랭킹에 영향을 주는 조건(시장·종목수)으로 지문 생성."""
@@ -111,18 +154,32 @@ def _save_top_codes_cache(codes: list, fingerprint: str):
 
 def _make_row(code: str, name: str, price: int, ev: dict) -> dict:
     return {
-        "code":         code,
-        "name":         name,
-        "price":        price,
-        "rsi":          ev.get("rsi"),
-        "ma":           ev.get("ma"),
-        "ma_short":     ev.get("ma_short"),
-        "volume_ratio": ev.get("volume_ratio"),
-        "breakout":     ev.get("breakout_ok", False),
-        "rsi_ok":       ev.get("rsi_ok", False),
-        "ma_ok":        ev.get("ma_ok", False),
-        "volume_ok":    ev.get("volume_ok", False),
+        "code":                 code,
+        "name":                 name,
+        "price":                price,
+        "rsi":                  ev.get("rsi"),
+        "ma":                   ev.get("ma"),
+        "ma_short":             ev.get("ma_short"),
+        "volume_ratio":         ev.get("volume_ratio"),
+        "breakout":             ev.get("breakout_ok", False),
+        "rsi_ok":               ev.get("rsi_ok", False),
+        "ma_ok":                ev.get("ma_ok", False),
+        "volume_ok":            ev.get("volume_ok", False),
+        "supply_ok":            ev.get("supply_ok", False),
+        "supply_data_available": ev.get("supply_data_available", True),
+        "trading_value":        ev.get("trading_value"),
+        "trading_value_ratio":  ev.get("trading_value_ratio"),
+        "trading_value_ok":     ev.get("trading_value_ok", False),
     }
+
+
+def _has_meaningful_investor_data(data: list) -> bool:
+    if not data:
+        return False
+    return any(
+        (row.get("foreign", 0) or row.get("institution", 0))
+        for row in data
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -153,7 +210,7 @@ class Scanner:
         self._is_running   = False
         self._is_scanning  = False
         self._cancelled    = False
-        self._phase        = "idle"   # "phase1" | "phase2" | "idle"
+        self._phase        = "idle"   # "phase1" | "phase2" | "phase3" | "idle"
         self._scan_started_at = None
         self._next_refresh_at = None
 
@@ -170,6 +227,10 @@ class Scanner:
         self._opt10030_codes: list = []
         self._opt10030_pages = 0
 
+        # Phase3: 수급 조회 상태
+        self._investor_total = 0
+        self._investor_done  = 0
+
         self._refresh_timer = QTimer()
         self._refresh_timer.timeout.connect(self._on_auto_refresh)
 
@@ -183,6 +244,7 @@ class Scanner:
         # 프로세스 내 최초 1회: 파일 캐시 → 메모리 로드
         if not Scanner._file_cache_loaded:
             _load_candle_cache_from_file()
+            _load_investor_cache_from_file()
             Scanner._file_cache_loaded = True
 
     # ── 외부 인터페이스 ────────────────────────────────────────────────────────
@@ -429,27 +491,137 @@ class Scanner:
             self._avg_volumes[code] = 0
 
     def _on_all_fetched(self):
-        """일봉 fetch 완료 후 조건 평가 및 결과 발행."""
+        """일봉 fetch 완료 후 — 수급 조건 활성 시 Phase3 진입, 아니면 바로 평가."""
         if self._cancelled:
             return
-
-        self._is_scanning = False
-        self._phase       = "idle"
-        self._scan_started_at = None
 
         # 캔들 캐시 파일 저장 (상위 N만)
         _save_candle_cache_to_file(self._top_codes)
 
-        # 조건 평가 → 결과 발행
+        conditions = self.config.get_scan()
+        if conditions.get("supply_enabled"):
+            # Phase3: 수급 데이터 조회
+            self._run_phase3()
+        else:
+            self._is_scanning = False
+            self._phase       = "idle"
+            self._scan_started_at = None
+            self._evaluate_and_emit()
+            self._schedule_next_refresh()
+            if self._done_cb:
+                self._done_cb()
+
+    # ── Phase 3: 수급 데이터 조회 (opt10059) ──────────────────────────────
+    def _run_phase3(self):
+        self._phase = "phase3"
+        self._log(f"[Phase3] {len(self._top_codes)}종목 수급 데이터 조회 시작")
+        self._start_investor_fetch(self._top_codes)
+
+    def _start_investor_fetch(self, codes: list):
+        """
+        수급 데이터(opt10059)를 TRQueue로 순차 조회.
+        캐시(15분) 유효한 종목은 TR 호출 없음.
+        """
+        self._investor_done = 0
+        now = time.time()
+        uncached = []
+        for code in codes:
+            entry = INVESTOR_CACHE.get(code)
+            if entry and (now - entry["ts"]) < _INVESTOR_TTL:
+                pass  # 캐시 hit (데이터 유무 불문, TTL 내 수신된 응답이면 재사용)
+            else:
+                uncached.append(code)
+
+        self._investor_total = len(uncached)
+        cached_cnt = len(codes) - len(uncached)
+        self._log(
+            f"[TR] 수급 {len(uncached)}개 조회 예정"
+            f" (캐시 재사용 {cached_cnt}개)"
+        )
+
+        if not uncached:
+            self._on_all_investor_fetched()
+            return
+
+        for code in uncached:
+            self.kiwoom.tr_queue.enqueue(
+                self.kiwoom.get_investor_data,
+                lambda data, c=code: self._on_investor_tr_callback(c, data),
+                code, _INVESTOR_COUNT,
+            )
+
+    def _on_investor_tr_callback(self, code: str, data):
+        """opt10059 TR 콜백."""
+        if self._cancelled:
+            return
+
+        if data:  # 빈 응답이 아니면 항상 캐시 (0값 포함)
+            INVESTOR_CACHE[code] = {"data": data, "ts": time.time()}
+
+        self._investor_done += 1
+        name  = self.kiwoom.get_stock_name_from_cache(code) or code
+        if self._progress_cb:
+            self._progress_cb("수급 조회", self._investor_done, self._investor_total, name)
+
+        if self._investor_done >= self._investor_total:
+            self._on_all_investor_fetched()
+
+    def _on_all_investor_fetched(self):
+        """수급 fetch 완료 후 조건 평가 및 결과 발행."""
+        if self._cancelled:
+            return
+
+        _save_investor_cache_to_file(self._top_codes)
+        cached_count = sum(1 for code in self._top_codes if code in INVESTOR_CACHE)
+        meaningful_count = sum(
+            1 for code in self._top_codes
+            if _has_meaningful_investor_data((INVESTOR_CACHE.get(code) or {}).get("data") or [])
+        )
+        self._log(
+            f"[Phase3] 수급 수신: {cached_count}종목 캐시됨"
+            f" / 의미있는 데이터: {meaningful_count}종목"
+            f" / 전체: {len(self._top_codes)}종목"
+        )
+        if self._top_codes and meaningful_count == 0:
+            self._log("[경고] 수급 데이터가 전 종목에서 0으로 들어왔습니다. opt10059 필드명 또는 입력값 확인이 필요합니다.")
+        elif meaningful_count > 0:
+            # 외국인/기관 오늘(최신) 값 분포 요약
+            f_pos = f_zero = f_neg = 0
+            i_pos = i_zero = i_neg = 0
+            for code in self._top_codes:
+                data = (INVESTOR_CACHE.get(code) or {}).get("data") or []
+                if not data:
+                    continue
+                fv = data[0].get("foreign", 0) or 0
+                iv = data[0].get("institution", 0) or 0
+                if fv > 0:   f_pos  += 1
+                elif fv < 0: f_neg  += 1
+                else:        f_zero += 1
+                if iv > 0:   i_pos  += 1
+                elif iv < 0: i_neg  += 1
+                else:        i_zero += 1
+            self._log(
+                f"[수급분포] 외국인 순매수:{f_pos} / 순매도:{f_neg} / 없음(ETF등):{f_zero}  |"
+                f"  기관 순매수:{i_pos} / 순매도:{i_neg} / 없음:{i_zero}"
+            )
+
+        self._is_scanning = False
+        self._phase       = "idle"
+        self._scan_started_at = None
         self._evaluate_and_emit()
         self._schedule_next_refresh()
-
         if self._done_cb:
             self._done_cb()
 
     def _evaluate_and_emit(self):
         conditions = self.config.get_scan()
         results    = []
+
+        stat = {
+            "rsi": 0, "ma": 0, "volume": 0, "breakout": 0,
+            "supply": 0, "supply_foreign": 0, "supply_institution": 0,
+            "trading_value": 0,
+        }
 
         for code in self._top_codes:
             name    = self.kiwoom.get_stock_name_from_cache(code) or code
@@ -459,7 +631,21 @@ class Scanner:
             price     = rt[0] if rt else (candles[0].get("close",  0) if candles else 0)
             today_vol = rt[1] if rt else (candles[0].get("volume", 0) if candles else 0)
 
-            ev = self._ta.evaluate(candles, price, today_vol, conditions)
+            inv_entry     = INVESTOR_CACHE.get(code)
+            investor_data = inv_entry["data"] if inv_entry else []
+
+            ev = self._ta.evaluate(candles, price, today_vol, conditions,
+                                   investor_data=investor_data)
+            if conditions.get("rsi_enabled")           and ev.get("rsi_ok"):               stat["rsi"]                += 1
+            if conditions.get("ma_enabled")            and ev.get("ma_ok"):                stat["ma"]                 += 1
+            if conditions.get("volume_enabled")        and ev.get("volume_ok"):            stat["volume"]             += 1
+            if conditions.get("breakout_enabled")      and ev.get("breakout_ok"):          stat["breakout"]           += 1
+            if conditions.get("supply_enabled"):
+                if ev.get("supply_ok"):                                                     stat["supply"]             += 1
+                if ev.get("supply_foreign_ok"):                                             stat["supply_foreign"]     += 1
+                if ev.get("supply_institution_ok"):                                         stat["supply_institution"] += 1
+            if conditions.get("trading_value_enabled") and ev.get("trading_value_ok"):     stat["trading_value"]      += 1
+
             if ev["match"]:
                 results.append(_make_row(code, name, price, ev))
 
@@ -467,14 +653,53 @@ class Scanner:
         self._watch_codes = [r["code"] for r in results]
         self._register_realtime(self._watch_codes)
 
-        self._log(f"[평가] 조건 만족 {len(results)}개 / {len(self._top_codes)}개")
+        total = len(self._top_codes)
+        stat_parts = []
+        if conditions.get("rsi_enabled"):           stat_parts.append(f"RSI:{stat['rsi']}/{total}")
+        if conditions.get("ma_enabled"):            stat_parts.append(f"MA:{stat['ma']}/{total}")
+        if conditions.get("volume_enabled"):        stat_parts.append(f"거래량:{stat['volume']}/{total}")
+        if conditions.get("breakout_enabled"):      stat_parts.append(f"돌파:{stat['breakout']}/{total}")
+        if conditions.get("supply_enabled"):
+            sub = []
+            foreign_days = int(conditions.get("foreign_consec_days", 3))
+            if foreign_days > 0:
+                sub.append(f"외국인{foreign_days}일:{stat['supply_foreign']}/{total}")
+            if conditions.get("institution_turnover_enabled", True):
+                sub.append(f"기관전환:{stat['supply_institution']}/{total}")
+            sub_str = f"({', '.join(sub)})" if sub else ""
+            stat_parts.append(f"수급:{stat['supply']}/{total} {sub_str}")
+        if conditions.get("trading_value_enabled"): stat_parts.append(f"거래대금:{stat['trading_value']}/{total}")
+        if stat_parts:
+            self._log(f"[평가] 조건별 통과: {', '.join(stat_parts)}")
+        self._log(f"[평가] 조건 만족 {len(results)}개 / {total}개")
         if self._result_cb:
             self._result_cb(results)
 
     def apply_new_conditions(self):
-        """설정 저장 후 호출 — TR 재조회 없이 캐시 데이터로 조건 재평가."""
+        """설정 저장 후 호출 — 캐시 데이터로 조건 재평가.
+        수급 조건이 활성화되어 있고 신선한 수급 데이터가 없는 종목이 있으면 Phase3를 실행.
+        """
         if not self._is_running or self._is_scanning:
             return
+
+        conditions = self.config.get_scan()
+        if conditions.get("supply_enabled"):
+            now = time.time()
+            needs_fetch = any(
+                not (
+                    code in INVESTOR_CACHE
+                    and (now - INVESTOR_CACHE[code].get("ts", 0)) < _INVESTOR_TTL
+                    and _has_meaningful_investor_data(INVESTOR_CACHE[code].get("data") or [])
+                )
+                for code in self._top_codes
+            )
+            if needs_fetch:
+                self._log("[설정] 수급 조건 활성화 → 수급 데이터 새로 조회")
+                self._is_scanning = True
+                self._scan_started_at = time.time()
+                self._run_phase3()
+                return
+
         self._log("[설정] 변경된 조건으로 캐시 데이터 재평가")
         self._evaluate_and_emit()
         if self._done_cb:

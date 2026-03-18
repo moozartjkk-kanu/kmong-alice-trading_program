@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QLabel, QPushButton, QTableWidget, QTableWidgetItem,
     QTextEdit, QComboBox, QTabWidget, QMessageBox, QHeaderView,
     QFrame, QGridLayout, QProgressBar, QDoubleSpinBox, QSpinBox,
-    QCheckBox, QDialog, QRadioButton, QButtonGroup
+    QCheckBox, QDialog, QRadioButton, QButtonGroup, QScrollArea
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
@@ -332,13 +332,14 @@ class MainWindow(QMainWindow):
 
         # 결과 테이블
         self.result_table = QTableWidget()
-        self.result_table.setColumnCount(7)
+        self.result_table.setColumnCount(9)
         self.result_table.setHorizontalHeaderLabels([
-            "종목명 (코드)", "현재가", "RSI", "이평(MA)", "거래량비", "돌파", "조건"
+            "종목명 (코드)", "현재가", "RSI", "이평(MA)", "거래량비", "돌파",
+            "수급", "거래대금", "조건"
         ])
         hdr = self.result_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.Stretch)
-        for c in range(1, 7):
+        for c in range(1, 9):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -351,7 +352,14 @@ class MainWindow(QMainWindow):
 
     # ── 설정 탭 ────────────────────────────────────────────────────────────
     def _build_settings_tab(self):
+        # 스크롤 영역으로 감싸서 창 크기에 무관하게 설정 내용을 스크롤로 볼 수 있게 함
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         w = QWidget()
+        scroll.setWidget(w)
+
         v = QVBoxLayout(w)
         v.setContentsMargins(10, 10, 10, 10)
         v.setSpacing(10)
@@ -494,6 +502,69 @@ class MainWindow(QMainWindow):
         self.bo_grp = bo_grp
         v.addWidget(bo_grp)
 
+        # ── 수급 조건 ──────────────────────────────────────────────────────
+        supply_grp = QGroupBox("수급 조건  ※ 활성화 시 종목당 TR 1회 추가 (탐색 시간 증가)")
+        supply_grp.setCheckable(True)
+        supply_grp.setChecked(bool(scan.get("supply_enabled", False)))
+        sg = QGridLayout(supply_grp)
+
+        sg.addWidget(QLabel("외국인 순매수 연속 (일):"), 0, 0)
+        self.foreign_consec_spin = QSpinBox()
+        self.foreign_consec_spin.setRange(0, 20)
+        self.foreign_consec_spin.setValue(int(scan.get("foreign_consec_days", 3)))
+        self.foreign_consec_spin.setSpecialValueText("사용 안 함")
+        sg.addWidget(self.foreign_consec_spin, 0, 1)
+
+        self.institution_turnover_chk = QCheckBox("기관 순매수 전환 (오늘 > 0)")
+        self.institution_turnover_chk.setChecked(
+            bool(scan.get("institution_turnover_enabled", True)))
+        sg.addWidget(self.institution_turnover_chk, 1, 0, 1, 2)
+
+        sg.addWidget(QLabel("예) 외국인 3일 연속 순매수\n+ 기관 순매수 전환"),
+                     0, 2, 2, 1, Qt.AlignTop | Qt.AlignLeft)
+        self.supply_grp = supply_grp
+        v.addWidget(supply_grp)
+
+        # ── 거래대금 조건 ──────────────────────────────────────────────────
+        tv_grp = QGroupBox("거래대금 조건")
+        tv_grp.setCheckable(True)
+        tv_grp.setChecked(bool(scan.get("trading_value_enabled", False)))
+        tvg = QGridLayout(tv_grp)
+
+        tvg.addWidget(QLabel("거래대금 최소 (억원):"), 0, 0)
+        self.tv_min_spin = QDoubleSpinBox()
+        self.tv_min_spin.setRange(0, 100000)
+        self.tv_min_spin.setDecimals(0)
+        self.tv_min_spin.setValue(float(scan.get("trading_value_min_billion", 100)))
+        self.tv_min_spin.setSuffix(" 억원")
+        tvg.addWidget(self.tv_min_spin, 0, 1)
+
+        self.tv_increase_chk = QCheckBox("거래대금 증가율 조건 사용")
+        self.tv_increase_chk.setChecked(
+            bool(scan.get("trading_value_increase_enabled", False)))
+        tvg.addWidget(self.tv_increase_chk, 1, 0, 1, 2)
+        self.tv_increase_chk.toggled.connect(self._on_tv_increase_toggled)
+
+        tvg.addWidget(QLabel("증가율 기준 (이상):"), 2, 0)
+        self.tv_ratio_spin = QDoubleSpinBox()
+        self.tv_ratio_spin.setRange(100, 10000)
+        self.tv_ratio_spin.setDecimals(0)
+        self.tv_ratio_spin.setValue(float(scan.get("trading_value_increase_pct", 200)))
+        self.tv_ratio_spin.setSuffix(" %")
+        tvg.addWidget(self.tv_ratio_spin, 2, 1)
+
+        tvg.addWidget(QLabel("평균 기간 (일):"), 3, 0)
+        self.tv_avg_days_spin = QSpinBox()
+        self.tv_avg_days_spin.setRange(1, 120)
+        self.tv_avg_days_spin.setValue(int(scan.get("trading_value_avg_days", 20)))
+        tvg.addWidget(self.tv_avg_days_spin, 3, 1)
+
+        tvg.addWidget(QLabel("예) 거래대금 > 100억\n20일 평균 대비 200% 이상"),
+                      0, 2, 4, 1, Qt.AlignTop | Qt.AlignLeft)
+        self.tv_grp = tv_grp
+        v.addWidget(tv_grp)
+        self._on_tv_increase_toggled(self.tv_increase_chk.isChecked())
+
         # ── 저장 버튼 ──────────────────────────────────────────────────────
         save_row = QHBoxLayout()
         save_row.addStretch()
@@ -505,7 +576,7 @@ class MainWindow(QMainWindow):
         v.addLayout(save_row)
 
         v.addStretch()
-        return w
+        return scroll
 
     # ── 로그 프레임 ────────────────────────────────────────────────────────
     def _build_log_frame(self):
@@ -533,6 +604,11 @@ class MainWindow(QMainWindow):
         self.ma_long_lbl.setVisible(is_golden)
         self.ma_long_spin.setVisible(is_golden)
 
+    def _on_tv_increase_toggled(self, checked: bool):
+        """거래대금 증가율 조건 사용 토글 시 관련 입력 표시/숨김"""
+        self.tv_ratio_spin.setEnabled(checked)
+        self.tv_avg_days_spin.setEnabled(checked)
+
     def _save_settings(self):
         """설정 저장"""
         cond_map = {0: "above", 1: "below", 2: "golden"}
@@ -554,6 +630,16 @@ class MainWindow(QMainWindow):
             "volume_ratio":      self.vol_ratio.value(),
             "breakout_enabled":  self.bo_grp.isChecked(),
             "breakout_days":     self.bo_days.value(),
+            # 수급 조건
+            "supply_enabled":                self.supply_grp.isChecked(),
+            "foreign_consec_days":           self.foreign_consec_spin.value(),
+            "institution_turnover_enabled":  self.institution_turnover_chk.isChecked(),
+            # 거래대금 조건
+            "trading_value_enabled":         self.tv_grp.isChecked(),
+            "trading_value_min_billion":     self.tv_min_spin.value(),
+            "trading_value_increase_enabled": self.tv_increase_chk.isChecked(),
+            "trading_value_increase_pct":    self.tv_ratio_spin.value(),
+            "trading_value_avg_days":        self.tv_avg_days_spin.value(),
         }
         if self.config.save_scan(scan):
             self.log("[설정] 저장 완료")
@@ -703,6 +789,10 @@ class MainWindow(QMainWindow):
             ma_s   = row.get("ma_short")
             vr     = row.get("volume_ratio")
             bo     = row.get("breakout", False)
+            supply_ok = row.get("supply_ok", False)
+            supply_data_available = row.get("supply_data_available", True)
+            tv     = row.get("trading_value")
+            tv_ratio = row.get("trading_value_ratio")
 
             # 종목명 (코드)
             self._set(r_idx, 0, f"{name} ({code})")
@@ -744,13 +834,49 @@ class MainWindow(QMainWindow):
                 item_bo.setForeground(QColor("#2e7d32"))
             self.result_table.setItem(r_idx, 5, item_bo)
 
+            # 수급
+            supply_enabled = bool(self.config.get("scan", "supply_enabled"))
+            if not supply_enabled:
+                supply_txt = "-"
+                supply_color = None
+            elif not supply_data_available:
+                supply_txt = "?"
+                supply_color = QColor("#ef6c00")
+            elif supply_ok:
+                supply_txt = "●"
+                supply_color = QColor("#6a1b9a")   # 보라
+            else:
+                supply_txt = "✕"
+                supply_color = QColor("#9e9e9e")
+            item_sup = self._make_item(supply_txt, align=Qt.AlignCenter)
+            if supply_color:
+                item_sup.setForeground(supply_color)
+            self.result_table.setItem(r_idx, 6, item_sup)
+
+            # 거래대금
+            tv_enabled = bool(self.config.get("scan", "trading_value_enabled"))
+            if not tv_enabled or tv is None:
+                tv_txt = "-"
+            else:
+                tv_bil = tv / 100
+                if tv_ratio is not None:
+                    tv_txt = f"{tv_bil:,.0f}억 ({tv_ratio:.0f}%)"
+                else:
+                    tv_txt = f"{tv_bil:,.0f}억"
+            item_tv = self._make_item(tv_txt, align=Qt.AlignRight | Qt.AlignVCenter)
+            if tv_enabled and row.get("trading_value_ok"):
+                item_tv.setForeground(QColor("#1565C0"))
+            self.result_table.setItem(r_idx, 7, item_tv)
+
             # 조건 요약
             conds = []
-            if row.get("rsi_ok"):    conds.append("RSI")
-            if row.get("ma_ok"):     conds.append("MA")
-            if row.get("volume_ok"): conds.append("거래량")
-            if row.get("breakout"):  conds.append("돌파")
-            self._set(r_idx, 6, " / ".join(conds) if conds else "-")
+            if row.get("rsi_ok"):           conds.append("RSI")
+            if row.get("ma_ok"):            conds.append("MA")
+            if row.get("volume_ok"):        conds.append("거래량")
+            if row.get("breakout"):         conds.append("돌파")
+            if row.get("supply_ok"):        conds.append("수급")
+            if row.get("trading_value_ok"): conds.append("거래대금")
+            self._set(r_idx, 8, " / ".join(conds) if conds else "-")
 
         self.result_table.setSortingEnabled(True)
 

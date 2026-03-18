@@ -12,6 +12,8 @@
 class TechnicalAnalysis:
     """지표 계산 클래스 (일봉 기준, 미완성 당일봉 포함)"""
 
+    _TRADING_VALUE_UNIT_KRW = 1_000_000
+
     # ------------------------------------------------------------------
     # RSI
     # ------------------------------------------------------------------
@@ -155,17 +157,21 @@ class TechnicalAnalysis:
         current_price: int,
         today_volume: int,
         conditions: dict,
+        investor_data: list = None,
     ) -> dict:
         """
         조건 평가
 
         Args:
             candles: 일봉 리스트 (최신순)
-                     각 봉: {"open", "high", "low", "close", "volume", "date"}
+                     각 봉: {"open", "high", "low", "close", "volume", "trading_value", "date"}
                      인덱스 0 = 당일 미완성봉 (장중)
             current_price: 실시간 현재가
             today_volume: 당일 누적 거래량 (실시간)
             conditions: config["scan"] 딕셔너리
+            investor_data: opt10059 결과 (최신순)
+                           [{"date", "foreign", "institution"}, ...]
+                           양수=순매수, 음수=순매도
 
         Returns:
             {
@@ -178,6 +184,10 @@ class TechnicalAnalysis:
                 "volume_ok": bool,
                 "highest": float | None,
                 "breakout_ok": bool,
+                "supply_ok": bool,
+                "trading_value": int | None,
+                "trading_value_ratio": float | None,
+                "trading_value_ok": bool,
                 "match": bool,
             }
         """
@@ -191,6 +201,13 @@ class TechnicalAnalysis:
             "volume_ok": False,
             "highest": None,
             "breakout_ok": False,
+            "supply_ok": False,
+            "supply_data_available": False,
+            "supply_foreign_ok": False,
+            "supply_institution_ok": False,
+            "trading_value": None,
+            "trading_value_ratio": None,
+            "trading_value_ok": False,
             "match": False,
         }
 
@@ -258,6 +275,70 @@ class TechnicalAnalysis:
             ok = highest is not None and current_price > highest
             result["breakout_ok"] = ok
             checks.append(ok)
+
+        # ── 수급 조건 (외국인/기관) ─────────────────────────────────
+        if conditions.get("supply_enabled"):
+            inv = investor_data or []
+            supply_data_available = any(
+                (row.get("foreign", 0) or row.get("institution", 0))
+                for row in inv
+            )
+            result["supply_data_available"] = supply_data_available
+            supply_parts = []
+
+            if supply_data_available:
+                # 외국인 순매수 N일 연속
+                foreign_days = int(conditions.get("foreign_consec_days", 3))
+                if foreign_days > 0:
+                    if len(inv) >= foreign_days:
+                        consecutive = all(inv[i]["foreign"] > 0 for i in range(foreign_days))
+                    else:
+                        consecutive = False
+                    result["supply_foreign_ok"] = consecutive
+                    supply_parts.append(consecutive)
+
+                # 기관 순매수 전환 (오늘 > 0)
+                if conditions.get("institution_turnover_enabled", True):
+                    inst_today = inv[0]["institution"] if inv else 0
+                    inst_ok = inst_today > 0
+                    result["supply_institution_ok"] = inst_ok
+                    supply_parts.append(inst_ok)
+
+            supply_ok = all(supply_parts) if supply_parts else False
+            result["supply_ok"] = supply_ok
+            checks.append(supply_ok)
+
+        # ── 거래대금 조건 ───────────────────────────────────────────────
+        if conditions.get("trading_value_enabled"):
+            tv_values = [abs(int(c.get("trading_value") or 0)) for c in candles]
+            today_tv = tv_values[0] if tv_values else 0
+            result["trading_value"] = today_tv
+            tv_parts = []
+
+            # 거래대금 최소 (억원) — API 단위가 원(KRW)이라고 가정
+            tv_min_billion = float(conditions.get("trading_value_min_billion", 100))
+            if tv_min_billion > 0:
+                tv_parts.append(today_tv >= tv_min_billion * 100)
+
+            # 거래대금 증가율 (%)
+            if conditions.get("trading_value_increase_enabled", False):
+                avg_days = int(conditions.get("trading_value_avg_days", 20))
+                past_tvs = [v for v in tv_values[1: avg_days + 1] if v > 0]
+                if past_tvs:
+                    avg_tv = sum(past_tvs) / len(past_tvs)
+                    if avg_tv > 0:
+                        ratio_pct = round(today_tv / avg_tv * 100, 1)
+                        result["trading_value_ratio"] = ratio_pct
+                        threshold = float(conditions.get("trading_value_increase_pct", 200))
+                        tv_parts.append(ratio_pct >= threshold)
+                    else:
+                        tv_parts.append(False)
+                else:
+                    tv_parts.append(False)
+
+            tv_ok = all(tv_parts) if tv_parts else False
+            result["trading_value_ok"] = tv_ok
+            checks.append(tv_ok)
 
         # ── 조건 결합 ──────────────────────────────────────────────────
         if not checks:

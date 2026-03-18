@@ -642,10 +642,25 @@ class KiwoomAPI:
                     "low": self.get_comm_data(trcode, rqname, i, "저가"),
                     "close": self.get_comm_data(trcode, rqname, i, "현재가"),
                     "volume": self.get_comm_data(trcode, rqname, i, "거래량"),
+                    "trading_value": self.get_comm_data(trcode, rqname, i, "거래대금"),
                 }
                 candles.append(candle)
             self.tr_data["opt10081_candles"] = candles
             self._debug(f"[TR] opt10081 extracted {len(candles)} candles")
+
+        # opt10059: 기간별 외국인기관 매매 동향
+        elif trcode == "opt10059":
+            records = []
+            repeat_cnt = self.get_repeat_cnt(trcode, rqname)
+            self._debug(f"[TR] opt10059 repeat_cnt={repeat_cnt} (rqname={rqname})")
+            for i in range(min(repeat_cnt, 30)):
+                records.append({
+                    "date":        self.get_comm_data(trcode, rqname, i, "일자"),
+                    "foreign":     self._get_comm_data_multi(trcode, rqname, i, ["외국인투자자", "외국인", "외인계", "외국계"]),
+                    "institution": self._get_comm_data_multi(trcode, rqname, i, ["기관계", "기관합계", "기관"]),
+                })
+            self.tr_data["opt10059_records"] = records
+            self._debug(f"[TR] opt10059 extracted {len(records)} records")
 
         # opt10030: 거래량 상위
         elif trcode.lower() == "opt10030":
@@ -686,6 +701,14 @@ class KiwoomAPI:
             trcode, record_name, index, item
         )
         return data.strip()
+
+    def _get_comm_data_multi(self, trcode, record_name, index, items):
+        """여러 후보 필드명 중 첫 번째 유효값을 반환."""
+        for item in items:
+            data = self.get_comm_data(trcode, record_name, index, item)
+            if data:
+                return data
+        return ""
 
     def get_repeat_cnt(self, trcode, record_name):
         """반복 데이터 개수"""
@@ -973,11 +996,64 @@ class KiwoomAPI:
                 "low": abs(int(raw.get("low") or 0)),
                 "close": abs(int(raw.get("close") or 0)),
                 "volume": int(raw.get("volume") or 0),
+                "trading_value": abs(int(raw.get("trading_value") or 0)),
             }
             candles.append(candle)
 
         self._debug(f"[opt10081] code={code} candles_count={len(candles)}")
         return candles
+
+    # ==================== 투자자 매매 동향 (외국인/기관) ====================
+    def get_investor_data(self, code, count=20):
+        """
+        기간별 외국인/기관 매매 동향 조회 (opt10059)
+
+        Args:
+            code: 종목코드
+            count: 조회 일수 (기본 20일)
+
+        Returns:
+            list[dict]: [{"date", "foreign", "institution"}, ...]
+                        최신순 (인덱스 0 = 오늘 또는 가장 최근)
+                        각 값: 양수=순매수, 음수=순매도
+        """
+        from datetime import datetime
+        today = datetime.now().strftime("%Y%m%d")
+        self.set_input_value("일자", today)
+        self.set_input_value("종목코드", code)
+        self.set_input_value("금액수량구분", "1")   # 1=금액
+        self.set_input_value("매매구분", "0")        # 0=순매수
+        self.set_input_value("단위구분", "1000")     # 천주
+        self.comm_rq_data("투자자매매동향", "opt10059", 0, "0197")
+
+        raw_records = self.tr_data.get("opt10059_records", [])
+        self._debug(f"[opt10059] code={code} raw_records={len(raw_records)}")
+
+        def _parse_investor_int(v):
+            if not v:
+                return 0
+            try:
+                s = str(v).replace(",", "").replace(" ", "")
+                return int(s)
+            except Exception:
+                return 0
+
+        records = []
+        for raw in raw_records[:count]:
+            records.append({
+                "date":        raw.get("date", ""),
+                "foreign":     _parse_investor_int(raw.get("foreign", 0)),
+                "institution": _parse_investor_int(raw.get("institution", 0)),
+            })
+
+        if records and not any(
+            r["foreign"] or r["institution"]
+            for r in records
+        ):
+            self._debug(f"[opt10059] code={code} all parsed values are zero; field names or TR inputs should be checked")
+
+        self._debug(f"[opt10059] code={code} parsed={len(records)} records")
+        return records
 
     # ==================== 거래량 상위 ====================
     def get_volume_top_opt10030(self, params: dict, prev_next=0):

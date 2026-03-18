@@ -51,6 +51,19 @@ DEFAULT_CONFIG = {
         # 가격 돌파 조건
         "breakout_enabled": False,
         "breakout_days": 20,            # N일 고가 돌파 여부
+
+        # 수급 조건 (외국인/기관 매매 동향, opt10059)
+        # ※ 수급 조건 활성화 시 종목당 TR 1회 추가 → 탐색 시간 증가
+        "supply_enabled": False,
+        "foreign_consec_days": 3,               # 외국인 순매수 N일 이상 연속 (0=미사용)
+        "institution_turnover_enabled": True,   # 기관 순매수 전환 (오늘 > 0)
+
+        # 거래대금 조건 (opt10081 거래대금 필드 활용, 단위: 원(KRW))
+        "trading_value_enabled": False,
+        "trading_value_min_billion": 100.0,     # 거래대금 최소 (억원), 0=미사용
+        "trading_value_increase_enabled": False,
+        "trading_value_increase_pct": 200.0,    # 거래대금 증가율 (%, N일 평균 대비)
+        "trading_value_avg_days": 20,           # 거래대금 평균 기준 일수
     }
 }
 
