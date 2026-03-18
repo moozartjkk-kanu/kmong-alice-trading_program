@@ -10,7 +10,7 @@ Phase 1 (최초 or 탐색 조건 변경 후)
      - 캐시(15분 TTL) 있는 종목은 즉시 처리 (TR 호출 없음)
   ③ 상위 N종목 목록을 top_codes_cache.json 에 저장
 
-Phase 2 (15분 자동 갱신)
+Phase 2 (2시간 자동 갱신)
   ① 저장된 상위 N종목만 일봉 갱신
   ② 조건 평가 → 결과 발행
 ─────────────────────────────────────────────────────────────────
@@ -138,7 +138,7 @@ class Scanner:
     done_cb()          스캔 완료(평가 직후)
     """
 
-    AUTO_REFRESH_MS  = 15 * 60 * 1000  # 15분
+    AUTO_REFRESH_MS  = 2 * 60 * 60 * 1000  # 2시간
     _file_cache_loaded = False            # 클래스 레벨 플래그 (프로세스 내 1회)
 
     def __init__(self, kiwoom, config,
@@ -154,6 +154,8 @@ class Scanner:
         self._is_scanning  = False
         self._cancelled    = False
         self._phase        = "idle"   # "phase1" | "phase2" | "idle"
+        self._scan_started_at = None
+        self._next_refresh_at = None
 
         self._top_codes: list  = []
         self._avg_volumes: dict = {}
@@ -229,10 +231,10 @@ class Scanner:
             return
         self._is_running = True
         self._cancelled = False
+        self._next_refresh_at = None
 
         self._log("[Phase1] 수동 시작 요청 -> 서버 1차 선별 재실행")
         self._run_phase1()
-        self._refresh_timer.start(self.AUTO_REFRESH_MS)
 
     def stop(self):
         """자동탐색 중지."""
@@ -240,6 +242,8 @@ class Scanner:
         self._is_scanning = False
         self._cancelled   = True
         self._phase       = "idle"
+        self._scan_started_at = None
+        self._next_refresh_at = None
         self._refresh_timer.stop()
         self._rt_eval_timer.stop()
         self.kiwoom.tr_queue.clear()    # 대기 중인 TR 모두 제거
@@ -252,8 +256,26 @@ class Scanner:
     def is_scanning(self) -> bool:
         return self._is_scanning
 
+    def get_scan_elapsed_seconds(self) -> int:
+        if not self._is_scanning or self._scan_started_at is None:
+            return 0
+        return max(0, int(time.time() - self._scan_started_at))
+
+    def get_next_refresh_remaining_seconds(self) -> int | None:
+        if self._next_refresh_at is None:
+            return None
+        return max(0, int(self._next_refresh_at - time.time()))
+
+    def _schedule_next_refresh(self):
+        self._refresh_timer.stop()
+        self._next_refresh_at = time.time() + (self.AUTO_REFRESH_MS / 1000)
+        self._refresh_timer.start(self.AUTO_REFRESH_MS)
+
     # ── Phase 1: 거래량 상위 수집 (opt10030) ─────────────────────────────────
     def _run_phase1(self):
+        if not self._is_scanning:
+            self._scan_started_at = time.time()
+        self._next_refresh_at = None
         self._phase        = "phase1"
         self._is_scanning  = True
         self._avg_volumes  = {}
@@ -332,6 +354,9 @@ class Scanner:
 
     # ── Phase 2: 상위 N종목 일봉 갱신 ────────────────────────────────────────
     def _run_phase2(self):
+        if not self._is_scanning:
+            self._scan_started_at = time.time()
+        self._next_refresh_at = None
         self._log(f"[Phase2] 상위 {len(self._top_codes)}종목 일봉 갱신")
         self._phase        = "phase2"
         self._is_scanning  = True
@@ -410,12 +435,14 @@ class Scanner:
 
         self._is_scanning = False
         self._phase       = "idle"
+        self._scan_started_at = None
 
         # 캔들 캐시 파일 저장 (상위 N만)
         _save_candle_cache_to_file(self._top_codes)
 
         # 조건 평가 → 결과 발행
         self._evaluate_and_emit()
+        self._schedule_next_refresh()
 
         if self._done_cb:
             self._done_cb()
@@ -453,12 +480,13 @@ class Scanner:
         if self._done_cb:
             self._done_cb()
 
-    # ── 15분 자동 갱신 ─────────────────────────────────────────────────────────
+    # ── 2시간 자동 갱신 ────────────────────────────────────────────────────────
     def _on_auto_refresh(self):
         if not self._is_running or self._is_scanning:
             return
-        self._log("[자동갱신] 15분 경과 → Phase2 갱신 시작")
+        self._log("[자동갱신] 2시간 경과 → Phase2 갱신 시작")
         self._cancelled = False
+        self._next_refresh_at = None
         self._run_phase2()
 
     # ── 실시간 등록/해제 ───────────────────────────────────────────────────────

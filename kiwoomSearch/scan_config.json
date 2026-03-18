@@ -6,7 +6,7 @@
   "scan": {
     "market": "both",
     "condition_mode": "AND",
-    "top_n": 500,
+    "top_n": 200,
     "rsi_enabled": false,
     "rsi_period": 14,
     "rsi_min": 0.0,

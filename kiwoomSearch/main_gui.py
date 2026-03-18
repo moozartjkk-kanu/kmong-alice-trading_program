@@ -635,8 +635,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat("스캔 중...")
         self.log("[탐색] 자동탐색 시작")
 
-        self._countdown = 15 * 60
         self._countdown_timer.start(1000)
+        self._tick_countdown()
 
     def _stop_scan(self):
         if self.scanner:
@@ -676,6 +676,7 @@ class MainWindow(QMainWindow):
             self._progress_dlg.mark_done()
         self.progress_bar.setFormat("완료")
         self.progress_lbl.setText("")
+        self._tick_countdown()
 
     def _on_scan_result(self, results: list):
         """Scanner.result_cb — 조건 만족 종목 목록 수신 → 테이블 갱신."""
@@ -686,8 +687,6 @@ class MainWindow(QMainWindow):
         self.last_scan_lbl.setText(f"마지막 갱신: {now}")
         self.result_count_lbl.setText(f"탐색 결과: {len(results)}종목")
         self.log(f"[결과] {len(results)}종목 탐색됨 ({now})")
-
-        self._countdown = 15 * 60
 
     def _refresh_table(self):
         """_result_cache → result_table 전체 재렌더"""
@@ -769,9 +768,22 @@ class MainWindow(QMainWindow):
     # 카운트다운
     # ──────────────────────────────────────────────────────────────────────
     def _tick_countdown(self):
-        if self._countdown > 0:
-            self._countdown -= 1
-        m, s = divmod(self._countdown, 60)
+        if not self.scanner or not self.scanner.is_running():
+            self.countdown_lbl.setText("")
+            return
+
+        if self.scanner.is_scanning():
+            elapsed = self.scanner.get_scan_elapsed_seconds()
+            m, s = divmod(elapsed, 60)
+            self.countdown_lbl.setText(f"탐색 경과: {m:02d}:{s:02d}  |  완료 후 02:00:00 뒤 갱신")
+            return
+
+        remaining = self.scanner.get_next_refresh_remaining_seconds()
+        if remaining is None:
+            self.countdown_lbl.setText("다음 갱신 예약 중...")
+            return
+
+        m, s = divmod(remaining, 60)
         self.countdown_lbl.setText(f"다음 갱신: {m:02d}:{s:02d}")
 
     # ──────────────────────────────────────────────────────────────────────
