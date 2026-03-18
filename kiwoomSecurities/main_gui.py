@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
     QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTabWidget,
-    QMessageBox, QHeaderView, QFrame, QGridLayout, QInputDialog, QDialog
+    QMessageBox, QHeaderView, QFrame, QGridLayout, QInputDialog, QDialog, QProgressBar
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
@@ -104,21 +104,42 @@ class DisclaimerDialog(QDialog):
 
 
 class WatchlistLoadingDialog(QDialog):
-    """감시 종목 데이터 불러오는 중 알림창 (사용자 조작 차단)"""
+    """감시 종목 데이터 불러오는 중 알림창 (진행률 표시)"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("불러오는 중")
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.CustomizeWindowHint)
         self.setModal(True)
-        self.setFixedSize(320, 80)
+        self.setFixedSize(340, 110)
         layout = QVBoxLayout()
-        label = QLabel("감시 종목 리스트 불러오는 중...", self)
-        label.setAlignment(Qt.AlignCenter)
+        layout.setSpacing(8)
+
+        self._label = QLabel("감시 종목 리스트 불러오는 중...", self)
+        self._label.setAlignment(Qt.AlignCenter)
         font = QFont()
-        font.setPointSize(12)
-        label.setFont(font)
-        layout.addWidget(label)
+        font.setPointSize(11)
+        self._label.setFont(font)
+        layout.addWidget(self._label)
+
+        self._progress_bar = QProgressBar(self)
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(False)
+        layout.addWidget(self._progress_bar)
+
+        self._percent_label = QLabel("0 / 0  (0%)", self)
+        self._percent_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self._percent_label)
+
         self.setLayout(layout)
+
+    def update_progress(self, done, total):
+        """진행률 업데이트"""
+        if total <= 0:
+            return
+        pct = int(done / total * 100)
+        self._progress_bar.setValue(pct)
+        self._percent_label.setText(f"{done} / {total}  ({pct}%)")
 
     def closeEvent(self, event):
         event.ignore()  # 사용자가 닫기 버튼으로 닫지 못하도록
@@ -1609,6 +1630,12 @@ class MainWindow(QMainWindow):
     def _continue_watchlist_refresh(self):
         """감시종목 갱신 계속 진행"""
         self._watchlist_refresh_done += 1
+
+        # 진행률 업데이트
+        if self._watchlist_loading_dialog and self._watchlist_refresh_total > 0:
+            self._watchlist_loading_dialog.update_progress(
+                self._watchlist_refresh_done, self._watchlist_refresh_total
+            )
 
         # 85% 이상 불러왔으면 알림창 닫기
         if self._watchlist_refresh_total > 0:

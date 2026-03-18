@@ -269,7 +269,7 @@ class TRQueue:
         self._process_timer = QTimer()
         self._process_timer.setSingleShot(True)
         self._process_timer.timeout.connect(self._process_next)
-        self._min_interval_ms = 250  # TR 호출 간 최소 간격
+        self._min_interval_ms = 1100  # TR 호출 간 최소 간격 (분당 60회 제한 대응: 1100ms → 약 54회/분)
 
     def enqueue(self, tr_func, callback=None, *args, **kwargs):
         """
