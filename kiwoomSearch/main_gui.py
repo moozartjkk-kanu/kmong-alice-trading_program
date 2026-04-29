@@ -565,6 +565,152 @@ class MainWindow(QMainWindow):
         v.addWidget(tv_grp)
         self._on_tv_increase_toggled(self.tv_increase_chk.isChecked())
 
+        # ── 추세 조건 (MA 기반) ────────────────────────────────────────────
+        trend_grp = QGroupBox("추세 조건 (MA 기반)")
+        trend_grp.setCheckable(True)
+        trend_grp.setChecked(bool(scan.get("trend_enabled", False)))
+        trendg = QVBoxLayout(trend_grp)
+
+        self.trend_close_above_ma20_chk = QCheckBox("현재가 > MA20 (MA 위에 위치)")
+        self.trend_close_above_ma20_chk.setChecked(bool(scan.get("trend_close_above_ma20", True)))
+        trendg.addWidget(self.trend_close_above_ma20_chk)
+
+        self.trend_ma20_rising_chk = QCheckBox("MA20 상승 중 (오늘 MA20 > 어제 MA20)")
+        self.trend_ma20_rising_chk.setChecked(bool(scan.get("trend_ma20_rising", True)))
+        trendg.addWidget(self.trend_ma20_rising_chk)
+
+        self.trend_ma20_above_ma60_chk = QCheckBox("MA20 > MA60 (정배열)")
+        self.trend_ma20_above_ma60_chk.setChecked(bool(scan.get("trend_ma20_above_ma60", True)))
+        trendg.addWidget(self.trend_ma20_above_ma60_chk)
+
+        trend_low_row = QHBoxLayout()
+        self.trend_low_above_ma20_chk = QCheckBox("저가 ≥ MA20 ×")
+        self.trend_low_above_ma20_chk.setChecked(bool(scan.get("trend_low_above_ma20", False)))
+        trend_low_row.addWidget(self.trend_low_above_ma20_chk)
+        self.trend_low_ratio_spin = QDoubleSpinBox()
+        self.trend_low_ratio_spin.setRange(0.7, 1.0)
+        self.trend_low_ratio_spin.setDecimals(2)
+        self.trend_low_ratio_spin.setSingleStep(0.01)
+        self.trend_low_ratio_spin.setValue(float(scan.get("trend_low_ratio", 0.97)))
+        trend_low_row.addWidget(self.trend_low_ratio_spin)
+        trend_low_row.addStretch()
+        trendg.addLayout(trend_low_row)
+
+        self.trend_grp = trend_grp
+        v.addWidget(trend_grp)
+
+        # ── 눌림 조건 ──────────────────────────────────────────────────────
+        pullback_grp = QGroupBox("눌림 조건")
+        pullback_grp.setCheckable(True)
+        pullback_grp.setChecked(bool(scan.get("pullback_enabled", False)))
+        pbg = QGridLayout(pullback_grp)
+
+        pbg.addWidget(QLabel("최근 기간 (일):"), 0, 0)
+        self.pullback_days_spin = QSpinBox()
+        self.pullback_days_spin.setRange(1, 30)
+        self.pullback_days_spin.setValue(int(scan.get("pullback_days", 5)))
+        pbg.addWidget(self.pullback_days_spin, 0, 1)
+
+        pbg.addWidget(QLabel("MA 기간:"), 1, 0)
+        self.pullback_ma_period_spin = QSpinBox()
+        self.pullback_ma_period_spin.setRange(1, 120)
+        self.pullback_ma_period_spin.setValue(int(scan.get("pullback_ma_period", 20)))
+        pbg.addWidget(self.pullback_ma_period_spin, 1, 1)
+
+        pbg.addWidget(QLabel("상한 배율 (≤ MA ×):"), 2, 0)
+        self.pullback_ratio_spin = QDoubleSpinBox()
+        self.pullback_ratio_spin.setRange(1.0, 1.2)
+        self.pullback_ratio_spin.setDecimals(2)
+        self.pullback_ratio_spin.setSingleStep(0.01)
+        self.pullback_ratio_spin.setValue(float(scan.get("pullback_ratio", 1.02)))
+        pbg.addWidget(self.pullback_ratio_spin, 2, 1)
+
+        pbg.addWidget(QLabel("하한 배율 (≥ MA ×):"), 3, 0)
+        self.pullback_lower_ratio_spin = QDoubleSpinBox()
+        self.pullback_lower_ratio_spin.setRange(0.7, 1.0)
+        self.pullback_lower_ratio_spin.setDecimals(2)
+        self.pullback_lower_ratio_spin.setSingleStep(0.01)
+        self.pullback_lower_ratio_spin.setValue(float(scan.get("pullback_lower_ratio", 0.97)))
+        pbg.addWidget(self.pullback_lower_ratio_spin, 3, 1)
+
+        self.pullback_volume_decrease_chk = QCheckBox("눌림 구간 거래량 감소 (최근 N일 평균 < 직전 N일 평균)")
+        self.pullback_volume_decrease_chk.setChecked(bool(scan.get("pullback_volume_decrease_enabled", False)))
+        pbg.addWidget(self.pullback_volume_decrease_chk, 4, 0, 1, 2)
+
+        pbg.addWidget(QLabel("예) 최근 5일 내 저가가\nMA20×0.97 ~ MA20×1.02 범위"),
+                      0, 2, 4, 1, Qt.AlignTop | Qt.AlignLeft)
+        self.pullback_grp = pullback_grp
+        v.addWidget(pullback_grp)
+
+        # ── 과도한 하락 방지 ───────────────────────────────────────────────
+        floor_grp = QGroupBox("과도한 하락 방지")
+        floor_grp.setCheckable(True)
+        floor_grp.setChecked(bool(scan.get("price_floor_enabled", False)))
+        flg = QGridLayout(floor_grp)
+
+        flg.addWidget(QLabel("기간 (일):"), 0, 0)
+        self.floor_days_spin = QSpinBox()
+        self.floor_days_spin.setRange(1, 250)
+        self.floor_days_spin.setValue(int(scan.get("price_floor_days", 20)))
+        flg.addWidget(self.floor_days_spin, 0, 1)
+
+        flg.addWidget(QLabel("비율 (이상):"), 1, 0)
+        self.floor_ratio_spin = QDoubleSpinBox()
+        self.floor_ratio_spin.setRange(0.5, 1.0)
+        self.floor_ratio_spin.setDecimals(2)
+        self.floor_ratio_spin.setSingleStep(0.01)
+        self.floor_ratio_spin.setValue(float(scan.get("price_floor_ratio", 0.92)))
+        flg.addWidget(self.floor_ratio_spin, 1, 1)
+
+        flg.addWidget(QLabel("예) 종가 ≥ 20일 최고가 × 0.92"),
+                      0, 2, 2, 1, Qt.AlignTop | Qt.AlignLeft)
+        self.floor_grp = floor_grp
+        v.addWidget(floor_grp)
+
+        # ── 힘 유지 조건 ───────────────────────────────────────────────────
+        strength_grp = QGroupBox("힘 유지 (최근 N일 내 종가가 이전 M일 최고가 돌파)")
+        strength_grp.setCheckable(True)
+        strength_grp.setChecked(bool(scan.get("strength_enabled", False)))
+        stg = QGridLayout(strength_grp)
+
+        stg.addWidget(QLabel("확인 기간 (일):"), 0, 0)
+        self.strength_days_spin = QSpinBox()
+        self.strength_days_spin.setRange(1, 60)
+        self.strength_days_spin.setValue(int(scan.get("strength_days", 10)))
+        stg.addWidget(self.strength_days_spin, 0, 1)
+
+        stg.addWidget(QLabel("기준 기간 (일):"), 1, 0)
+        self.strength_ref_days_spin = QSpinBox()
+        self.strength_ref_days_spin.setRange(1, 120)
+        self.strength_ref_days_spin.setValue(int(scan.get("strength_ref_days", 20)))
+        stg.addWidget(self.strength_ref_days_spin, 1, 1)
+
+        stg.addWidget(QLabel("예) 최근 10일 내 종가 >\n이전 20일 종가 최고가"),
+                      0, 2, 2, 1, Qt.AlignTop | Qt.AlignLeft)
+        self.strength_grp = strength_grp
+        v.addWidget(strength_grp)
+
+        # ── 반등 신호 조건 (OR 결합) ───────────────────────────────────────
+        rebound_grp = QGroupBox("반등 신호 (아래 중 하나 이상 만족)")
+        rebound_grp.setCheckable(True)
+        rebound_grp.setChecked(bool(scan.get("rebound_enabled", False)))
+        rbg = QVBoxLayout(rebound_grp)
+
+        self.rebound_bullish_chk = QCheckBox("오늘 양봉 (종가 > 시가)")
+        self.rebound_bullish_chk.setChecked(bool(scan.get("rebound_bullish_candle", True)))
+        rbg.addWidget(self.rebound_bullish_chk)
+
+        self.rebound_volume_chk = QCheckBox("거래량 증가 (당일 거래량 > 5일 평균)")
+        self.rebound_volume_chk.setChecked(bool(scan.get("rebound_volume_increase", True)))
+        rbg.addWidget(self.rebound_volume_chk)
+
+        self.rebound_prev_high_chk = QCheckBox("전일 고가 돌파 (현재가 > 전일 고가)")
+        self.rebound_prev_high_chk.setChecked(bool(scan.get("rebound_prev_high_breakout", True)))
+        rbg.addWidget(self.rebound_prev_high_chk)
+
+        self.rebound_grp = rebound_grp
+        v.addWidget(rebound_grp)
+
         # ── 저장 버튼 ──────────────────────────────────────────────────────
         save_row = QHBoxLayout()
         save_row.addStretch()
@@ -640,6 +786,33 @@ class MainWindow(QMainWindow):
             "trading_value_increase_enabled": self.tv_increase_chk.isChecked(),
             "trading_value_increase_pct":    self.tv_ratio_spin.value(),
             "trading_value_avg_days":        self.tv_avg_days_spin.value(),
+            # 추세 조건
+            "trend_enabled":                 self.trend_grp.isChecked(),
+            "trend_close_above_ma20":        self.trend_close_above_ma20_chk.isChecked(),
+            "trend_ma20_rising":             self.trend_ma20_rising_chk.isChecked(),
+            "trend_ma20_above_ma60":         self.trend_ma20_above_ma60_chk.isChecked(),
+            "trend_low_above_ma20":          self.trend_low_above_ma20_chk.isChecked(),
+            "trend_low_ratio":               self.trend_low_ratio_spin.value(),
+            # 눌림 조건
+            "pullback_enabled":              self.pullback_grp.isChecked(),
+            "pullback_days":                 self.pullback_days_spin.value(),
+            "pullback_ma_period":            self.pullback_ma_period_spin.value(),
+            "pullback_ratio":                self.pullback_ratio_spin.value(),
+            "pullback_lower_ratio":          self.pullback_lower_ratio_spin.value(),
+            "pullback_volume_decrease_enabled": self.pullback_volume_decrease_chk.isChecked(),
+            # 과도한 하락 방지
+            "price_floor_enabled":           self.floor_grp.isChecked(),
+            "price_floor_days":              self.floor_days_spin.value(),
+            "price_floor_ratio":             self.floor_ratio_spin.value(),
+            # 힘 유지
+            "strength_enabled":              self.strength_grp.isChecked(),
+            "strength_days":                 self.strength_days_spin.value(),
+            "strength_ref_days":             self.strength_ref_days_spin.value(),
+            # 반등 신호
+            "rebound_enabled":               self.rebound_grp.isChecked(),
+            "rebound_bullish_candle":        self.rebound_bullish_chk.isChecked(),
+            "rebound_volume_increase":       self.rebound_volume_chk.isChecked(),
+            "rebound_prev_high_breakout":    self.rebound_prev_high_chk.isChecked(),
         }
         if self.config.save_scan(scan):
             self.log("[설정] 저장 완료")
@@ -876,6 +1049,11 @@ class MainWindow(QMainWindow):
             if row.get("breakout"):         conds.append("돌파")
             if row.get("supply_ok"):        conds.append("수급")
             if row.get("trading_value_ok"): conds.append("거래대금")
+            if row.get("trend_ok"):         conds.append("추세")
+            if row.get("pullback_ok"):      conds.append("눌림")
+            if row.get("price_floor_ok"):   conds.append("하락방지")
+            if row.get("strength_ok"):      conds.append("힘유지")
+            if row.get("rebound_ok"):       conds.append("반등")
             self._set(r_idx, 8, " / ".join(conds) if conds else "-")
 
         self.result_table.setSortingEnabled(True)

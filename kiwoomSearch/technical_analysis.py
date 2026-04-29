@@ -208,6 +208,14 @@ class TechnicalAnalysis:
             "trading_value": None,
             "trading_value_ratio": None,
             "trading_value_ok": False,
+            "trend_ok": False,
+            "pullback_ok": False,
+            "price_floor_ok": False,
+            "strength_ok": False,
+            "rebound_ok": False,
+            "rebound_bullish": False,
+            "rebound_volume": False,
+            "rebound_prev_high": False,
             "match": False,
         }
 
@@ -215,7 +223,9 @@ class TechnicalAnalysis:
             return result
 
         close_prices = [c.get("close", 0) for c in candles]
+        open_prices  = [c.get("open",  0) for c in candles]
         high_prices  = [c.get("high",  0) for c in candles]
+        low_prices   = [c.get("low",   0) for c in candles]
         volumes      = [c.get("volume", 0) for c in candles]
 
         mode = conditions.get("condition_mode", "AND")
@@ -339,6 +349,120 @@ class TechnicalAnalysis:
             tv_ok = all(tv_parts) if tv_parts else False
             result["trading_value_ok"] = tv_ok
             checks.append(tv_ok)
+
+        # ── 추세 조건 (MA 기반) ────────────────────────────────────────
+        if conditions.get("trend_enabled"):
+            trend_parts = []
+
+            if conditions.get("trend_close_above_ma20", True):
+                ma20 = self.calculate_sma(close_prices, 20)
+                trend_parts.append(ma20 is not None and current_price > ma20)
+
+            if conditions.get("trend_ma20_rising", True):
+                ma20_today = self.calculate_sma(close_prices, 20)
+                ma20_yesterday = self.calculate_sma(close_prices[1:], 20)
+                trend_parts.append(
+                    ma20_today is not None and ma20_yesterday is not None
+                    and ma20_today > ma20_yesterday
+                )
+
+            if conditions.get("trend_ma20_above_ma60", True):
+                ma20 = self.calculate_sma(close_prices, 20)
+                ma60 = self.calculate_sma(close_prices, 60)
+                trend_parts.append(ma20 is not None and ma60 is not None and ma20 > ma60)
+
+            # 저가 >= MA20 × ratio (추세 유지: MA 아래로 너무 빠지지 않음)
+            if conditions.get("trend_low_above_ma20", False):
+                ma20 = self.calculate_sma(close_prices, 20)
+                low_ratio = float(conditions.get("trend_low_ratio", 0.97))
+                today_low = float(low_prices[0]) if low_prices else None
+                trend_parts.append(
+                    ma20 is not None and today_low is not None
+                    and today_low >= ma20 * low_ratio
+                )
+
+            trend_ok = all(trend_parts) if trend_parts else False
+            result["trend_ok"] = trend_ok
+            checks.append(trend_ok)
+
+        # ── 눌림 조건 ──────────────────────────────────────────────────
+        if conditions.get("pullback_enabled"):
+            days = int(conditions.get("pullback_days", 5))
+            ma_period = int(conditions.get("pullback_ma_period", 20))
+            upper_ratio = float(conditions.get("pullback_ratio", 1.02))
+            lower_ratio = float(conditions.get("pullback_lower_ratio", 0.97))
+            ma = self.calculate_sma(close_prices, ma_period)
+            pullback_ok = False
+            if ma is not None and len(low_prices) >= days:
+                upper = ma * upper_ratio
+                lower = ma * lower_ratio
+                # 최근 N일 내 하루라도 저가가 [lower, upper] 범위 안에 있으면 눌림 인정
+                pullback_ok = any(
+                    lower <= float(low_prices[i]) <= upper
+                    for i in range(days)
+                )
+            # 눌림 구간(최근 N일) 평균 거래량 < 직전 N일 평균 거래량
+            if pullback_ok and conditions.get("pullback_volume_decrease_enabled", False):
+                pullback_vols = [float(volumes[i]) for i in range(1, days + 1) if i < len(volumes)]
+                prev_vols = [float(volumes[i]) for i in range(days + 1, days * 2 + 1) if i < len(volumes)]
+                if pullback_vols and prev_vols:
+                    avg_pullback = sum(pullback_vols) / len(pullback_vols)
+                    avg_prev = sum(prev_vols) / len(prev_vols)
+                    if not (avg_prev > 0 and avg_pullback < avg_prev):
+                        pullback_ok = False
+            result["pullback_ok"] = pullback_ok
+            checks.append(pullback_ok)
+
+        # ── 과도한 하락 방지 ───────────────────────────────────────────
+        if conditions.get("price_floor_enabled"):
+            days = int(conditions.get("price_floor_days", 20))
+            ratio = float(conditions.get("price_floor_ratio", 0.92))
+            recent_highs = high_prices[:days]
+            price_floor_ok = False
+            if recent_highs:
+                highest = max(float(h) for h in recent_highs)
+                price_floor_ok = highest > 0 and current_price >= highest * ratio
+            result["price_floor_ok"] = price_floor_ok
+            checks.append(price_floor_ok)
+
+        # ── 힘 유지 (최근 N일 내 종가가 이전 M일 최고가 돌파한 적 있음) ────
+        if conditions.get("strength_enabled"):
+            s_days = int(conditions.get("strength_days", 10))
+            s_ref_days = int(conditions.get("strength_ref_days", 20))
+            # close_prices[0] = 오늘, [1..s_days-1] = 최근 N일, [s_days..s_days+s_ref_days-1] = 기준 기간
+            ref_closes = close_prices[s_days: s_days + s_ref_days]
+            strength_ok = False
+            if ref_closes and len(close_prices) >= s_days:
+                ref_high = max(float(c) for c in ref_closes)
+                strength_ok = any(float(close_prices[i]) > ref_high for i in range(s_days))
+            result["strength_ok"] = strength_ok
+            checks.append(strength_ok)
+
+        # ── 반등 신호 (OR 결합) ────────────────────────────────────────
+        if conditions.get("rebound_enabled"):
+            rebound_parts = []
+
+            if conditions.get("rebound_bullish_candle", True):
+                bullish = (len(close_prices) > 0 and len(open_prices) > 0
+                           and float(close_prices[0]) > float(open_prices[0]))
+                result["rebound_bullish"] = bullish
+                rebound_parts.append(bullish)
+
+            if conditions.get("rebound_volume_increase", True):
+                avg5 = self.calculate_avg_volume(volumes, 5)
+                vol_ok = avg5 is not None and today_volume > avg5
+                result["rebound_volume"] = vol_ok
+                rebound_parts.append(vol_ok)
+
+            if conditions.get("rebound_prev_high_breakout", True):
+                prev_high = float(high_prices[1]) if len(high_prices) > 1 else None
+                ph_ok = prev_high is not None and prev_high > 0 and current_price > prev_high
+                result["rebound_prev_high"] = ph_ok
+                rebound_parts.append(ph_ok)
+
+            rebound_ok = any(rebound_parts) if rebound_parts else False
+            result["rebound_ok"] = rebound_ok
+            checks.append(rebound_ok)
 
         # ── 조건 결합 ──────────────────────────────────────────────────
         if not checks:

@@ -170,6 +170,11 @@ def _make_row(code: str, name: str, price: int, ev: dict) -> dict:
         "trading_value":        ev.get("trading_value"),
         "trading_value_ratio":  ev.get("trading_value_ratio"),
         "trading_value_ok":     ev.get("trading_value_ok", False),
+        "trend_ok":             ev.get("trend_ok", False),
+        "pullback_ok":          ev.get("pullback_ok", False),
+        "price_floor_ok":       ev.get("price_floor_ok", False),
+        "strength_ok":          ev.get("strength_ok", False),
+        "rebound_ok":           ev.get("rebound_ok", False),
     }
 
 
@@ -621,6 +626,7 @@ class Scanner:
             "rsi": 0, "ma": 0, "volume": 0, "breakout": 0,
             "supply": 0, "supply_foreign": 0, "supply_institution": 0,
             "trading_value": 0,
+            "trend": 0, "pullback": 0, "price_floor": 0, "strength": 0, "rebound": 0,
         }
 
         for code in self._top_codes:
@@ -645,6 +651,11 @@ class Scanner:
                 if ev.get("supply_foreign_ok"):                                             stat["supply_foreign"]     += 1
                 if ev.get("supply_institution_ok"):                                         stat["supply_institution"] += 1
             if conditions.get("trading_value_enabled") and ev.get("trading_value_ok"):     stat["trading_value"]      += 1
+            if conditions.get("trend_enabled")       and ev.get("trend_ok"):              stat["trend"]              += 1
+            if conditions.get("pullback_enabled")    and ev.get("pullback_ok"):           stat["pullback"]           += 1
+            if conditions.get("price_floor_enabled") and ev.get("price_floor_ok"):        stat["price_floor"]        += 1
+            if conditions.get("strength_enabled")    and ev.get("strength_ok"):           stat["strength"]           += 1
+            if conditions.get("rebound_enabled")     and ev.get("rebound_ok"):            stat["rebound"]            += 1
 
             if ev["match"]:
                 results.append(_make_row(code, name, price, ev))
@@ -669,6 +680,11 @@ class Scanner:
             sub_str = f"({', '.join(sub)})" if sub else ""
             stat_parts.append(f"수급:{stat['supply']}/{total} {sub_str}")
         if conditions.get("trading_value_enabled"): stat_parts.append(f"거래대금:{stat['trading_value']}/{total}")
+        if conditions.get("trend_enabled"):        stat_parts.append(f"추세:{stat['trend']}/{total}")
+        if conditions.get("pullback_enabled"):     stat_parts.append(f"눌림:{stat['pullback']}/{total}")
+        if conditions.get("price_floor_enabled"):  stat_parts.append(f"하락방지:{stat['price_floor']}/{total}")
+        if conditions.get("strength_enabled"):     stat_parts.append(f"힘유지:{stat['strength']}/{total}")
+        if conditions.get("rebound_enabled"):      stat_parts.append(f"반등:{stat['rebound']}/{total}")
         if stat_parts:
             self._log(f"[평가] 조건별 통과: {', '.join(stat_parts)}")
         self._log(f"[평가] 조건 만족 {len(results)}개 / {total}개")
