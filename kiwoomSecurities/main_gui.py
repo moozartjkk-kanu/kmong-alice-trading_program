@@ -280,7 +280,7 @@ class MainWindow(QMainWindow):
         except Exception:
             percent = 19
 
-        headers = ["종목코드", "종목명", "현재가", "메인 기준", f"main condition"]
+        headers = ["종목코드", "종목명", "현재가", "메인 기준", "main condition", "전략"]
         if hasattr(self, "watchlist_table") and self.watchlist_table is not None:
             self.watchlist_table.setHorizontalHeaderLabels(headers)
 
@@ -302,12 +302,15 @@ class MainWindow(QMainWindow):
         for row, stock in enumerate(watchlist):
             code = stock["code"]
             name = stock.get("name", "")
+            strategy = stock.get("strategy", "envelope")
+            strategy_label = "눌림목" if strategy == "pullback" else "엔벨로프"
             self._watchlist_code_to_row[code] = row
             self.watchlist_table.setItem(row, 0, QTableWidgetItem(code))
             self.watchlist_table.setItem(row, 1, QTableWidgetItem(name))
             self.watchlist_table.setItem(row, 2, QTableWidgetItem("-"))
             self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
             self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
+            self.watchlist_table.setItem(row, 5, QTableWidgetItem(strategy_label))
 
         if watchlist:
             self.log(f"[시스템] 저장된 감시 종목 {len(watchlist)}개 로드 완료")
@@ -528,9 +531,9 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left_group)
 
         self.watchlist_table = QTableWidget()
-        self.watchlist_table.setColumnCount(5)
+        self.watchlist_table.setColumnCount(6)
         self.watchlist_table.setHorizontalHeaderLabels([
-            "종목코드", "종목명", "현재가", "메인 기준", "main condition"
+            "종목코드", "종목명", "현재가", "메인 기준", "main condition", "전략"
         ])
         self.watchlist_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.watchlist_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -540,6 +543,12 @@ class MainWindow(QMainWindow):
         self.add_code_input = QLineEdit()
         self.add_code_input.setPlaceholderText("종목코드 또는 종목명 입력 (예: 005930, 삼성전자)")
         add_layout.addWidget(self.add_code_input)
+
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.addItem("엔벨로프", "envelope")
+        self.strategy_combo.addItem("눌림목", "pullback")
+        self.strategy_combo.setFixedWidth(90)
+        add_layout.addWidget(self.strategy_combo)
 
         add_btn = QPushButton("종목 추가")
         add_btn.clicked.connect(self.add_to_watchlist)
@@ -1402,6 +1411,8 @@ class MainWindow(QMainWindow):
             for row, stock in enumerate(watchlist):
                 code = stock["code"]
                 name = stock.get("name", "")
+                strategy = stock.get("strategy", "envelope")
+                strategy_label = "눌림목" if strategy == "pullback" else "엔벨로프"
                 self._watchlist_code_to_row[code] = row
 
                 # 코드/이름은 항상 설정 (변경될 수 있음)
@@ -1415,6 +1426,7 @@ class MainWindow(QMainWindow):
                     self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
                 if not self.watchlist_table.item(row, 4):
                     self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
+                self.watchlist_table.setItem(row, 5, QTableWidgetItem(strategy_label))
 
             # 캐시된 데이터로 먼저 표시 (이벤트 엔진의 배치 스케줄러 캐시 사용)
             if self.trader and self.trader.event_engine:
@@ -1782,9 +1794,11 @@ class MainWindow(QMainWindow):
 
     def _add_stock_to_watchlist(self, code, name):
         """감시종목에 종목 추가"""
-        success, message = self.config.add_to_watchlist(code, name)
+        strategy_type = self.strategy_combo.currentData() if hasattr(self, "strategy_combo") else "envelope"
+        strategy_label = "눌림목" if strategy_type == "pullback" else "엔벨로프"
+        success, message = self.config.add_to_watchlist(code, name, strategy_type=strategy_type)
         if success:
-            self.log(f"[시스템] 감시 종목 추가: {code} {name}")
+            self.log(f"[시스템] 감시 종목 추가: {code} {name} [{strategy_label}]")
             self.add_code_input.clear()
             # 부분 갱신: 추가된 종목만 TR 큐에 넣고 전체 갱신은 타이머 유지
             row = self.watchlist_table.rowCount()
@@ -1795,6 +1809,7 @@ class MainWindow(QMainWindow):
             self.watchlist_table.setItem(row, 2, QTableWidgetItem("-"))
             self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
             self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
+            self.watchlist_table.setItem(row, 5, QTableWidgetItem(strategy_label))
             self.watchlist_table.viewport().update()
 
             self._refresh_watchlist_for_codes([code])
@@ -2167,7 +2182,7 @@ def main():
 
     # 사용 기간 체크
     today = datetime.date.today()
-    expiry_date = datetime.date(2026, 4, 8)
+    expiry_date = datetime.date(2027, 4, 8)
 
     if today > expiry_date:
         QMessageBox.critical(None, "사용 기간 만료",
@@ -2175,11 +2190,11 @@ def main():
             f"kanu: moozartjkk@gmail.com")
         sys.exit(0)
 
-    if today.year == 2026 and today.month == 3:
+    if today.year == 2027 and today.month == 3:
         remaining = (expiry_date - today).days
         QMessageBox.warning(None, "사용 기간 안내",
             f"프로그램 사용 기간이 {remaining}일 남았습니다.\n"
-            f"만료일: 2026년 4월 8일\n\n"
+            f"만료일: 2027년 4월 8일\n\n"
             f"계속 사용하시려면 관리자에게 문의해 주세요.\n"
             f"kanu: moozartjkk@gmail.com")
 

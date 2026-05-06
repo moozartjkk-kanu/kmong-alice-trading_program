@@ -238,7 +238,7 @@ class Config:
     def get_watchlist(self):
         return self.get("watchlist") or []
 
-    def add_to_watchlist(self, stock_code, stock_name=""):
+    def add_to_watchlist(self, stock_code, stock_name="", strategy_type="envelope"):
         watchlist = self.get_watchlist()
         max_count = min(self.get("max_watchlist_count") or 200, 200)
 
@@ -251,9 +251,16 @@ class Config:
             if item["code"] == stock_code:
                 return False, "이미 등록된 종목입니다."
 
-        watchlist.append({"code": stock_code, "name": stock_name})
+        watchlist.append({"code": stock_code, "name": stock_name, "strategy": strategy_type})
         result = self.set(watchlist, "watchlist")
         return result, "등록 완료" if result else "저장 실패"
+
+    def get_stock_strategy(self, stock_code):
+        """감시종목의 전략 유형 반환. 기본값 'envelope'."""
+        for item in self.get_watchlist():
+            if item.get("code") == stock_code:
+                return item.get("strategy", "envelope")
+        return "envelope"
 
     def remove_from_watchlist(self, stock_code):
         watchlist = self.get_watchlist()

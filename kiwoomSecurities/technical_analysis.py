@@ -72,6 +72,58 @@ class TechnicalAnalysis:
         upper, lower = TechnicalAnalysis.calculate_main_condition(ma, percent)
         return {"ma": ma, "upper": upper, "lower": lower}
 
+    @staticmethod
+    def calculate_rsi(candles, period=14):
+        """RSI(period) 계산 (candles 최신순). 값 없으면 None 반환."""
+        if not candles or len(candles) < period + 1:
+            return None
+        try:
+            closes = [float(c.get("close") or 0) for c in candles[:period + 1]]
+            closes.reverse()
+            gains, losses = [], []
+            for i in range(1, len(closes)):
+                d = closes[i] - closes[i - 1]
+                gains.append(max(d, 0.0))
+                losses.append(max(-d, 0.0))
+            avg_gain = sum(gains) / period
+            avg_loss = sum(losses) / period
+            if avg_loss == 0:
+                return 100.0
+            rs = avg_gain / avg_loss
+            return round(100 - (100 / (1 + rs)), 2)
+        except Exception:
+            return None
+
+    @staticmethod
+    def find_reference_candle(candles, lookback=5, min_rise_pct=3.0, vol_ratio=2.0):
+        """
+        기준봉 탐색 (candles 최신순, candles[0]=가장 최근).
+        조건: 양봉, 상승률 >= min_rise_pct%, 거래량 >= 20일 평균의 vol_ratio배.
+        Returns: (index, candle_dict) or None
+        """
+        if not candles or len(candles) < 21:
+            return None
+        try:
+            avg_vol = sum(float(c.get("volume") or 0) for c in candles[:20]) / 20
+        except Exception:
+            return None
+        for i in range(min(lookback, len(candles) - 1)):
+            c = candles[i]
+            try:
+                o = float(c.get("open") or 0)
+                cl = float(c.get("close") or 0)
+                vol = float(c.get("volume") or 0)
+            except Exception:
+                continue
+            if o <= 0 or cl <= o:
+                continue
+            if (cl - o) / o * 100 < min_rise_pct:
+                continue
+            if avg_vol > 0 and vol < avg_vol * vol_ratio:
+                continue
+            return (i, c)
+        return None
+
 
 class TradingSignal:
     """매매 신호 분석 클래스"""
@@ -403,6 +455,152 @@ class TradingSignal:
         except Exception:
             quantity = 0
         return max(quantity, 1)
+
+    # ==================== 눌림목 전략 ====================
+    def check_pullback_buy_signal(self, code, current_price, candles, position=None):
+        """
+        단기 추세 눌림목 매수 신호 확인.
+        조건:
+          [추세] MA20 > MA60, 둘 다 전일 대비 상승, 현재가 > MA20
+          [기준봉] 최근 5일 이내 양봉+상승률≥3%+거래량≥20일평균2배
+          [눌림] 기준봉 이후 1~5봉, 현재가 ≤ 기준봉고가×0.97, 현재가 ≥ 기준봉시가
+          [지지] MA20±2% 또는 최근 10일 고점±2% 이내
+          [진입] 현재가 > 전일 종가 (양봉 흐름)
+          [RSI14] > 40
+        """
+        if position and position.get("quantity", 0) > 0:
+            return {"signal": False, "reason": "이미 보유 중"}
+
+        if not candles or len(candles) < 61:
+            return {"signal": False, "reason": "데이터 부족 (최소 61봉 필요)"}
+
+        # ---- 1. 추세 조건 ----
+        ma20 = self.ta.get_ma_from_candles(candles, 20)
+        ma60 = self.ta.get_ma_from_candles(candles, 60)
+        if ma20 is None or ma60 is None:
+            return {"signal": False, "reason": "MA 계산 불가"}
+
+        if ma20 <= ma60:
+            return {"signal": False, "reason": f"추세 미충족: MA20({ma20:.0f}) <= MA60({ma60:.0f})"}
+
+        if current_price <= ma20:
+            return {"signal": False, "reason": f"추세 미충족: 현재가({current_price:,}) <= MA20({ma20:.0f})"}
+
+        # MA20·MA60 전일 대비 상승
+        ma20_prev = self.ta.get_ma_from_candles(candles[1:], 20)
+        ma60_prev = self.ta.get_ma_from_candles(candles[1:], 60)
+        if ma20_prev is None or ma60_prev is None:
+            return {"signal": False, "reason": "이전 MA 계산 불가"}
+        if ma20 <= ma20_prev:
+            return {"signal": False, "reason": f"MA20 하락 중 ({ma20:.0f} <= {ma20_prev:.0f})"}
+        if ma60 <= ma60_prev:
+            return {"signal": False, "reason": f"MA60 하락 중 ({ma60:.0f} <= {ma60_prev:.0f})"}
+
+        # ---- 2. 기준봉 탐색 (최근 5일 이내) ----
+        ref = self.ta.find_reference_candle(candles, lookback=5)
+        if ref is None:
+            return {"signal": False, "reason": "기준봉 없음 (최근 5일 이내 조건 미충족)"}
+
+        ref_idx, ref_candle = ref
+        ref_high = float(ref_candle.get("high") or 0)
+        ref_open = float(ref_candle.get("open") or 0)
+
+        # ---- 3. 눌림 조건 (기준봉 이후 1~5봉) ----
+        bars_since_ref = ref_idx + 1  # candles[0]이 가장 최근이므로
+        if bars_since_ref < 1 or bars_since_ref > 5:
+            return {"signal": False, "reason": f"눌림 타이밍 벗어남 (기준봉 이후 {bars_since_ref}봉)"}
+
+        pullback_upper = ref_high * 0.97
+        if current_price > pullback_upper:
+            return {
+                "signal": False,
+                "reason": f"눌림 미진행: 현재가({current_price:,}) > 기준봉고가×0.97({pullback_upper:.0f})"
+            }
+        if ref_open > 0 and current_price < ref_open:
+            return {
+                "signal": False,
+                "reason": f"과도한 눌림: 현재가({current_price:,}) < 기준봉시가({ref_open:.0f})"
+            }
+
+        # ---- 4. 지지 조건 ----
+        near_ma20 = (ma20 * 0.98) <= current_price <= (ma20 * 1.02)
+        try:
+            highs_10 = [float(c.get("high") or 0) for c in candles[1:11]]
+            recent_10d_high = max(highs_10) if highs_10 else 0
+        except Exception:
+            recent_10d_high = 0
+        near_10d_high = (recent_10d_high > 0 and
+                         abs(current_price - recent_10d_high) / recent_10d_high <= 0.02)
+
+        if not near_ma20 and not near_10d_high:
+            return {
+                "signal": False,
+                "reason": (
+                    f"지지 미확인: MA20±2%({ma20*0.98:.0f}~{ma20*1.02:.0f})"
+                    f" 또는 10일고점±2%({recent_10d_high:.0f}) 미해당"
+                )
+            }
+
+        # ---- 5. 진입 조건 ----
+        # 5-a. 현재가 > 전일 종가 (양봉 흐름)
+        try:
+            prev_close = float(candles[1].get("close") or 0) if len(candles) > 1 else 0
+        except Exception:
+            prev_close = 0
+        if prev_close > 0 and current_price <= prev_close:
+            return {
+                "signal": False,
+                "reason": f"진입 조건 미충족: 현재가({current_price:,}) <= 전일종가({prev_close:.0f})"
+            }
+
+        # 5-b. 거래량 증가: 오늘(candles[0]) > 전일(candles[1])
+        # candles[0]은 장 중 TR 조회 시 당일 누적 거래량, [1]은 전일 완성 거래량
+        try:
+            today_vol = float(candles[0].get("volume") or 0)
+            prev_vol = float(candles[1].get("volume") or 0) if len(candles) > 1 else 0
+        except Exception:
+            today_vol, prev_vol = 0.0, 0.0
+
+        if prev_vol > 0 and today_vol <= prev_vol:
+            return {
+                "signal": False,
+                "reason": (
+                    f"거래량 감소: 오늘({int(today_vol):,}) <= 전일({int(prev_vol):,})"
+                    f" (오늘/전일 비율: {today_vol/prev_vol*100:.0f}%)"
+                )
+            }
+
+        # ---- 6. RSI(14) > 40 ----
+        rsi = self.ta.calculate_rsi(candles, period=14)
+        if rsi is not None and rsi <= 40:
+            return {"signal": False, "reason": f"RSI({rsi:.1f}) <= 40"}
+
+        # ---- 기준봉 거래량 정보 (로그용) ----
+        try:
+            ref_vol = float(ref_candle.get("volume") or 0)
+            avg_vol_20 = sum(float(c.get("volume") or 0) for c in candles[:20]) / 20
+            ref_vol_ratio = ref_vol / avg_vol_20 if avg_vol_20 > 0 else 0
+        except Exception:
+            ref_vol, avg_vol_20, ref_vol_ratio = 0.0, 0.0, 0.0
+
+        # ---- 매수 신호 ----
+        limit_price = self._ceil_to_tick(current_price) or current_price
+        rsi_str = f"{rsi:.1f}" if rsi is not None else "-"
+        vol_ratio_str = f"{today_vol/prev_vol*100:.0f}%" if prev_vol > 0 else "-"
+        return {
+            "signal": True,
+            "strategy": "pullback",
+            "buy_count": 1,
+            "reason": (
+                f"[{code}] 눌림목 매수: MA20({ma20:.0f})/MA60({ma60:.0f}) 상승추세, "
+                f"기준봉 {bars_since_ref}봉전(거래량 {ref_vol_ratio:.1f}배) 이후 눌림, "
+                f"{'MA20' if near_ma20 else '10일고점'} 지지, "
+                f"오늘거래량 전일대비 {vol_ratio_str}, RSI({rsi_str})"
+            ),
+            "target_price": limit_price,
+            "ma20": int(ma20),
+            "order_type": self.ORDER_TYPE_LIMIT,
+        }
 
     def get_position_summary(self, position, current_price, candles):
         if not position or position.get("quantity", 0) == 0:

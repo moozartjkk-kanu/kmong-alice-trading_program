@@ -415,16 +415,62 @@ class AutoTrader:
                 except queue.Full:
                     break
 
+    def _get_stock_strategy(self, code, position):
+        """종목의 전략 유형 반환. position에 저장된 값 우선, 없으면 watchlist 조회."""
+        if position and position.get("strategy"):
+            return position["strategy"]
+        return self.config.get_stock_strategy(code)
+
     def _evaluate_intents(self, code, current_price, candles):
         """주문을 직접 실행하지 않고, 실행해야 할 주문 의도(intent) 목록을 반환"""
         intents = []
         try:
             position = self.config.get_position(code)
+            strategy = self._get_stock_strategy(code, position)
 
             # ensure 인텐트 스로틀 체크 (동일 종목에 대해 _ensure_throttle_sec 내 중복 방지)
             now = time.time()
             last_ensure = self._last_ensure_ts.get(code, 0.0)
             ensure_allowed = (now - last_ensure) >= self._ensure_throttle_sec
+
+            # ===================== 눌림목 전략 =====================
+            if strategy == "pullback":
+                if position and position.get("quantity", 0) > 0:
+                    # 스탑로스 즉시 발동 확인
+                    if self._should_trigger_pullback_stoploss(current_price, position, candles):
+                        intents.append({"type": "pullback_stoploss", "code": code,
+                                        "price": current_price, "position": position})
+                        return intents
+                    # 매도 주문 유지
+                    if ensure_allowed:
+                        intents.append({"type": "ensure_pullback_sell", "code": code,
+                                        "position": position, "candles": candles})
+                else:
+                    # 신규 매수 신호
+                    if not (position and position.get("stoploss_triggered", False)):
+                        buy_signal = self.signal.check_pullback_buy_signal(
+                            code, current_price, candles, position)
+                        if buy_signal.get("signal"):
+                            if not self._can_buy_new_stock():
+                                return intents
+                            t_price = buy_signal.get("target_price") or current_price
+                            if t_price > 0:
+                                buy_amount = self.config.get("buy", "buy_amount_per_stock")
+                                required = (buy_amount // t_price) * t_price
+                                if self._available_funds is not None and self._available_funds < required:
+                                    self.log(
+                                        f"[{code}] 예수금 부족 - 눌림목매수 스킵"
+                                        f" (예수금: {self._available_funds:,}, 필요: {required:,})", "WARNING")
+                                    return intents
+                            intents.append({"type": "pullback_buy", "code": code,
+                                            "price": current_price, "buy_signal": buy_signal,
+                                            "candles": candles})
+
+                if ensure_allowed:
+                    self._last_ensure_ts[code] = now
+                return intents
+
+            # ===================== 엔벨로프 전략 (기존) =====================
 
             # 0) 스탑로스 주문 유지(필요 시) — 스로틀 적용
             if ensure_allowed:
@@ -505,8 +551,8 @@ class AutoTrader:
                 else:
                     key = (code, intent_type)
 
-                # 중복 방지(특히 buy/stoploss/additional_buy)
-                if intent_type in ("buy", "stoploss", "additional_buy"):
+                # 중복 방지(특히 buy/stoploss/additional_buy/pullback)
+                if intent_type in ("buy", "stoploss", "additional_buy", "pullback_buy", "pullback_stoploss"):
                     if key in self._pending_order_codes:
                         continue
                     self._pending_order_codes.add(key)
@@ -519,7 +565,8 @@ class AutoTrader:
                         current_queue.put_nowait(intent)
                     except Exception:
                         pass
-                    if key in self._pending_order_codes and intent_type in ("buy", "stoploss", "additional_buy"):
+                    if key in self._pending_order_codes and intent_type in (
+                            "buy", "stoploss", "additional_buy", "pullback_buy", "pullback_stoploss"):
                         self._pending_order_codes.discard(key)
                     return
 
@@ -537,10 +584,20 @@ class AutoTrader:
                             code, intent.get("buy_count"),
                             intent.get("target_price"), intent.get("position")
                         )
+                    # ---- 눌림목 전략 ----
+                    elif intent_type == "pullback_buy":
+                        self._execute_pullback_buy(
+                            code, intent.get("price"), intent.get("buy_signal"))
+                    elif intent_type == "pullback_stoploss":
+                        self._execute_pullback_stoploss(
+                            code, intent.get("price"), intent.get("position"), intent.get("candles"))
+                    elif intent_type == "ensure_pullback_sell":
+                        self._ensure_pullback_sell_orders_placed(
+                            code, intent.get("position"))
 
                     self._last_order_ts = time.time()
-                    # ✅ 성공 시 즉시 해제 → 다음 틱에서 동일 종목 재주문 가능
-                    if intent_type == "stoploss":
+                    # 성공 시 즉시 해제 → 다음 틱에서 동일 종목 재주문 가능
+                    if intent_type in ("stoploss", "pullback_stoploss"):
                         self._pending_order_codes.discard(key)
                 except Exception as e:
                     self.log(f"[{code}] 주문 처리 오류({intent_type}): {e}", "ERROR")
@@ -548,7 +605,8 @@ class AutoTrader:
                         current_queue.put_nowait(intent)
                     except Exception:
                         pass
-                    if key in self._pending_order_codes and intent_type in ("buy", "stoploss", "additional_buy"):
+                    if key in self._pending_order_codes and intent_type in (
+                            "buy", "stoploss", "additional_buy", "pullback_buy", "pullback_stoploss"):
                         self._pending_order_codes.discard(key)
 
                 processed += 1
@@ -564,6 +622,40 @@ class AutoTrader:
         """
         try:
             position = self.config.get_position(code)
+            strategy = self._get_stock_strategy(code, position)
+
+            # ===================== 눌림목 전략 =====================
+            if strategy == "pullback":
+                if position and position.get("quantity", 0) > 0:
+                    if self._should_trigger_pullback_stoploss(current_price, position, candles):
+                        try:
+                            self.urgent_order_queue.put_nowait({
+                                "type": "pullback_stoploss", "code": code,
+                                "price": current_price, "position": position, "candles": candles})
+                        except queue.Full:
+                            pass
+                        return
+                    try:
+                        self.order_queue.put_nowait({
+                            "type": "ensure_pullback_sell", "code": code,
+                            "position": position})
+                    except queue.Full:
+                        pass
+                else:
+                    if not (position and position.get("stoploss_triggered", False)):
+                        buy_signal = self.signal.check_pullback_buy_signal(
+                            code, current_price, candles, position)
+                        if buy_signal.get("signal") and self._can_buy_new_stock():
+                            try:
+                                self.urgent_order_queue.put_nowait({
+                                    "type": "pullback_buy", "code": code,
+                                    "price": current_price, "buy_signal": buy_signal,
+                                    "candles": candles})
+                            except queue.Full:
+                                pass
+                return
+
+            # ===================== 엔벨로프 전략 (기존) =====================
 
             # 0) 스탑로스 유지 강제
             try:
@@ -1073,6 +1165,263 @@ class AutoTrader:
                     })
 
         return orders
+
+    # ==================== 눌림목 전략 ====================
+
+    def _should_trigger_pullback_stoploss(self, current_price, position, candles):
+        """
+        눌림목 손절 발동 조건:
+        - 현재가 <= 평단가 × 0.97 (-3%)
+        - 또는 현재가 < MA20
+        """
+        if not position or position.get("stoploss_triggered", False):
+            return False
+        avg_price = float(position.get("avg_price", 0) or 0)
+        if avg_price <= 0:
+            return False
+        if current_price <= avg_price * 0.97:
+            return True
+        ma20 = self.ta.get_ma_from_candles(candles, 20) if candles else None
+        if ma20 is not None and current_price < ma20:
+            return True
+        return False
+
+    def _execute_pullback_stoploss(self, code, current_price, position, candles):
+        """눌림목 손절 실행 — 잔여 전량 즉시 지정가 매도"""
+        try:
+            position = self.config.get_position(code) or position
+            if position.get("stoploss_triggered", False):
+                return
+            total_qty = int(position.get("quantity", 0) or 0)
+            if total_qty <= 0:
+                return
+            avg_price = float(position.get("avg_price", 0) or 0)
+            if avg_price <= 0:
+                return
+
+            ma20 = self.ta.get_ma_from_candles(candles, 20) if candles else None
+            if current_price <= avg_price * 0.97:
+                reason = f"-3% 손절 (평단가 {avg_price:,.0f})"
+            else:
+                reason = f"MA20({ma20:.0f}) 이탈 손절" if ma20 else "MA20 이탈 손절"
+
+            stop_price = self._floor_to_tick(current_price) or int(current_price)
+            stock_name = position.get("name", code)
+            is_nxt = self.is_nxt_trading_hours()
+            market_type = "NXT" if is_nxt else "KRX"
+            self.log(f"[{code} {stock_name}] 눌림목 손절 ({market_type}): {reason} → {stop_price:,}원 지정가 매도", "WARNING")
+
+            try:
+                self.kiwoom.cancel_all_orders_for_stock(self.account, code)
+            except Exception as ce:
+                self.log(f"[{code}] 눌림목 손절 전 주문취소 오류: {ce}", "ERROR")
+
+            self._cancel_pending_buy_orders(code)
+            self.config.clear_pending_orders_for_stock(code, order_type="sell")
+            if code in self.placed_sell_orders:
+                del self.placed_sell_orders[code]
+
+            position["stoploss_triggered"] = True
+            position["stoploss_price"] = stop_price
+            sold_targets = position.get("sold_targets", [])
+            if "눌림손절" not in sold_targets:
+                sold_targets.append("눌림손절")
+            position["sold_targets"] = sold_targets
+            position["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.config.update_position(code, position)
+
+            self.config.save_pending_order(code, {
+                "order_type": "sell", "quantity": total_qty, "price": stop_price,
+                "target_name": "눌림손절", "sell_ratio": 100,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "is_nxt": is_nxt, "persist": True
+            })
+
+            info = {"code": code, "quantity": total_qty, "price": stop_price,
+                    "market_type": market_type, "is_nxt": is_nxt}
+            if is_nxt:
+                self.kiwoom.sell_stock_nxt_queued(
+                    self.account, code, total_qty, stop_price,
+                    callback=lambda result, _, i=info: self._on_stoploss_order_result(result, i),
+                    priority=True)
+            else:
+                self.kiwoom.sell_stock_queued(
+                    self.account, code, total_qty, stop_price,
+                    callback=lambda result, _, i=info: self._on_stoploss_order_result(result, i),
+                    priority=True)
+        except Exception as e:
+            self.log(f"[{code}] 눌림목 손절 실행 오류: {e}", "ERROR")
+
+    def _execute_pullback_buy(self, code, current_price, signal):
+        """눌림목 매수 실행 — 현재가 지정가 1회 진입"""
+        try:
+            position = self.config.get_position(code)
+            if position and position.get("stoploss_triggered", False):
+                self.log(f"[{code}] 손절 이력 - 눌림목 재매수 차단", "WARNING")
+                return
+            if position and position.get("quantity", 0) > 0:
+                return  # 이미 보유 중
+
+            buy_price = signal.get("target_price") or current_price
+            if buy_price <= 0:
+                buy_price = current_price
+
+            buy_amount = self.config.get("buy", "buy_amount_per_stock")
+            quantity = buy_amount // buy_price
+            if quantity <= 0:
+                self.log(f"[{code}] 눌림목 매수 수량 0 (금액: {buy_amount:,}, 가격: {buy_price:,})", "WARNING")
+                return
+
+            stock_name = self.kiwoom.get_stock_name_from_cache(code)
+            is_nxt = self.is_nxt_trading_hours()
+            market_type = "NXT" if is_nxt else "KRX"
+
+            if is_nxt and self._is_nxt_order_blocked(code):
+                self.log(f"[{code}] NXT 차단 - 눌림목 매수 스킵", "WARNING")
+                return
+
+            self.log(f"[{code} {stock_name}] 눌림목 매수 ({market_type}): {signal.get('reason', '')}")
+
+            ma20 = signal.get("ma20", 0)
+            info = {"code": code, "stock_name": stock_name, "buy_count": 1,
+                    "quantity": quantity, "price": buy_price, "ma20": ma20,
+                    "is_nxt": is_nxt, "market_type": market_type, "strategy": "pullback"}
+
+            if is_nxt:
+                self.kiwoom.buy_stock_nxt_queued(
+                    self.account, code, quantity, buy_price,
+                    callback=lambda result, _, i=info: self._on_pullback_buy_result(result, i),
+                    priority=True)
+            else:
+                self.kiwoom.buy_stock_queued(
+                    self.account, code, quantity, buy_price,
+                    callback=lambda result, _, i=info: self._on_pullback_buy_result(result, i),
+                    priority=True)
+        except Exception as e:
+            self.log(f"[{code}] 눌림목 매수 실행 오류: {e}", "ERROR")
+
+    def _on_pullback_buy_result(self, result, info):
+        """눌림목 매수 주문 결과 처리"""
+        try:
+            code = info["code"]
+            stock_name = info["stock_name"]
+            quantity = info["quantity"]
+            buy_price = info["price"]
+            ma20 = info["ma20"]
+            is_nxt = info["is_nxt"]
+            market_type = info["market_type"]
+
+            if result == 0:
+                self.log(f"[{code}] 눌림목 매수 주문 성공 ({market_type}): {quantity}주 @ {buy_price:,}원", "SUCCESS")
+                if code not in self.pending_buy_orders:
+                    self.pending_buy_orders[code] = []
+                self.pending_buy_orders[code].append({
+                    "buy_count": 1, "quantity": quantity, "price": buy_price,
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                self.config.save_pending_order(code, {
+                    "order_type": "buy", "quantity": quantity, "price": buy_price,
+                    "buy_count": 1, "ma20": ma20,
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "is_nxt": is_nxt
+                })
+                position = self.config.get_position(code) or {}
+                if position.get("quantity", 0) == 0:
+                    new_pos = {
+                        "code": code, "name": stock_name, "quantity": 0, "avg_price": 0,
+                        "buy_count": 1, "last_buy_price": buy_price, "target_buy_price": buy_price,
+                        "first_buy_price": buy_price, "ma20": ma20,
+                        "sold_targets": [], "sell_occurred": False,
+                        "initial_quantity": 0, "stoploss_triggered": False, "stoploss_price": 0,
+                        "is_nxt_order": is_nxt,
+                        "nxt_buy_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S") if is_nxt else "",
+                        "strategy": "pullback",
+                        "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    self.config.update_position(code, new_pos)
+            else:
+                self.log(f"[{code}] 눌림목 매수 주문 실패 ({market_type}): 에러코드 {result}", "ERROR")
+                if is_nxt:
+                    self._mark_nxt_order_failed(code)
+        except Exception as e:
+            self.log(f"[{info.get('code', '?')}] 눌림목 매수 결과 처리 오류: {e}", "ERROR")
+
+    def _calculate_pullback_sell_orders(self, avg_price, initial_qty, current_qty, sold_targets):
+        """
+        눌림목 익절 주문 계획:
+        - 눌림익절1: +3%, 50%
+        - 눌림익절2: +6%, 잔여 전량
+        """
+        orders = []
+        q1 = max(int(initial_qty * 0.50), 1)
+        used_qty = 0
+
+        if "눌림익절1" not in sold_targets and used_qty + q1 <= current_qty:
+            price1 = self._ceil_to_tick(avg_price * 1.03)
+            if price1:
+                qty = min(q1, current_qty - used_qty)
+                orders.append({"target_name": "눌림익절1", "quantity": qty,
+                                "price": price1, "sell_ratio": 50})
+                used_qty += qty
+
+        remaining = current_qty - used_qty
+        if "눌림익절2" not in sold_targets and remaining > 0:
+            price2 = self._ceil_to_tick(avg_price * 1.06)
+            if price2:
+                orders.append({"target_name": "눌림익절2", "quantity": remaining,
+                                "price": price2, "sell_ratio": 100})
+
+        return orders
+
+    def _ensure_pullback_sell_orders_placed(self, code, position):
+        """눌림목 보유 종목에 익절 주문이 걸려있는지 확인 후 없으면 걸기"""
+        if not position or position.get("quantity", 0) <= 0:
+            return
+        if position.get("stoploss_triggered", False):
+            return
+
+        avg_price = float(position.get("avg_price", 0) or 0)
+        if avg_price <= 0:
+            return
+
+        sold_targets = position.get("sold_targets", [])
+        if code not in self.placed_sell_orders:
+            self.placed_sell_orders[code] = {}
+
+        initial_qty = int(position.get("initial_quantity", 0) or 0)
+        current_qty = int(position.get("quantity", 0) or 0)
+        if initial_qty <= 0:
+            initial_qty = current_qty
+
+        orders = self._calculate_pullback_sell_orders(avg_price, initial_qty, current_qty, sold_targets)
+
+        for order in orders:
+            target_name = order["target_name"]
+            if self.placed_sell_orders[code].get(target_name, False):
+                continue
+            if target_name in sold_targets:
+                continue
+            if not self.is_any_trading_time():
+                self.config.save_pending_order(code, {
+                    "order_type": "sell", "quantity": order["quantity"], "price": order["price"],
+                    "target_name": target_name, "sell_ratio": order.get("sell_ratio", 0),
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "is_nxt": self.is_nxt_trading_hours()
+                })
+                continue
+
+            is_nxt = self.is_nxt_trading_hours()
+            order_info = {"code": code, "target_name": target_name,
+                          "quantity": order["quantity"], "price": order["price"],
+                          "sell_ratio": order.get("sell_ratio", 0), "is_nxt": is_nxt}
+            if is_nxt:
+                self.kiwoom.sell_stock_nxt_queued(
+                    self.account, code, order["quantity"], order["price"],
+                    callback=lambda result, _, oi=order_info: self._on_sell_order_result(result, oi))
+            else:
+                self.kiwoom.sell_stock_queued(
+                    self.account, code, order["quantity"], order["price"],
+                    callback=lambda result, _, oi=order_info: self._on_sell_order_result(result, oi))
+            self.placed_sell_orders[code][target_name] = True
 
     def _ceil_to_tick(self, price):
         """호가 단위로 올림"""
