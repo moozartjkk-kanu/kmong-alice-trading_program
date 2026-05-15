@@ -4,9 +4,10 @@
     "use_mock_trading": false
   },
   "scan": {
-    "market": "both",
     "condition_mode": "AND",
+    "market": "both",
     "top_n": 1000,
+    "opt10030_params": {},
     "rsi_enabled": false,
     "rsi_period": 14,
     "rsi_min": 0.0,
@@ -33,6 +34,7 @@
     "trend_close_above_ma20": true,
     "trend_ma20_rising": true,
     "trend_ma20_above_ma60": true,
+    "trend_ma60_rising": false,
     "trend_low_above_ma20": false,
     "trend_low_ratio": 0.97,
     "pullback_enabled": false,
@@ -50,6 +52,16 @@
     "rebound_enabled": false,
     "rebound_bullish_candle": true,
     "rebound_volume_increase": true,
-    "rebound_prev_high_breakout": true
+    "rebound_prev_high_breakout": true,
+    "ref_candle_pullback_enabled": false,
+    "ref_candle_search_days": 5,
+    "ref_candle_min_rise_pct": 3.0,
+    "ref_candle_vol_multiplier": 2.0,
+    "ref_candle_vol_avg_days": 20,
+    "ref_candle_pullback_max_ratio": 0.97,
+    "close_above_prev_enabled": false,
+    "near_high_support_enabled": false,
+    "near_high_support_days": 10,
+    "near_high_support_pct": 2.0
   }
 }

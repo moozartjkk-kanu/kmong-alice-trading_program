@@ -149,6 +149,56 @@ class TechnicalAnalysis:
             return None
 
     # ------------------------------------------------------------------
+    # 기준봉 탐지
+    # ------------------------------------------------------------------
+    @staticmethod
+    def find_reference_candle(candles: list, avg_vol_days: int = 20,
+                              min_rise_pct: float = 3.0, vol_multiplier: float = 2.0,
+                              search_days: int = 5):
+        """
+        최근 search_days일 이내에서 기준봉(큰 양봉) 탐지
+          - 양봉 (종가 > 시가)
+          - 상승률 >= min_rise_pct %
+          - 거래량 >= avg_vol_days일 평균 × vol_multiplier
+        candles: 최신순 (인덱스 0 = 당일)
+        반환: {"index": i, "open": ..., "close": ..., "high": ...} or None
+        """
+        needed = search_days + avg_vol_days + 1
+        if not candles or len(candles) < needed:
+            return None
+
+        for i in range(1, search_days + 1):
+            c = candles[i]
+            open_p  = float(c.get("open",   0) or 0)
+            close_p = float(c.get("close",  0) or 0)
+            high_p  = float(c.get("high",   0) or 0)
+            vol     = float(c.get("volume", 0) or 0)
+
+            if open_p <= 0 or close_p <= open_p:
+                continue
+
+            rise_pct = (close_p - open_p) / open_p * 100
+            if rise_pct < min_rise_pct:
+                continue
+
+            # 기준봉 당일 기준 과거 avg_vol_days일 평균 거래량
+            past_vols = [
+                float(candles[j].get("volume", 0) or 0)
+                for j in range(i + 1, i + avg_vol_days + 1)
+                if j < len(candles)
+            ]
+            if len(past_vols) < avg_vol_days:
+                continue
+
+            avg_vol = sum(past_vols) / len(past_vols)
+            if avg_vol <= 0 or vol < avg_vol * vol_multiplier:
+                continue
+
+            return {"index": i, "open": open_p, "close": close_p, "high": high_p}
+
+        return None
+
+    # ------------------------------------------------------------------
     # 통합 조건 평가
     # ------------------------------------------------------------------
     def evaluate(
@@ -216,6 +266,10 @@ class TechnicalAnalysis:
             "rebound_bullish": False,
             "rebound_volume": False,
             "rebound_prev_high": False,
+            "ref_candle_ok": False,
+            "ref_candle_found": False,
+            "close_above_prev_ok": False,
+            "near_high_support_ok": False,
             "match": False,
         }
 
@@ -371,6 +425,14 @@ class TechnicalAnalysis:
                 ma60 = self.calculate_sma(close_prices, 60)
                 trend_parts.append(ma20 is not None and ma60 is not None and ma20 > ma60)
 
+            if conditions.get("trend_ma60_rising", False):
+                ma60_today = self.calculate_sma(close_prices, 60)
+                ma60_yesterday = self.calculate_sma(close_prices[1:], 60)
+                trend_parts.append(
+                    ma60_today is not None and ma60_yesterday is not None
+                    and ma60_today > ma60_yesterday
+                )
+
             # 저가 >= MA20 × ratio (추세 유지: MA 아래로 너무 빠지지 않음)
             if conditions.get("trend_low_above_ma20", False):
                 ma20 = self.calculate_sma(close_prices, 20)
@@ -463,6 +525,49 @@ class TechnicalAnalysis:
             rebound_ok = any(rebound_parts) if rebound_parts else False
             result["rebound_ok"] = rebound_ok
             checks.append(rebound_ok)
+
+        # ── 기준봉 눌림 조건 ──────────────────────────────────────────
+        if conditions.get("ref_candle_pullback_enabled"):
+            search_days  = int(conditions.get("ref_candle_search_days", 5))
+            min_rise_pct = float(conditions.get("ref_candle_min_rise_pct", 3.0))
+            vol_mult     = float(conditions.get("ref_candle_vol_multiplier", 2.0))
+            vol_avg_days = int(conditions.get("ref_candle_vol_avg_days", 20))
+            pb_max_ratio = float(conditions.get("ref_candle_pullback_max_ratio", 0.97))
+
+            ref = self.find_reference_candle(
+                candles, vol_avg_days, min_rise_pct, vol_mult, search_days
+            )
+            ref_candle_ok = False
+            if ref:
+                result["ref_candle_found"] = True
+                # 현재가 <= 기준봉 고가 × 눌림 비율  AND  현재가 >= 기준봉 시가
+                if (current_price <= ref["high"] * pb_max_ratio
+                        and current_price >= ref["open"]):
+                    ref_candle_ok = True
+            result["ref_candle_ok"] = ref_candle_ok
+            checks.append(ref_candle_ok)
+
+        # ── 종가 > 전일 종가 ───────────────────────────────────────────
+        if conditions.get("close_above_prev_enabled"):
+            prev_close = float(close_prices[1]) if len(close_prices) > 1 else None
+            ok = prev_close is not None and prev_close > 0 and current_price > prev_close
+            result["close_above_prev_ok"] = ok
+            checks.append(ok)
+
+        # ── 최근 N일 고점 ±% 이내 지지 ────────────────────────────────
+        if conditions.get("near_high_support_enabled"):
+            nhs_days   = int(conditions.get("near_high_support_days", 10))
+            nhs_pct    = float(conditions.get("near_high_support_pct", 2.0))
+            past_highs = high_prices[1: nhs_days + 1]
+            near_ok    = False
+            if past_highs:
+                recent_high = max(float(h) for h in past_highs)
+                if recent_high > 0:
+                    lower = recent_high * (1 - nhs_pct / 100)
+                    upper = recent_high * (1 + nhs_pct / 100)
+                    near_ok = lower <= current_price <= upper
+            result["near_high_support_ok"] = near_ok
+            checks.append(near_ok)
 
         # ── 조건 결합 ──────────────────────────────────────────────────
         if not checks:

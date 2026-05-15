@@ -175,6 +175,10 @@ def _make_row(code: str, name: str, price: int, ev: dict) -> dict:
         "price_floor_ok":       ev.get("price_floor_ok", False),
         "strength_ok":          ev.get("strength_ok", False),
         "rebound_ok":           ev.get("rebound_ok", False),
+        "ref_candle_ok":        ev.get("ref_candle_ok", False),
+        "ref_candle_found":     ev.get("ref_candle_found", False),
+        "close_above_prev_ok":  ev.get("close_above_prev_ok", False),
+        "near_high_support_ok": ev.get("near_high_support_ok", False),
     }
 
 
@@ -627,6 +631,7 @@ class Scanner:
             "supply": 0, "supply_foreign": 0, "supply_institution": 0,
             "trading_value": 0,
             "trend": 0, "pullback": 0, "price_floor": 0, "strength": 0, "rebound": 0,
+            "ref_candle": 0, "close_above_prev": 0, "near_high_support": 0,
         }
 
         for code in self._top_codes:
@@ -655,7 +660,10 @@ class Scanner:
             if conditions.get("pullback_enabled")    and ev.get("pullback_ok"):           stat["pullback"]           += 1
             if conditions.get("price_floor_enabled") and ev.get("price_floor_ok"):        stat["price_floor"]        += 1
             if conditions.get("strength_enabled")    and ev.get("strength_ok"):           stat["strength"]           += 1
-            if conditions.get("rebound_enabled")     and ev.get("rebound_ok"):            stat["rebound"]            += 1
+            if conditions.get("rebound_enabled")          and ev.get("rebound_ok"):           stat["rebound"]           += 1
+            if conditions.get("ref_candle_pullback_enabled") and ev.get("ref_candle_ok"):    stat["ref_candle"]        += 1
+            if conditions.get("close_above_prev_enabled")    and ev.get("close_above_prev_ok"): stat["close_above_prev"] += 1
+            if conditions.get("near_high_support_enabled")   and ev.get("near_high_support_ok"): stat["near_high_support"] += 1
 
             if ev["match"]:
                 results.append(_make_row(code, name, price, ev))
@@ -684,7 +692,10 @@ class Scanner:
         if conditions.get("pullback_enabled"):     stat_parts.append(f"눌림:{stat['pullback']}/{total}")
         if conditions.get("price_floor_enabled"):  stat_parts.append(f"하락방지:{stat['price_floor']}/{total}")
         if conditions.get("strength_enabled"):     stat_parts.append(f"힘유지:{stat['strength']}/{total}")
-        if conditions.get("rebound_enabled"):      stat_parts.append(f"반등:{stat['rebound']}/{total}")
+        if conditions.get("rebound_enabled"):            stat_parts.append(f"반등:{stat['rebound']}/{total}")
+        if conditions.get("ref_candle_pullback_enabled"): stat_parts.append(f"기준봉눌림:{stat['ref_candle']}/{total}")
+        if conditions.get("close_above_prev_enabled"):    stat_parts.append(f"전일종가초과:{stat['close_above_prev']}/{total}")
+        if conditions.get("near_high_support_enabled"):   stat_parts.append(f"고점지지:{stat['near_high_support']}/{total}")
         if stat_parts:
             self._log(f"[평가] 조건별 통과: {', '.join(stat_parts)}")
         self._log(f"[평가] 조건 만족 {len(results)}개 / {total}개")

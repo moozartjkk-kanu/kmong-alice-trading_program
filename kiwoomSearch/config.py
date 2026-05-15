@@ -64,6 +64,55 @@ DEFAULT_CONFIG = {
         "trading_value_increase_enabled": False,
         "trading_value_increase_pct": 200.0,    # 거래대금 증가율 (%, N일 평균 대비)
         "trading_value_avg_days": 20,           # 거래대금 평균 기준 일수
+
+        # 추세 조건 추가 항목
+        "trend_enabled": False,
+        "trend_close_above_ma20": True,
+        "trend_ma20_rising": True,
+        "trend_ma20_above_ma60": True,
+        "trend_ma60_rising": False,             # MA60 상승 (오늘 > 어제)
+        "trend_low_above_ma20": False,
+        "trend_low_ratio": 0.97,
+
+        # 눌림 조건
+        "pullback_enabled": False,
+        "pullback_days": 5,
+        "pullback_ma_period": 20,
+        "pullback_ratio": 1.02,
+        "pullback_lower_ratio": 0.97,
+        "pullback_volume_decrease_enabled": False,
+
+        # 과도한 하락 방지
+        "price_floor_enabled": False,
+        "price_floor_days": 20,
+        "price_floor_ratio": 0.92,
+
+        # 힘 유지
+        "strength_enabled": False,
+        "strength_days": 10,
+        "strength_ref_days": 20,
+
+        # 반등 신호
+        "rebound_enabled": False,
+        "rebound_bullish_candle": True,
+        "rebound_volume_increase": True,
+        "rebound_prev_high_breakout": True,
+
+        # 기준봉 눌림 조건 (신규)
+        "ref_candle_pullback_enabled": False,
+        "ref_candle_search_days": 5,            # 기준봉 탐색 최근 N일
+        "ref_candle_min_rise_pct": 3.0,         # 기준봉 최소 상승률 (%)
+        "ref_candle_vol_multiplier": 2.0,       # 기준봉 거래량 배수 (N일 평균 대비)
+        "ref_candle_vol_avg_days": 20,          # 거래량 평균 기간
+        "ref_candle_pullback_max_ratio": 0.97,  # 기준봉 고가 대비 최대 눌림 비율
+
+        # 종가 > 전일 종가 조건 (신규)
+        "close_above_prev_enabled": False,
+
+        # 최근 N일 고점 ±% 이내 지지 조건 (신규)
+        "near_high_support_enabled": False,
+        "near_high_support_days": 10,
+        "near_high_support_pct": 2.0,
     }
 }
 

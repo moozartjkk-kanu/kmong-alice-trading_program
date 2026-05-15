@@ -579,6 +579,10 @@ class MainWindow(QMainWindow):
         self.trend_ma20_rising_chk.setChecked(bool(scan.get("trend_ma20_rising", True)))
         trendg.addWidget(self.trend_ma20_rising_chk)
 
+        self.trend_ma60_rising_chk = QCheckBox("MA60 상승 중 (오늘 MA60 > 어제 MA60)")
+        self.trend_ma60_rising_chk.setChecked(bool(scan.get("trend_ma60_rising", False)))
+        trendg.addWidget(self.trend_ma60_rising_chk)
+
         self.trend_ma20_above_ma60_chk = QCheckBox("MA20 > MA60 (정배열)")
         self.trend_ma20_above_ma60_chk.setChecked(bool(scan.get("trend_ma20_above_ma60", True)))
         trendg.addWidget(self.trend_ma20_above_ma60_chk)
@@ -641,6 +645,89 @@ class MainWindow(QMainWindow):
                       0, 2, 4, 1, Qt.AlignTop | Qt.AlignLeft)
         self.pullback_grp = pullback_grp
         v.addWidget(pullback_grp)
+
+        # ── 기준봉 눌림 조건 (신규) ────────────────────────────────────────
+        ref_grp = QGroupBox("기준봉 눌림 조건 (최근 N일 이내 큰 양봉 후 눌림)")
+        ref_grp.setCheckable(True)
+        ref_grp.setChecked(bool(scan.get("ref_candle_pullback_enabled", False)))
+        rfg = QGridLayout(ref_grp)
+
+        rfg.addWidget(QLabel("기준봉 탐색 기간 (일):"), 0, 0)
+        self.ref_search_days_spin = QSpinBox()
+        self.ref_search_days_spin.setRange(1, 20)
+        self.ref_search_days_spin.setValue(int(scan.get("ref_candle_search_days", 5)))
+        rfg.addWidget(self.ref_search_days_spin, 0, 1)
+
+        rfg.addWidget(QLabel("최소 상승률 (%이상):"), 1, 0)
+        self.ref_min_rise_spin = QDoubleSpinBox()
+        self.ref_min_rise_spin.setRange(0.5, 30.0)
+        self.ref_min_rise_spin.setDecimals(1)
+        self.ref_min_rise_spin.setValue(float(scan.get("ref_candle_min_rise_pct", 3.0)))
+        self.ref_min_rise_spin.setSuffix(" %")
+        rfg.addWidget(self.ref_min_rise_spin, 1, 1)
+
+        rfg.addWidget(QLabel("거래량 배수 (N일 평균 ×):"), 2, 0)
+        self.ref_vol_mult_spin = QDoubleSpinBox()
+        self.ref_vol_mult_spin.setRange(1.0, 20.0)
+        self.ref_vol_mult_spin.setDecimals(1)
+        self.ref_vol_mult_spin.setValue(float(scan.get("ref_candle_vol_multiplier", 2.0)))
+        self.ref_vol_mult_spin.setSuffix(" 배")
+        rfg.addWidget(self.ref_vol_mult_spin, 2, 1)
+
+        rfg.addWidget(QLabel("거래량 평균 기간 (일):"), 3, 0)
+        self.ref_vol_avg_days_spin = QSpinBox()
+        self.ref_vol_avg_days_spin.setRange(5, 60)
+        self.ref_vol_avg_days_spin.setValue(int(scan.get("ref_candle_vol_avg_days", 20)))
+        rfg.addWidget(self.ref_vol_avg_days_spin, 3, 1)
+
+        rfg.addWidget(QLabel("눌림 최대 비율 (기준봉 고가 ×):"), 4, 0)
+        self.ref_pullback_ratio_spin = QDoubleSpinBox()
+        self.ref_pullback_ratio_spin.setRange(0.7, 1.0)
+        self.ref_pullback_ratio_spin.setDecimals(2)
+        self.ref_pullback_ratio_spin.setSingleStep(0.01)
+        self.ref_pullback_ratio_spin.setValue(float(scan.get("ref_candle_pullback_max_ratio", 0.97)))
+        rfg.addWidget(self.ref_pullback_ratio_spin, 4, 1)
+
+        rfg.addWidget(QLabel(
+            "기준봉: 양봉 + 상승률≥N% + 거래량≥N배\n\n"
+            "눌림: 현재가 ≤ 기준봉 고가 × 비율\n       현재가 ≥ 기준봉 시가"),
+            0, 2, 5, 1, Qt.AlignTop | Qt.AlignLeft)
+        self.ref_grp = ref_grp
+        v.addWidget(ref_grp)
+
+        # ── 종가 > 전일 종가 조건 (신규) ───────────────────────────────────
+        close_prev_grp = QGroupBox("종가 > 전일 종가 조건")
+        close_prev_grp.setCheckable(True)
+        close_prev_grp.setChecked(bool(scan.get("close_above_prev_enabled", False)))
+        cpg = QHBoxLayout(close_prev_grp)
+        cpg.addWidget(QLabel("현재가(종가)가 전일 종가보다 높을 때 조건 만족"))
+        self.close_prev_grp = close_prev_grp
+        v.addWidget(close_prev_grp)
+
+        # ── 최근 N일 고점 ±% 이내 지지 조건 (신규) ────────────────────────
+        nhs_grp = QGroupBox("최근 N일 고점 ±% 이내 지지 조건")
+        nhs_grp.setCheckable(True)
+        nhs_grp.setChecked(bool(scan.get("near_high_support_enabled", False)))
+        nhsg = QGridLayout(nhs_grp)
+
+        nhsg.addWidget(QLabel("기간 (일):"), 0, 0)
+        self.nhs_days_spin = QSpinBox()
+        self.nhs_days_spin.setRange(1, 60)
+        self.nhs_days_spin.setValue(int(scan.get("near_high_support_days", 10)))
+        nhsg.addWidget(self.nhs_days_spin, 0, 1)
+
+        nhsg.addWidget(QLabel("허용 범위 (%):"), 1, 0)
+        self.nhs_pct_spin = QDoubleSpinBox()
+        self.nhs_pct_spin.setRange(0.5, 20.0)
+        self.nhs_pct_spin.setDecimals(1)
+        self.nhs_pct_spin.setValue(float(scan.get("near_high_support_pct", 2.0)))
+        self.nhs_pct_spin.setSuffix(" %")
+        nhsg.addWidget(self.nhs_pct_spin, 1, 1)
+
+        nhsg.addWidget(QLabel("예) 최근 10일 고점 ±2% 범위 내에\n현재가가 위치하면 조건 만족"),
+                       0, 2, 2, 1, Qt.AlignTop | Qt.AlignLeft)
+        self.nhs_grp = nhs_grp
+        v.addWidget(nhs_grp)
 
         # ── 과도한 하락 방지 ───────────────────────────────────────────────
         floor_grp = QGroupBox("과도한 하락 방지")
@@ -790,6 +877,7 @@ class MainWindow(QMainWindow):
             "trend_enabled":                 self.trend_grp.isChecked(),
             "trend_close_above_ma20":        self.trend_close_above_ma20_chk.isChecked(),
             "trend_ma20_rising":             self.trend_ma20_rising_chk.isChecked(),
+            "trend_ma60_rising":             self.trend_ma60_rising_chk.isChecked(),
             "trend_ma20_above_ma60":         self.trend_ma20_above_ma60_chk.isChecked(),
             "trend_low_above_ma20":          self.trend_low_above_ma20_chk.isChecked(),
             "trend_low_ratio":               self.trend_low_ratio_spin.value(),
@@ -813,6 +901,19 @@ class MainWindow(QMainWindow):
             "rebound_bullish_candle":        self.rebound_bullish_chk.isChecked(),
             "rebound_volume_increase":       self.rebound_volume_chk.isChecked(),
             "rebound_prev_high_breakout":    self.rebound_prev_high_chk.isChecked(),
+            # 기준봉 눌림 조건 (신규)
+            "ref_candle_pullback_enabled":   self.ref_grp.isChecked(),
+            "ref_candle_search_days":        self.ref_search_days_spin.value(),
+            "ref_candle_min_rise_pct":       self.ref_min_rise_spin.value(),
+            "ref_candle_vol_multiplier":     self.ref_vol_mult_spin.value(),
+            "ref_candle_vol_avg_days":       self.ref_vol_avg_days_spin.value(),
+            "ref_candle_pullback_max_ratio": self.ref_pullback_ratio_spin.value(),
+            # 종가 > 전일 종가 (신규)
+            "close_above_prev_enabled":      self.close_prev_grp.isChecked(),
+            # 최근 N일 고점 지지 (신규)
+            "near_high_support_enabled":     self.nhs_grp.isChecked(),
+            "near_high_support_days":        self.nhs_days_spin.value(),
+            "near_high_support_pct":         self.nhs_pct_spin.value(),
         }
         if self.config.save_scan(scan):
             self.log("[설정] 저장 완료")
@@ -1053,7 +1154,10 @@ class MainWindow(QMainWindow):
             if row.get("pullback_ok"):      conds.append("눌림")
             if row.get("price_floor_ok"):   conds.append("하락방지")
             if row.get("strength_ok"):      conds.append("힘유지")
-            if row.get("rebound_ok"):       conds.append("반등")
+            if row.get("rebound_ok"):           conds.append("반등")
+            if row.get("ref_candle_ok"):        conds.append("기준봉눌림")
+            if row.get("close_above_prev_ok"):  conds.append("전일종가↑")
+            if row.get("near_high_support_ok"): conds.append("고점지지")
             self._set(r_idx, 8, " / ".join(conds) if conds else "-")
 
         self.result_table.setSortingEnabled(True)
